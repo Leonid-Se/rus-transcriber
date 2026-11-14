@@ -753,6 +753,229 @@ def backup_voice_profile(path):
     return str(target)
 
 
+def backup_voice_profiles(group=""):
+    """Сделать отдельную резервную копию профиля одной группы или всех групп.
+
+    Копии лежат в `voice-backups` внутри группы, не шифруются, не входят в экспорт и
+    автоматически не удаляются. Векторы и имена не возвращаются.
+    """
+    import voices
+    if group:
+        if group not in paths.list_groups():
+            raise CoreError("группа не найдена")
+        groups = [group]
+    else:
+        groups = paths.list_groups()
+    backups = []
+    for name in groups:
+        path = paths.voices_path(name)
+        try:
+            with settings.group_voice_lock(name):
+                target = backup_voice_profile(path)
+        except (OSError, ValueError) as ex:
+            raise CoreError(f"не удалось сохранить резерв группы «{name}»: {ex}") from ex
+        if target:
+            backups.append({"group": name, "backup": target})
+    return {"backups": backups, "count": len(backups),
+            "note": "Резерв — биометрия в открытом виде; храните и удаляйте по решению владельца."}
+
+
+def voice_quality(group=""):
+    """Политика качества и сохранённые измерения по профилям; аудио не декодируется."""
+    import voices
+    if group and group not in paths.list_groups():
+        raise CoreError("группа не найдена")
+    groups = [group] if group else paths.list_groups()
+    out = []
+    for name in groups:
+        try:
+            policy = settings.group_voice_settings(name)
+        except ValueError as ex:
+            out.append({"group": name, "settings_error": str(ex)})
+            continue
+        entry = {"group": name,
+                 "audio_quality_policy": policy.get("audio_quality_policy", "warn"),
+                 "policy_source": policy.get("audio_quality_policy_source", "default")}
+        path = paths.voices_path(name)
+        if not path.exists():
+            entry.update({"profile": "absent", "measurements": [], "summary": {"measured_sources": 0}})
+            out.append(entry)
+            continue
+        try:
+            data = voices.load_profile(path, convert=False)
+        except voices.VoiceProfileError as ex:
+            entry.update({"profile_error": str(ex)})
+            out.append(entry)
+            continue
+        measurements = []
+        for source, q in (data.get("audio_quality") or {}).items():
+            if not isinstance(q, dict):
+                continue
+            measurements.append({
+                "recording": Path(source).name, "from": q.get("from"),
+                "at": q.get("at"), "available": q.get("available"),
+                "duration_sec": q.get("duration_sec"), "peak_dbfs": q.get("peak_dbfs"),
+                "rms_dbfs": q.get("rms_dbfs"), "clipping_ratio": q.get("clipping_ratio"),
+                "silence_ratio": q.get("silence_ratio"), "snr_db_estimate": q.get("snr_db_estimate"),
+                "warnings": q.get("warnings") or [],
+                "warning_notes": voices.explain_audio_quality(q)})
+        entry.update({
+            "profile": "ok", "measurements": measurements[-50:],
+            "summary": {"measured_sources": len(measurements),
+                        "clipping_sources": sum(1 for m in measurements if "clipping" in (m["warnings"] or [])),
+                        "warning_sources": sum(1 for m in measurements if m["warnings"])},
+            "recent_quality_warnings": [w for w in (data.get("warnings") or [])
+                                        if w.get("kind") == "audio_quality"][-5:]})
+        out.append(entry)
+    return {"groups": out,
+            "note": "Измерения приблизительны. Политика warn только предупреждает; "
+                    "reject_clipping не учитывает источник с клиппингом. Тихая речь не отбраковывается."}
+
+
+def set_voice_quality_policy(policy, group=""):
+    """Политика качества: warn (по умолчанию) или reject_clipping; без group — для новых групп."""
+    import voices
+    try:
+        policy = voices.validate_quality_policy(policy)
+    except ValueError as ex:
+        raise CoreError(str(ex)) from ex
+    if not group:
+        settings.update(explicit=("voice_quality_policy_default",), voice_quality_policy_default=policy)
+        return {"default_for_new_groups": policy,
+                "note": "Группы без явной политики наследуют это значение; уже выбранная политика группы не меняется."}
+    if group not in paths.list_groups():
+        raise CoreError("группа не найдена")
+    try:
+        with settings.group_voice_lock(group):
+            current = settings.group_voice_settings(group)
+            data = {k: v for k, v in current.items() if k != "audio_quality_policy_source"}
+            data["audio_quality_policy"] = policy
+            saved = settings.save_group_voice_settings(group, data)
+    except (ValueError, OSError) as ex:
+        raise CoreError(str(ex)) from ex
+    return {"group": group, "audio_quality_policy": saved.get("audio_quality_policy", policy),
+            "auto_learn": saved.get("auto_learn")}
+
+
+REFRESH_MEANINGS = {
+    "unchanged": "Источник учтён, отпечаток совпадает.",
+    "changed": "Стенограмма или аудио изменились — нужен просмотр и подтверждённое обновление.",
+    "legacy_baseline_pending": "Отпечатка нет; при следующем обучении текущее состояние будет принято как исходное.",
+    "not_recorded": "Источник есть в профиле, но без записи происхождения.",
+    "transcript_missing": "Файл стенограммы не найден.",
+    "transcript_unreadable": "Стенограмма не читается.",
+    "audio_missing": "Исходное аудио не найдено или не указано.",
+}
+
+
+def _voice_job_map():
+    """{путь стенограммы: id задачи} по готовым задачам; нужен только для подсказки обновления."""
+    out = {}
+    try:
+        files = sorted(paths.JOBS.glob("*.json"))
+    except OSError:
+        return out
+    for p in files:
+        try:
+            status = json.loads(p.read_text(encoding="utf-8"))
+            jp = status.get("json")
+            if status.get("state") == "done" and jp:
+                out[str(Path(jp).resolve())] = p.stem
+        except (OSError, ValueError, TypeError):
+            continue
+    return out
+
+
+def voice_refresh_plan(group=""):
+    """Что изменилось после прежнего обучения; только чтение, без моделей и записи профиля."""
+    import voices
+    if group and group not in paths.list_groups():
+        raise CoreError("группа не найдена")
+    groups = [group] if group else paths.list_groups()
+    jobs = _voice_job_map()
+    out = []
+    for name in groups:
+        path = paths.voices_path(name)
+        if not path.exists():
+            out.append({"group": name, "profile": "absent", "sources": [], "summary": {"needs_update": 0}})
+            continue
+        try:
+            data = voices.load_profile(path, convert=False)
+        except voices.VoiceProfileError as ex:
+            out.append({"group": name, "profile_error": str(ex)})
+            continue
+        entries = []
+        for key, stored in sorted((data.get("sources") or {}).items()):
+            jp = Path(key)
+            audio_path, audio_key = None, None
+            entry = {"transcript": jp.name, "recording": None, "job_id": jobs.get(str(jp.resolve())),
+                     "status": "transcript_missing", "needs_update": True,
+                     "needs_review_reasons": []}
+            if jp.is_file():
+                try:
+                    source_data = json.loads(jp.read_text(encoding="utf-8"))
+                    audio_path = source_data.get("file")
+                except (OSError, ValueError, TypeError):
+                    entry["status"] = "transcript_unreadable"
+                else:
+                    if not audio_path:
+                        entry["status"] = "audio_missing"
+                    else:
+                        audio_key = str(Path(audio_path).resolve())
+                        entry["recording"] = Path(audio_path).name
+                        if not Path(audio_path).is_file():
+                            entry["status"] = "audio_missing"
+                        else:
+                            current = voices.source_fingerprint(jp, audio_path)
+                            status = voices.source_fingerprint_status(stored, current, jp.stat().st_mtime)
+                            entry["status"] = {"unchanged": "unchanged", "changed": "changed",
+                                               "legacy_unchanged": "legacy_baseline_pending",
+                                               "legacy_changed": "changed",
+                                               "absent": "not_recorded"}.get(status, "changed")
+                            entry["transcript_changed"] = bool(isinstance(stored, dict)
+                                and stored.get("transcript_sha256") != current["transcript_sha256"])
+                            entry["audio_changed"] = bool(isinstance(stored, dict)
+                                and (stored.get("audio_size") != current["audio_size"]
+                                     or stored.get("audio_mtime") != current["audio_mtime"]))
+            versions = []
+            if audio_key:
+                for speaker in (data.get("speakers") or {}).values():
+                    part = (speaker.get("parts") or {}).get(audio_key)
+                    if part:
+                        versions.append(part.get("selection_version"))
+            current_selection = bool(versions) and all(v == voices.SELECTION_VERSION for v in versions)
+            entry["selection_version_current"] = current_selection
+            if entry["status"] == "changed":
+                entry["needs_review_reasons"].append("стенограмма или аудио изменились")
+            if versions and not current_selection:
+                entry["needs_review_reasons"].append("вклад без текущей версии отбора")
+            if entry["status"] in ("transcript_missing", "transcript_unreadable", "audio_missing"):
+                entry["needs_review_reasons"].append(REFRESH_MEANINGS[entry["status"]])
+            if entry["status"] == "not_recorded":
+                entry["needs_review_reasons"].append("нет отпечатка источника")
+            if entry["status"] == "legacy_baseline_pending":
+                entry["needs_review_reasons"].append("нет постоянного отпечатка источника")
+            if audio_key and audio_key in (data.get("audio_quality") or {}):
+                q = data["audio_quality"][audio_key]
+                entry["audio_quality_warnings"] = (q or {}).get("warnings") or []
+                entry["audio_quality_notes"] = voices.explain_audio_quality(q)
+                if entry["audio_quality_warnings"]:
+                    entry["needs_review_reasons"].append("есть предупреждения качества аудио")
+            entry["needs_update"] = bool(entry["needs_review_reasons"])
+            entry["meaning"] = REFRESH_MEANINGS.get(entry["status"], entry["status"])
+            entries.append(entry)
+        summary = {}
+        for item in entries:
+            summary[item["status"]] = summary.get(item["status"], 0) + 1
+        summary["needs_update"] = sum(1 for item in entries if item["needs_update"])
+        out.append({"group": name, "profile": "ok", "revision": data.get("revision"),
+                    "sources": entries, "summary": summary})
+    return {"groups": out,
+            "needs_update": sum(item.get("summary", {}).get("needs_update", 0) for item in out),
+            "note": "План только показывает различия. Автоматическая замена вкладов не выполняется; "
+                    "обновляйте через preview_voice_profiles и update_voice_profiles отдельной задачи."}
+
+
 def start_voice_update(snapshot):
     group, jp = snapshot["group"], Path(snapshot["json"])
     with settings.group_voice_lock(group):
@@ -824,7 +1047,10 @@ def set_voice_auto_learn(enabled, group=""):
         raise CoreError("группа не найдена")
     try:
         with settings.group_voice_lock(group):
-            return {"group": group, **settings.save_group_voice_settings(group, {"auto_learn": enabled, "reason": "manual"})}
+            current = settings.group_voice_settings(group)
+            data = {k: v for k, v in current.items() if k != "audio_quality_policy_source"}
+            data.update(auto_learn=enabled, reason="manual")
+            return {"group": group, **settings.save_group_voice_settings(group, data)}
     except (ValueError, OSError) as ex:
         raise CoreError(str(ex)) from ex
 
@@ -856,19 +1082,45 @@ def voice_profiles():
         out.append({"group": p.parent.name, "revision": d.get("revision"),
                     "auto_learn": policy, "sufficiency": voices.profile_sufficiency(d, expected),
                     "weight_diagnostics": voices.voice_weight_diagnostics(d),
-                    "speakers": {n: {"records": len(s.get("parts", {})),
-                                     "seconds": round(sum(pt.get("auto_sec", pt["sec"]) + pt.get("human_sec", 0)
-                                                          for pt in s.get("parts", {}).values())),
-                                     "human_seconds": round(sum(pt.get("human_sec", 0) for pt in s.get("parts", {}).values()), 1)}
-                                 for n, s in d.get("speakers", {}).items()},
+                    "audio_quality_policy": policy.get("audio_quality_policy", "warn"),
+                    "audio_quality_policy_source": policy.get("audio_quality_policy_source", "default"),
+                    "speakers": {n: _speaker_voice_summary(s) for n, s in d.get("speakers", {}).items()},
                     "corrected_pairs": conf,
                     "warnings": (d.get("warnings") or [])[-5:],
+                    "quality_summary": {"measured_sources": len(d.get("audio_quality") or {}),
+                                        "clipping_sources": sum(
+                                            1 for q in (d.get("audio_quality") or {}).values()
+                                            if "clipping" in ((q or {}).get("warnings") or []))},
                     "quarantine": [{"name": n, "recording": Path(a).name, **{k: v for k, v in q.items() if k != "json"}}
                                    for a, qa in (d.get("quarantine") or {}).items() for n, q in qa.items()],
                     "identity": {Path(a).name: v for a, v in (d.get("identity") or {}).items()},
                     "sources": list(d.get("sources", {}))})
     return {"profiles": out, "groups": paths.list_groups(),
             "default_group": settings.load_config().get("default_group")}
+
+
+def _speaker_voice_summary(speaker):
+    """Длительность и вес раздельно: старый `sec` не подменяет неизмеренную длительность."""
+    seconds = weighted = human = 0.0
+    measured = unmeasured = 0
+    for part in (speaker.get("parts") or {}).values():
+        sec = part.get("sec")
+        if isinstance(sec, (int, float)) and not isinstance(sec, bool) and sec >= 0:
+            weighted += float(sec)
+        a, h = part.get("auto_sec"), part.get("human_sec")
+        if (isinstance(a, (int, float)) and not isinstance(a, bool)
+                and isinstance(h, (int, float)) and not isinstance(h, bool) and a >= 0 and h >= 0):
+            seconds += float(a) + float(h)
+            human += float(h)
+            measured += 1
+        else:
+            unmeasured += 1
+    return {"records": len(speaker.get("parts") or {}),
+            "seconds": round(seconds, 1),
+            "weighted_seconds": round(weighted, 1),
+            "human_seconds": round(human, 1),
+            "measured_records": measured,
+            "unmeasured_records": unmeasured}
 
 
 # ---------- данные: выполнение (решение человека принимает слой управления) ----------

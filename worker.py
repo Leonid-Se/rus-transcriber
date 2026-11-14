@@ -647,16 +647,23 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
     with settings.group_voice_lock(group):
         prof, profile_ok = load_group_profile_for_recognition(ppath, quality)
         selection_report = {}
+        quality_report = {}
         learned = []
         if profile_ok:
+            def run_learn():
+                try:
+                    policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
+                except (ValueError, OSError):
+                    policy = "warn"
+                return voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
+                                    selection_report=selection_report, quality_policy=policy,
+                                    quality_report=quality_report,
+                                    stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"])
             learned, quality["voice_auto_learn"] = voices.auto_learn_group(
-                prof, group, names,
-                lambda: voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
-                                     selection_report=selection_report,
-                                     stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"]),
-                lambda: voices.save_profile(ppath, prof))
+                prof, group, names, run_learn, lambda: voices.save_profile(ppath, prof))
         quality["voice_selection_report"] = selection_report
         quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
+        quality["voice_audio_quality"] = quality_report
     return ppath, prof, learned
 
 
@@ -699,11 +706,19 @@ def learn_only(a, st, cfg, src):
             prof = voices.load_profile(ppath)
             st.set(stage="профили: пересчёт по ответам человека", progress=40)
             selection_report = {}
+            quality_report = {}
+            try:
+                quality_policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
+            except (ValueError, OSError):
+                quality_policy = "warn"
+            before_provenance = prof.get("provenance_revision", 0)
             learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
                                    only=[a.learn_only], group=group, selection_report=selection_report,
-                                   allow_replace=authorized)
+                                   allow_replace=authorized, quality_policy=quality_policy,
+                                   quality_report=quality_report)
+            provenance_updated = prof.get("provenance_revision", 0) != before_provenance
             backup = None
-            if learned:
+            if learned or provenance_updated:
                 if authorized:
                     if core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
                         raise RuntimeError("стенограмма или профиль изменились во время пересчёта; запись отменена")
@@ -713,6 +728,7 @@ def learn_only(a, st, cfg, src):
         st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
                revision=prof.get("revision"), last=last, selection_report=selection_report,
                selection_explanation=voices.explain_selection_report(selection_report), backup=backup,
+               provenance_updated=provenance_updated, audio_quality=quality_report,
                quarantine={n: q for qa in (prof.get("quarantine") or {}).values() for n, q in qa.items()
                            if last and q.get("from") == last.get("from")},
                warnings=[w for w in prof.get("warnings", []) if last and w.get("from") == last.get("from")])

@@ -9,6 +9,10 @@
     python rt.py reopen ЗАДАЧА r57,r88
     python rt.py cancel ЗАДАЧА
     python rt.py settings | profiles | audit    # audit: абсолютные пути в данных
+    python rt.py voice-quality [--group ИМЯ]  # политика и измерения качества аудио
+    python rt.py voice-refresh-plan [--group ИМЯ]  # изменённые источники, только чтение
+    python rt.py voice-quality-policy warn|reject_clipping [--group ИМЯ]
+    python rt.py voice-backup [--group ИМЯ]    # открытый резерв профилей в voice-backups
     python rt.py self-check [--no-tests]        # тесты, проверка файлов на личные данные, морфология
 
     Данные (опасные действия: спрашивают согласие на клавиатуре, только в настоящем терминале):
@@ -121,6 +125,11 @@ def build():
     vp = sub.add_parser("voice-preview"); vp.add_argument("job")
     vu = sub.add_parser("voice-update"); vu.add_argument("job")
     vr = sub.add_parser("voice-revoke"); vr.add_argument("job")
+    vq = sub.add_parser("voice-quality"); vq.add_argument("--group", default="")
+    vqp = sub.add_parser("voice-quality-policy"); vqp.add_argument("policy", choices=["warn", "reject_clipping"])
+    vqp.add_argument("--group", default="")
+    vrp = sub.add_parser("voice-refresh-plan"); vrp.add_argument("--group", default="")
+    vbk = sub.add_parser("voice-backup"); vbk.add_argument("--group", default="")
     sc = sub.add_parser("self-check"); sc.add_argument("--no-tests", action="store_true")
     e = sub.add_parser("export"); e.add_argument("--group", default=""); e.add_argument("--dest", default=""); e.add_argument("--with-jobs", action="store_true")
     i = sub.add_parser("import"); i.add_argument("zip"); i.add_argument("--replace", action="store_true"); i.add_argument("--apply", action="store_true")
@@ -192,6 +201,19 @@ def run(a):
         return gated("Настройка автопополнения голосов", [f"Группа: {a.group or 'умолчание новых групп'}",
                      f"Автопополнение: {a.state}"],
                      lambda: core.set_voice_auto_learn(a.state == "on", a.group))
+    elif c == "voice-quality":
+        out(core.voice_quality(a.group))
+    elif c == "voice-quality-policy":
+        return gated("Политика качества голосов", [f"Группа: {a.group or 'умолчание новых групп'}",
+                     f"Политика: {a.policy}",
+                     "reject_clipping отбраковывает только клиппинг; тихая речь не отбраковывается."],
+                     lambda: core.set_voice_quality_policy(a.policy, a.group))
+    elif c == "voice-refresh-plan":
+        out(core.voice_refresh_plan(a.group))
+    elif c == "voice-backup":
+        return gated("Резервное копирование голосовых профилей", [f"Группа: {a.group or 'все группы'}",
+                     "Резерв — биометрия в открытом виде; старые копии не заменяются и не удаляются."],
+                     lambda: core.backup_voice_profiles(a.group))
     elif c == "audit":
         import data_io
         out(data_io.audit())

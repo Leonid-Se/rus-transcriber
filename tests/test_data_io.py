@@ -46,9 +46,23 @@ def put_group(name, spk, vocab=None):
 class T(unittest.TestCase):
     def setUp(self):
         import shutil
+        self._patches = [patch.object(paths, "DATA_DIR", Path(_TMP)),
+                         patch.object(paths, "GROUPS", Path(_TMP) / "groups"),
+                         patch.object(paths, "JOBS", Path(_TMP) / "jobs"),
+                         patch.object(paths, "BENCH", Path(_TMP) / "bench"),
+                         patch.object(paths, "CONFIG_FILE", Path(_TMP) / "config.json")]
+        for item in self._patches:
+            item.start()
         for d in (paths.GROUPS, paths.DATA_DIR / "_deleted", paths.DATA_DIR / "exports"):
             shutil.rmtree(d, ignore_errors=True)
-        paths.GROUPS.mkdir(parents=True, exist_ok=True)
+        for d in Path(_TMP).glob("_backup-import-*"):
+            shutil.rmtree(d, ignore_errors=True)
+        for d in (paths.GROUPS, paths.JOBS, paths.BENCH):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        for item in reversed(self._patches):
+            item.stop()
 
     def test_export_has_no_absolute_paths_and_no_quarantine(self):
         put_group("demo", {"Анна": 100, "Борис": 50})
@@ -92,6 +106,17 @@ class T(unittest.TestCase):
         put_group("demo", {"Глеб": 5})
         rep = data_io.import_data(z, "replace", apply=True)
         self.assertTrue(Path(rep["backup"], "groups", "demo", "voices.json").exists())
+
+    def test_repeated_replace_with_same_timestamp_does_not_collide(self):
+        put_group("demo", {"Анна": 100})
+        z = data_io.export_data()["zip"]
+        put_group("demo", {"Глеб": 5})
+        with patch.object(data_io.time, "strftime", return_value="repeat-test"):
+            first = data_io.import_data(z, "replace", apply=True)
+            second = data_io.import_data(z, "replace", apply=True)
+        self.assertNotEqual(first["backup"], second["backup"])
+        self.assertTrue(Path(first["backup"]).is_dir())
+        self.assertTrue(Path(second["backup"]).is_dir())
 
     def test_voice_settings_roundtrip_merge_replace_and_preview(self):
         put_group("demo", {"Анна": 100})

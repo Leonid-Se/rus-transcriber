@@ -70,7 +70,13 @@ def _voice_settings(data):
     reason = data.get("reason", "manual")
     if reason not in ("default", "manual", "sufficient"):
         raise RuntimeError("Недопустимая причина настройки автопополнения голосов")
-    return {"auto_learn": data["auto_learn"], "reason": reason}
+    out = {"auto_learn": data["auto_learn"], "reason": reason}
+    policy = data.get("audio_quality_policy")
+    if policy is not None and data.get("audio_quality_policy_source") != "default":
+        if policy not in ("warn", "reject_clipping"):
+            raise RuntimeError("Недопустимая политика качества голосов в архиве")
+        out["audio_quality_policy"] = policy
+    return out
 
 
 # ---------- экспорт ----------
@@ -222,6 +228,12 @@ def import_data(zip_path, mode="merge", apply=False):
                 raise RuntimeError("Не удалось прочитать настройки голосов из архива") from ex
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = paths.DATA_DIR / f"_backup-import-{stamp}"
+    # Два импорта в одну секунду (или повтор после прежнего резерва) не должны делить папку:
+    # иначе shutil.copytree падает на существующем каталоге и импорт не выполняется.
+    suffix = 2
+    while backup.exists():
+        backup = paths.DATA_DIR / f"_backup-import-{stamp}-{suffix}"
+        suffix += 1
     result = {"mode": mode, "applied": bool(apply), "archive_created": man.get("created"), "groups": {},
               "jobs": "не импортируются" if man.get("with_jobs") else None, "backup": None}
     extra_warnings = []

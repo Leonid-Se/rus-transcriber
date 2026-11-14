@@ -23,6 +23,7 @@ DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnn
             "diar_embeddings": "auto", "diar_ov_device": "CPU", "diar_chunks_per_batch": 16,
             "diar_segmentation_batch": 0, "torch_threads": 0,
             "pipeline": "words", "max_heavy_jobs": 2, "default_group": "", "voice_auto_learn_default": True,
+            "voice_quality_policy_default": "warn",
             # порог совпадения текста с эталоном при выборе устройства в тесте скорости.
             # 0.97 — обычный компромисс; для работы, где важнее точность, поднимите до 0.99.
             "bench_min_similarity": 0.97,
@@ -76,7 +77,11 @@ def update(explicit=(), **kv):
 
 
 def group_voice_settings(group, initialize=False):
-    """Настройка группы фиксируется при первом использовании, затем не зависит от общего умолчания."""
+    """Настройка группы фиксируется при первом использовании, затем не зависит от общего умолчания.
+
+    Политика качества (`warn` или `reject_clipping`) без явного значения наследует общее умолчание;
+    источник значения показывается, чтобы отличие умолчания от выбора человека было явным.
+    """
     if not group or paths.safe_group(group) != group:
         raise ValueError("недопустимое имя группы")
     p = paths.group_dir(group) / "voice-settings.json"
@@ -85,21 +90,35 @@ def group_voice_settings(group, initialize=False):
             data = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or type(data.get("auto_learn")) is not bool:
                 raise ValueError("неверный формат")
-            return data
+            policy = data.get("audio_quality_policy")
+            if policy is None:
+                policy, source = load_config().get("voice_quality_policy_default", "warn"), "default"
+                if policy not in ("warn", "reject_clipping"):
+                    raise ValueError("неверное глобальное умолчание качества")
+            elif policy in ("warn", "reject_clipping"):
+                source = "group"
+            else:
+                raise ValueError("неверная политика качества")
         except (OSError, ValueError) as ex:
             raise ValueError("настройки голосов группы повреждены; автопополнение запрещено") from ex
+        return {**data, "audio_quality_policy": policy, "audio_quality_policy_source": source}
     value = load_config().get("voice_auto_learn_default", True)
     if type(value) is not bool:
         raise ValueError("неверное глобальное умолчание автопополнения")
     data = {"auto_learn": value, "reason": "default"}
     if initialize:
         save_group_voice_settings(group, data)
-    return data
+    policy = load_config().get("voice_quality_policy_default", "warn")
+    if policy not in ("warn", "reject_clipping"):
+        raise ValueError("неверное глобальное умолчание качества")
+    return {**data, "audio_quality_policy": policy, "audio_quality_policy_source": "default"}
 
 
 def save_group_voice_settings(group, data):
     if not group or paths.safe_group(group) != group or type(data.get("auto_learn")) is not bool:
         raise ValueError("неверные настройки группы")
+    if data.get("audio_quality_policy") not in (None, "warn", "reject_clipping"):
+        raise ValueError("неверная политика качества")
     p = paths.group_dir(group) / "voice-settings.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     import tempfile

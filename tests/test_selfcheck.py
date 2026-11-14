@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -56,6 +57,32 @@ class SelfCheck(unittest.TestCase):
         self.assertNotIn("Секрет", str(m))
         self.assertEqual(m[1]["why"], "путь с именем пользователя")
         self.assertEqual(m[2]["why"], "файл личных данных или результатов не должен быть в репозитории")
+
+    def _with_check_repo(self, body):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "tools").mkdir()
+            (root / "tools" / "check_repo.py").write_text(
+                "def check(staged=False, require_words=True):\n" + body, encoding="utf-8")
+            old = selfcheck.HERE
+            selfcheck.HERE = root
+            try:
+                return selfcheck.run_check_repo()
+            finally:
+                selfcheck.HERE = old
+
+    def test_empty_word_list_is_partial_not_failure(self):
+        # на домашней установке приватного списка слов нет: проверка путей выполнена, это не поломка
+        r = self._with_check_repo("    return [], set(), False\n")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["partial"])
+        self.assertEqual((r["words"], r["violations"]), (0, 0))
+        self.assertIn("проверка слов не выполнена", r["note"])
+
+    def test_violations_fail_even_without_word_list(self):
+        r = self._with_check_repo("    return [('a.py:1', 'нарушение')], set(), False\n")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["violations"], 1)
 
 
 if __name__ == "__main__":

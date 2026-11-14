@@ -13,7 +13,8 @@
       %APPDATA%\rus-transcriber-data; путь записывается в настройки сервера (RUS_TRANSCRIBER_DATA)
 
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
-      убирает сервер из настроек Claude; отдельно спрашивает: удалить папку программы с моделями и кэшами
+      убирает сервер из настроек приложения ИИ-агента (например, Claude Desktop);
+      отдельно спрашивает: удалить папку программы с моделями и кэшами
       (по умолчанию да) и удалить личные данные (по умолчанию НЕТ)
 
 Повторный запуск безопасен: обновляет программу, не трогая данные пользователя (папка данных: профили, словари, config.json с результатом теста скорости).
@@ -60,7 +61,7 @@ function Invoke-RerunHint {
     return "  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
 }
 
-# ---------- где лежит конфиг Claude Desktop (обычная установка или из Microsoft Store) ----------
+# ---------- где лежит конфиг приложения ИИ-агента (обычная установка или из Microsoft Store) ----------
 function Find-ClaudeConfig {
     # Claude Desktop из Microsoft Store (с версии ~3.1623) читает настройки из
     #   %LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json
@@ -119,7 +120,7 @@ if (-not $Target) {
     }
 }
 $Target = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Target).TrimEnd("\")
-# папка данных: параметр -DataDir -> уже записанная в настройках Claude -> %APPDATA%\rus-transcriber-data
+# папка данных: параметр -DataDir -> уже записанная в настройках приложения ИИ-агента -> %APPDATA%\rus-transcriber-data
 if (-not $DataDir) { $DataDir = Join-Path $env:APPDATA "$Name-data" }
 $DataDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataDir).TrimEnd("\")
 if ($DataDir -eq $Target -or $DataDir.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -132,7 +133,7 @@ if ($Uninstall) {
     foreach ($cp in (Find-ClaudeConfig)) {
         if (Test-Path $cp) {
             Edit-ClaudeConfig $cp { param($s) $s.PSObject.Properties.Remove($Name) }
-            Write-Host "  убран из настроек Claude: $cp"
+            Write-Host "  убран из настроек приложения ИИ-агента: $cp"
         }
     }
     if (Test-Path (Join-Path $Target "server.py")) {
@@ -147,7 +148,7 @@ if ($Uninstall) {
         else { Write-Host "  данные оставлены нетронутыми: $DataDir" }
     }
     Write-Host "Python и ffmpeg не удалялись (ими могут пользоваться другие программы)"
-    Write-Host "Перезапустите Claude Desktop."
+    Write-Host "Перезапустите приложение ИИ-агента (например, Claude Desktop)."
     exit 0
 }
 
@@ -265,12 +266,22 @@ if ($Source -ne $Target) {
                      "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "cards.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
     }
-    $tl = Join-Path $Source "tools"      # проверка качества (eval_quality.py) и проверка репозитория (check_repo.py)
-    if (Test-Path $tl) { Copy-Item $tl (Join-Path $Target "tools") -Recurse -Force -Exclude "__pycache__" }
-    $ts = Join-Path $Source "tests"      # тесты — для самопроверки (self_check) на этом компьютере
-    if (Test-Path $ts) { Copy-Item $ts (Join-Path $Target "tests") -Recurse -Force -Exclude "__pycache__" }
-    $ex = Join-Path $Source "examples"
-    if (Test-Path $ex) { Copy-Item $ex (Join-Path $Target "examples") -Recurse -Force }   # пример группы (вымышленный)
+    # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
+    # examples — вымышленный пример группы.
+    # Копируем СОДЕРЖИМОЕ папок, а не сами папки: Copy-Item -Recurse с существующей папкой
+    # назначения вложил бы источник внутрь (tests\tests), и при обновлении тесты остались бы старыми.
+    foreach ($sub in @("tools", "tests", "examples")) {
+        $sd = Join-Path $Source $sub
+        if (-not (Test-Path $sd)) { continue }
+        $dd = Join-Path $Target $sub
+        New-Item -ItemType Directory -Path $dd -Force | Out-Null
+        Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
+        # вложенные дубли от прошлых версий установщика больше не нужны
+        $dup = Join-Path $dd $sub
+        if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
     # данные (профили, словари, настройки, задачи) лежат в папке данных, установщик их не копирует и не трогает;
     # старые profiles\, config.json, jobs\ из папки программы перенесёт migrate.py при первом запуске сервера
 } else { Write-Host "  запуск из папки программы, копировать нечего" }
@@ -317,8 +328,20 @@ if ($ov -ne "2025.4.1") {
 Write-Host "  нужны CPU, OpenVINOExecutionProvider и желательно GPU; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
 
 Step "8/9" "Токен Hugging Face"
+# при обновлении приложение ИИ-агента уже хранит рабочий токен — второй раз вводить не нужно
+$savedToken = ""
+foreach ($cp in (Find-ClaudeConfig)) {
+    if (Test-Path $cp) {
+        try {
+            $saved = (Get-Content $cp -Raw -Encoding UTF8 | ConvertFrom-Json).mcpServers.$Name
+            if ($saved -and $saved.env -and $saved.env.HF_TOKEN -and
+                $saved.env.HF_TOKEN -ne "ВСТАВЬТЕ_СЮДА_hf_ТОКЕН") { $savedToken = [string]$saved.env.HF_TOKEN }
+        } catch { }
+    }
+}
 if (-not $Token) {
-    $sec = Read-Host "Вставьте токен Hugging Face (hf_..., тип Read). Enter — пропустить" -AsSecureString
+    $hint = if ($savedToken) { "Enter — оставить сохранённый токен" } else { "Enter — пропустить" }
+    $sec = Read-Host "Вставьте токен Hugging Face (hf_..., тип Read). $hint" -AsSecureString
     $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
 }
 $Token = $Token.Trim()
@@ -336,18 +359,20 @@ if ($Token) {
                         "  и примите условия (кнопка вверху страницы), потом всё заработает без переустановки") -ForegroundColor Yellow
         }
     } catch { Write-Host "  токен не принят Hugging Face — проверьте, что скопировали его целиком" -ForegroundColor Yellow }
+} elseif ($savedToken) {
+    Write-Host "  пропущено: останется сохранённый токен из настроек приложения ИИ-агента" -ForegroundColor DarkGray
 } else {
-    Write-Host "  пропущено: допишите HF_TOKEN в настройки Claude позже (см. README)" -ForegroundColor Yellow
+    Write-Host "  пропущено: допишите HF_TOKEN в настройки приложения ИИ-агента позже (см. README)" -ForegroundColor Yellow
 }
 
-Step "9/9" "Подключение к Claude Desktop"
+Step "9/9" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
 if ($SkipClaudeConfig) {
     Write-Host "  пропущено (-SkipClaudeConfig)"
 } else {
-    # Claude Desktop при выходе сохраняет настройки поверх файла и затирает нашу запись,
-    # поэтому писать можно только при полностью закрытом приложении
+    # Приложение при выходе сохраняет настройки поверх файла и затирает нашу запись,
+    # поэтому писать можно только при полностью закрытом приложении.
     while (Get-Process -Name "Claude" -ErrorAction SilentlyContinue) {
-        Write-Host "  Claude Desktop запущен. Закройте его полностью: правой кнопкой по значку Claude в трее → Quit (Выход)." -ForegroundColor Yellow
+        Write-Host "  Приложение ИИ-агента (например, Claude Desktop) запущено. Закройте его полностью: правой кнопкой по значку в трее → Quit (Выход)." -ForegroundColor Yellow
         $null = Read-Host "  Когда закроете, нажмите Enter"
         Start-Sleep -Seconds 2
     }
@@ -365,7 +390,7 @@ if ($SkipClaudeConfig) {
         if ($chk -and ([string]$chk.args[0]) -eq $server) { Write-Host "  записано и проверено: $cp" -ForegroundColor Green }
         else { Fail "Запись в $cp не сохранилась. Пришлите этот файл (без токена) для разбора." }
     }
-    Write-Host "  Теперь запустите Claude Desktop." -ForegroundColor Yellow
+    Write-Host "  Теперь запустите приложение ИИ-агента (например, Claude Desktop)." -ForegroundColor Yellow
 }
 
 # старые кэши от первой версии в профиле можно удалить
@@ -377,5 +402,5 @@ if ($old) {
 
 Write-Host "`nГотово. Программа, модели и кэши: $Target" -ForegroundColor Green
 Write-Host "Личные данные: $DataDir (установщик их не трогает; перенос между компьютерами — export_group / import_group)" -ForegroundColor Green
-Write-Host "Дальше — тест скорости. Попросите Claude: «запусти тест скорости на C:\...\запись.mp3»,"
+Write-Host "Дальше — тест скорости. Попросите ИИ-агента (например, Claude Desktop): «запусти тест скорости на C:\...\запись.mp3»,"
 Write-Host "или вручную:  `$env:HF_TOKEN='hf_...'; & '$py' '$Target\bench.py' 'C:\путь\к\записи.mp3'"

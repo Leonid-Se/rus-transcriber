@@ -274,8 +274,38 @@ if ($Source -ne $Target) {
         $sd = Join-Path $Source $sub
         if (-not (Test-Path $sd)) { continue }
         $dd = Join-Path $Target $sub
-        if (Test-Path $dd) { Remove-Item $dd -Recurse -Force }
-        Copy-Item $sd $dd -Recurse -Force
+        $srcFiles = @(Get-ChildItem $sd -Recurse -File | ForEach-Object { $_.FullName.Substring($sd.Length + 1) })
+        # файлы, которых нет в комплекте, могли добавить вы сами: без согласия их не удаляем
+        $extra = @()
+        if (Test-Path $dd) {
+            $extra = @(Get-ChildItem $dd -Recurse -File -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName.Substring($dd.Length + 1) } |
+                Where-Object { $srcFiles -notcontains $_ -and $_ -notlike "$sub\*" -and
+                               ($_ -split '\\') -notcontains "__pycache__" -and $_ -notlike "*.pyc" })
+        }
+        $replace = $true
+        if ($extra.Count) {
+            $shown = ($extra | Select-Object -First 5) -join "; "
+            if ($extra.Count -gt 5) { $shown += "; и ещё " + ($extra.Count - 5) }
+            Write-Host "  в папке $sub есть файлы, которых нет в комплекте программы ($($extra.Count)):" -ForegroundColor Yellow
+            Write-Host "    $shown" -ForegroundColor Yellow
+            Write-Host "  при обновлении папка $sub заменяется целиком, чтобы self_check проверял актуальный набор" -ForegroundColor Yellow
+            $ans = Read-Host "  Удалить эти файлы? Enter или y — удалить, n — оставить (Y/n)"
+            $replace = -not ($ans -match '^(n|н)')
+            if (-not $replace) {
+                Write-Host "  файлы оставлены: файлы программы будут перезаписаны, устаревшие останутся, self_check может показывать старые проверки" -ForegroundColor Yellow
+            }
+        }
+        if ($replace) {
+            if (Test-Path $dd) { Remove-Item $dd -Recurse -Force }
+            Copy-Item $sd $dd -Recurse -Force
+        } else {
+            New-Item -ItemType Directory -Path $dd -Force | Out-Null
+            Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
+        }
+        # вложенные дубли прошлых версий установщика и кэш байткода — не данные пользователя
+        $dup = Join-Path $dd $sub
+        if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
         Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }

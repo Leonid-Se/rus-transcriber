@@ -67,6 +67,8 @@ VARIANTS = [
      "asr_model": "v3_e2e_ctc", "label": "CTC, процессор"},
     {"id": "ctc-cpu-b8", "family": CTC, "device": "CPU", "asr_backend": "onnx-cpu",
      "asr_model": "v3_e2e_ctc", "asr_batch": 8, "label": "CTC, процессор, пакеты по 8"},
+    {"id": "ctc-dml", "family": CTC, "device": "GPU", "asr_backend": "dml",
+     "asr_model": "v3_e2e_ctc", "label": "CTC, DirectML"},
     {"id": "ctc-gpu", "family": CTC, "device": "GPU", "asr_backend": "openvino", "asr_device": "GPU",
      "asr_model": "v3_e2e_ctc", "label": "CTC, видеокарта Arc"},
     {"id": "ctc-gpu-b8", "family": CTC, "device": "GPU", "asr_backend": "openvino", "asr_device": "GPU",
@@ -80,6 +82,8 @@ VARIANTS = [
      "asr_third_device": "GPU", "asr_third_quant": "fp16", "label": "Whisper, видеокарта Arc (fp16)"},
     {"id": "whisper-cpu", "family": WHISPER, "device": "CPU", "asr_backend": "whisper-cpu",
      "asr_third_device": "CPU", "asr_third_quant_cpu": "int8", "label": "Whisper, процессор (int8)"},
+    {"id": "whisper-dml", "family": WHISPER, "device": "GPU", "asr_backend": "dml",
+     "asr_quant": "int8", "label": "Whisper, DirectML (int8)"},
 ]
 
 DEFAULT_SET = ("torch-cpu,onnx-cpu,onnx-cpu-b8,onnx-cpu-b16,"
@@ -224,6 +228,12 @@ def run_one(variant, npy, model, chunk_max):
         if variant["asr_backend"] == "whisper-ov":
             asr = WhisperOV(third, device="GPU", quant=variant.get("asr_third_quant", "fp16"),
                             language="ru", batch=4)
+        elif variant["asr_backend"] == "dml":
+            # Whisper через общий OnnxASR с провайдером DirectML (для машин без OpenVINO GPU)
+            asr, _ = make_asr({"asr_model": third, "asr_backend": "dml", "asr_device": "GPU",
+                               "asr_quant": variant.get("asr_quant", "int8"),
+                               "asr_quant_cpu": variant.get("asr_quant", "int8"),
+                               "asr_language": "ru", "asr_batch": 4})
         else:
             asr, _ = make_asr({"asr_model": third, "asr_backend": "onnx-cpu", "asr_device": "CPU",
                                "asr_quant_cpu": variant.get("asr_third_quant_cpu", "int8"),

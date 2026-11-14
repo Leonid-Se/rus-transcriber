@@ -51,6 +51,8 @@
   защита в `backends.py` уже есть;
 - исследование `faster-whisper` (CTranslate2 int8 CPU) или whisper.cpp с Vulkan
   (задействует Radeon) — замена третьей модели, с обязательной проверкой эталоном.
+  Предварительное исследование: `docs/research-third-whisper-2026-11.md` (2026-11-14:
+  приоритет faster-whisper, замеры не выполнялись).
 
 ### Г. Вне кода
 

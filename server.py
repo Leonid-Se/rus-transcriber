@@ -69,7 +69,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.14.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.14.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)

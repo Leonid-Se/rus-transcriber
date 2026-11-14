@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import re
+import time
 import uuid
 from functools import wraps
 from pathlib import Path
@@ -117,6 +118,11 @@ def render_md(data, text_only=False):
              f"Длительность: {data['duration']} · Участников: {len(data['speakers'])}"
              + (f" ({', '.join(data['speakers'])})" if data.get("speaker_names") else ""), ""]
     q0 = data.get("quality") or {}
+    if q0.get("asr_incomplete_chunks"):
+        lines.append(f"_Внимание: технически не распознано фрагментов: {q0['asr_incomplete_chunks']}; "
+                     "завершение задачи не означает полноту стенограммы._\n")
+    if q0.get("vote3_skipped"):
+        lines.append("_Голосование трёх моделей отключено из-за неполного или неизвестного результата ASR._\n")
     if q0.get("group_doubt"):
         lines.append(f"_Внимание: {q0['group_doubt']['note']}._\n")
     if q0.get("names_outside_vocab"):
@@ -202,6 +208,16 @@ def save_new(data, json_path, md_path):
         return _save_locked(data, json_path, md_path)
 
 
+def _listening_fingerprint(words):
+    content = [[w.get("word_id"), w.get("w"), w.get("s"), w.get("e")] for w in words]
+    return hashlib.sha256(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _interval_words(data, start, end):
+    return [w for seg in data.get("segments") or [] for w in seg.get("words") or []
+            if w.get("s", end) < end and w.get("e", w.get("s", end)) > start]
+
+
 def _save_locked(data, json_path, md_path):
     # Идентификаторы не зависят от времени слова или его позиции в отображении.
     # Старые файлы получают их при первом сохранении; дубликаты после разрезания
@@ -217,6 +233,20 @@ def _save_locked(data, json_path, md_path):
                 ident = uuid.uuid4().hex
                 obj[field] = ident
             seen.add(ident)
+    for item in data.get("review") or []:
+        listening = item.get("listening")
+        if item.get("asr_problem") and not listening and item.get("status") == "resolved":
+            item["status"] = "open"
+            data["review_done"] = False
+        if not listening or not item.get("gap"):
+            continue
+        start, end = item["gap"]
+        current = _interval_words(data, start, end)
+        if _listening_fingerprint(current) != listening.get("fingerprint"):
+            item.pop("listening", None)
+            item["status"] = "open"
+            item["note"] = "Слова интервала изменились после прослушивания; нужна новая проверка."
+            data["review_done"] = False
     data["source_revision"] = data.get("source_revision", 0) + 1
     Path(json_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     Path(md_path).write_text(render_md(data), encoding="utf-8")
@@ -421,7 +451,14 @@ def review_list(json_path, offset=0, limit=40, reasons=None, min_sec=0.0, brief=
             continue
         loc = _find_span(data, it)
         row = {k: it.get(k) for k in ("id", "t", "speaker", "text", "alt_ctc", "alt_whisper", "alt_ctc_extra", "reasons", "voices",
-                                      "conf_min", "note", "status") if it.get(k) is not None}
+                                      "conf_min", "note", "status", "asr_problem", "listening") if it.get(k) is not None}
+        if row.get("asr_problem"):
+            models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
+            problem = dict(row["asr_problem"])
+            problem["model_id"] = (models.get(problem.get("model")) or {}).get("id")
+            problem["words_from_models"] = [(models.get(key) or {}).get("id") or key
+                                             for key in problem.get("words_from") or []]
+            row["asr_problem"] = problem
         row["t"] = hms(it["t"])
         if loc:
             si, w1, w2 = loc
@@ -505,6 +542,7 @@ def reopen(json_path, md_path, ids):
             continue
         it["status"] = "open"
         it.pop("note", None)
+        it.pop("listening", None)
         done.append(rid)
     data["review_done"] = not any(i.get("status", "open") == "open" for i in data.get("review") or [])
     save(data, json_path, md_path)
@@ -983,6 +1021,30 @@ def apply_review(json_path, md_path, decisions, by="claude"):
         if d.get("status") == "human":
             it["status"], it["note"] = "human", d.get("note") or it.get("note")
             report["human"] += 1
+            continue
+        if it.get("asr_problem") and "listened" not in d:
+            report.setdefault("conflicts", []).append({"id": it["id"], "why": "нужно отдельное подтверждение прослушивания"})
+            continue
+        if "listened" in d:
+            if by != "human" or not it.get("asr_problem") or d["listened"] not in ("words", "silence") \
+                    or d.get("human_after"):
+                report.setdefault("conflicts", []).append({"id": it["id"], "why": "нет явного подтверждения человека"})
+                continue
+            start, end = it.get("gap", [None, None])
+            if start is None or end is None or end <= start:
+                report.setdefault("conflicts", []).append({"id": it["id"], "why": "неверный интервал"})
+                continue
+            heard_words = _interval_words(data, start, end)
+            if (d["listened"] == "silence" and heard_words) or (d["listened"] == "words" and not heard_words):
+                report.setdefault("conflicts", []).append({"id": it["id"], "why":
+                    "выбранный ответ противоречит словам стенограммы; сначала исправьте стенограмму"})
+                continue
+            it["listening"] = {"by": "human", "result": d["listened"],
+                               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                               "fingerprint": _listening_fingerprint(heard_words)}
+            it["status"] = "resolved"
+            report["kept"] += 1
+            report["successful_ids"].append(it["id"])
             continue
         target = {**it, **({"word_ids": d["word_ids"]} if "word_ids" in d else {})}
         loc = _find_span(data, target)

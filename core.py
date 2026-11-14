@@ -242,6 +242,10 @@ def _text_only(s, key):
         if rest:
             body += f"\n\n[без разделов: {', '.join(rest)} — {len(full) - len(body)} симв.; extra=True — полностью]"
         return body
+    quality = data.get("quality") or {}
+    summary = {k: quality[k] for k in ("asr_incomplete_chunks", "vote3_skipped") if quality.get(k)}
+    if summary:
+        data["asr_summary"] = summary
     for k in ("review", "edits", "quality", "timing"):
         data.pop(k, None)
     segs = []

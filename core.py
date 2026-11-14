@@ -886,7 +886,7 @@ def set_voice_quality_policy(policy, group=""):
 
 REFRESH_MEANINGS = {
     "unchanged": "Источник учтён, отпечаток совпадает.",
-    "changed": "Стенограмма или аудио изменились — нужен просмотр и подтверждённое обновление.",
+    "changed": "Отпечаток стенограммы или метаданные аудио отличаются — нужен просмотр и подтверждённое обновление.",
     "legacy_baseline_pending": "Отпечатка нет; при следующем обучении текущее состояние будет принято как исходное.",
     "not_recorded": "Источник есть в профиле, но без записи происхождения.",
     "transcript_missing": "Файл стенограммы не найден.",
@@ -937,6 +937,8 @@ def voice_refresh_plan(group=""):
             audio_path, audio_key = None, None
             entry = {"transcript": jp.name, "recording": None, "job_id": jobs.get(str(jp.resolve())),
                      "status": "transcript_missing", "needs_update": True,
+                     "transcript_changed": None, "audio_changed": None,
+                     "comparison_basis": "unavailable", "legacy_mtime_changed": None,
                      "needs_review_reasons": []}
             if jp.is_file():
                 try:
@@ -959,11 +961,17 @@ def voice_refresh_plan(group=""):
                                                "legacy_unchanged": "legacy_baseline_pending",
                                                "legacy_changed": "changed",
                                                "absent": "not_recorded"}.get(status, "changed")
-                            entry["transcript_changed"] = bool(isinstance(stored, dict)
-                                and stored.get("transcript_sha256") != current["transcript_sha256"])
-                            entry["audio_changed"] = bool(isinstance(stored, dict)
-                                and (stored.get("audio_size") != current["audio_size"]
-                                     or stored.get("audio_mtime") != current["audio_mtime"]))
+                            if status in ("legacy_changed", "legacy_unchanged"):
+                                entry["comparison_basis"] = "legacy_mtime"
+                                entry["legacy_mtime_changed"] = status == "legacy_changed"
+                            elif isinstance(stored, dict):
+                                entry["comparison_basis"] = "fingerprint"
+                                transcript_keys = ("transcript_sha256", "transcript_size")
+                                audio_keys = ("audio_size", "audio_mtime")
+                                if all(stored.get(k) is not None for k in transcript_keys):
+                                    entry["transcript_changed"] = any(stored[k] != current[k] for k in transcript_keys)
+                                if all(stored.get(k) is not None for k in audio_keys):
+                                    entry["audio_changed"] = any(stored[k] != current[k] for k in audio_keys)
             versions = []
             if audio_key:
                 for speaker in (data.get("speakers") or {}).values():
@@ -973,7 +981,12 @@ def voice_refresh_plan(group=""):
             current_selection = bool(versions) and all(v == voices.SELECTION_VERSION for v in versions)
             entry["selection_version_current"] = current_selection
             if entry["status"] == "changed":
-                entry["needs_review_reasons"].append("стенограмма или аудио изменились")
+                if entry["comparison_basis"] == "legacy_mtime":
+                    entry["needs_review_reasons"].append("время стенограммы отличается от сохранённого старого значения")
+                elif entry["comparison_basis"] == "unavailable":
+                    entry["needs_review_reasons"].append("прежние данные источника не позволяют выполнить сравнение")
+                else:
+                    entry["needs_review_reasons"].append("отпечаток стенограммы или метаданные аудио отличаются")
             if versions and not current_selection:
                 entry["needs_review_reasons"].append("вклад без текущей версии отбора")
             if entry["status"] in ("transcript_missing", "transcript_unreadable", "audio_missing"):
@@ -990,6 +1003,11 @@ def voice_refresh_plan(group=""):
                     entry["needs_review_reasons"].append("есть предупреждения качества аудио")
             entry["needs_update"] = bool(entry["needs_review_reasons"])
             entry["meaning"] = REFRESH_MEANINGS.get(entry["status"], entry["status"])
+            if entry["status"] == "changed" and entry["comparison_basis"] == "legacy_mtime":
+                entry["meaning"] = ("Время стенограммы отличается от старого значения; сравнить содержимое "
+                                    "стенограммы и прежнее аудио невозможно. Нужен просмотр.")
+            elif entry["status"] == "changed" and entry["comparison_basis"] == "unavailable":
+                entry["meaning"] = "Прежние данные источника не позволяют выполнить сравнение; нужен просмотр."
             entries.append(entry)
         summary = {}
         for item in entries:

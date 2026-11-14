@@ -172,6 +172,10 @@ class VoiceManagementTests(unittest.TestCase):
         entry = plan["groups"][0]["sources"][0]
         self.assertEqual(entry["status"], "unchanged")
         self.assertFalse(entry["needs_update"])
+        self.assertEqual(entry["comparison_basis"], "fingerprint")
+        self.assertIs(entry["transcript_changed"], False)
+        self.assertIs(entry["audio_changed"], False)
+        self.assertIsNone(entry["legacy_mtime_changed"])
         st = source.stat()
         source.write_text(json.dumps({**data, "source_revision": 2}), encoding="utf-8")
         os.utime(source, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -179,6 +183,7 @@ class VoiceManagementTests(unittest.TestCase):
         entry = plan["groups"][0]["sources"][0]
         self.assertEqual(entry["status"], "changed")
         self.assertTrue(entry["transcript_changed"])
+        self.assertIs(entry["audio_changed"], False)
         self.assertTrue(entry["needs_update"])
         self.assertEqual(plan["needs_update"], 1)
         self.assertEqual(target.read_bytes(), before)
@@ -192,6 +197,75 @@ class VoiceManagementTests(unittest.TestCase):
         entry = core.voice_refresh_plan("demo-group")["groups"][0]["sources"][0]
         self.assertEqual(entry["status"], "legacy_baseline_pending")
         self.assertTrue(entry["needs_update"])
+        self.assertEqual(entry["comparison_basis"], "legacy_mtime")
+        self.assertIs(entry["legacy_mtime_changed"], False)
+        self.assertIsNone(entry["transcript_changed"])
+        self.assertIsNone(entry["audio_changed"])
+
+    def test_legacy_changed_mtime_does_not_claim_fingerprint_comparisons(self):
+        folder = self.group()
+        audio, source, _ = write_recording(folder)
+        profile = self.profile(sources={str(source.resolve()): source.stat().st_mtime - 100})
+        target = folder / "voices.json"
+        target.write_text(json.dumps(profile), encoding="utf-8")
+        before = [p.read_bytes() for p in (target, source, audio)]
+        entry = core.voice_refresh_plan("demo-group")["groups"][0]["sources"][0]
+        self.assertEqual(entry["status"], "changed")
+        self.assertTrue(entry["needs_update"])
+        self.assertEqual(entry["comparison_basis"], "legacy_mtime")
+        self.assertIs(entry["legacy_mtime_changed"], True)
+        self.assertIsNone(entry["transcript_changed"])
+        self.assertIsNone(entry["audio_changed"])
+        self.assertIn("время стенограммы", entry["needs_review_reasons"][0])
+        self.assertIn("сравнить содержимое", entry["meaning"])
+        self.assertEqual([p.read_bytes() for p in (target, source, audio)], before)
+
+    def test_refresh_plan_reports_audio_metadata_change(self):
+        folder = self.group()
+        audio, source, _ = write_recording(folder)
+        profile = self.profile(sources={str(source.resolve()): voices.source_fingerprint(source, audio)})
+        target = folder / "voices.json"
+        target.write_text(json.dumps(profile), encoding="utf-8")
+        audio.write_bytes(b"different synthetic audio length")
+        before = [p.read_bytes() for p in (target, source, audio)]
+        entry = core.voice_refresh_plan("demo-group")["groups"][0]["sources"][0]
+        self.assertEqual(entry["status"], "changed")
+        self.assertIs(entry["transcript_changed"], False)
+        self.assertIs(entry["audio_changed"], True)
+        self.assertEqual([p.read_bytes() for p in (target, source, audio)], before)
+
+    def test_refresh_plan_missing_source_or_audio_has_unknown_comparisons(self):
+        folder = self.group()
+        audio, source, _ = write_recording(folder)
+        missing = folder / "missing.transcript.json"
+        profile = self.profile(sources={str(source.resolve()): voices.source_fingerprint(source, audio),
+                                        str(missing.resolve()): 1.0})
+        target = folder / "voices.json"
+        target.write_text(json.dumps(profile), encoding="utf-8")
+        audio.unlink()
+        before = [p.read_bytes() for p in (target, source)]
+        entries = core.voice_refresh_plan("demo-group")["groups"][0]["sources"]
+        self.assertEqual({entry["status"] for entry in entries}, {"audio_missing", "transcript_missing"})
+        for entry in entries:
+            self.assertEqual(entry["comparison_basis"], "unavailable")
+            self.assertIsNone(entry["legacy_mtime_changed"])
+            self.assertIsNone(entry["transcript_changed"])
+            self.assertIsNone(entry["audio_changed"])
+            self.assertTrue(entry["needs_update"])
+        self.assertEqual([p.read_bytes() for p in (target, source)], before)
+
+    def test_refresh_plan_incomplete_fingerprint_leaves_missing_comparison_unknown(self):
+        folder = self.group()
+        audio, source, _ = write_recording(folder)
+        fingerprint = voices.source_fingerprint(source, audio)
+        fingerprint.pop("audio_mtime")
+        target = folder / "voices.json"
+        target.write_text(json.dumps(self.profile(sources={str(source.resolve()): fingerprint})), encoding="utf-8")
+        entry = core.voice_refresh_plan("demo-group")["groups"][0]["sources"][0]
+        self.assertEqual(entry["status"], "changed")
+        self.assertEqual(entry["comparison_basis"], "fingerprint")
+        self.assertIs(entry["transcript_changed"], False)
+        self.assertIsNone(entry["audio_changed"])
 
     def test_backup_creates_separate_unencrypted_copy(self):
         folder = self.group()

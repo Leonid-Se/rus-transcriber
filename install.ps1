@@ -267,18 +267,15 @@ if ($Source -ne $Target) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
     }
     # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
-    # examples — вымышленный пример группы.
-    # Копируем СОДЕРЖИМОЕ папок, а не сами папки: Copy-Item -Recurse с существующей папкой
-    # назначения вложил бы источник внутрь (tests\tests), и при обновлении тесты остались бы старыми.
+    # examples — вымышленный пример группы. Это копии комплекта программы, а личные данные
+    # лежат в папке данных, поэтому при обновлении папки заменяются целиком: иначе старые
+    # тесты и инструменты остаются рядом с новыми и self_check проверяет устаревший набор.
     foreach ($sub in @("tools", "tests", "examples")) {
         $sd = Join-Path $Source $sub
         if (-not (Test-Path $sd)) { continue }
         $dd = Join-Path $Target $sub
-        New-Item -ItemType Directory -Path $dd -Force | Out-Null
-        Copy-Item (Join-Path $sd "*") $dd -Recurse -Force
-        # вложенные дубли от прошлых версий установщика больше не нужны
-        $dup = Join-Path $dd $sub
-        if (Test-Path $dup) { Remove-Item $dup -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $dd) { Remove-Item $dd -Recurse -Force }
+        Copy-Item $sd $dd -Recurse -Force
         Get-ChildItem $dd -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }

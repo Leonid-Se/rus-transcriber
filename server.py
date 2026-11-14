@@ -56,6 +56,8 @@ rus-transcriber: расшифровка русской речи (в том чи�
 5. Голоса: rename_speakers подтверждает имена в расшифровке; update_voice_profiles — отдельный пересчёт
    после подтверждения человеком; resolve_voice — только по решению человека о тёзке из карантина.
    Автопополнение зависит от настройки группы и отключается при достаточности; новые голоса по-прежнему обнаруживаются.
+   voice_refresh_plan показывает изменённые источники без записи; voice_quality и set_voice_quality_policy —
+   диагностика и политика warn/reject_clipping; backup_voice_profiles делает открытый резерв биометрии.
 6. Конспект пишете вы: цитаты «…» берите только из стенограммы; check_quotes проверяет их, conspect_link связывает
    с местами стенограммы, conspect_render собирает документ.
 7. После обновления программы — self_check (тесты, проверка файлов на личные данные, морфология).
@@ -67,7 +69,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.13.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.14.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -661,6 +663,55 @@ async def set_voice_auto_learn(enabled: bool, group: str = "") -> str:
 
 
 @mcp.tool()
+def voice_quality(group: str = "") -> str:
+    """Политика качества аудио и сохранённые измерения по группам (без декодирования аудио).
+    warn — только предупреждать; reject_clipping — не учитывать источник с клиппингом. Тихая речь
+    и оценка SNR сами по себе не отбраковываются. Измерения приблизительны."""
+    try:
+        return json.dumps(core.voice_quality(group), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+async def set_voice_quality_policy(policy: str, group: str = "") -> str:
+    """Выбрать политику качества: warn (по умолчанию) или reject_clipping. Без group — умолчание
+    для групп без явной политики. Изменение требует отдельного подтверждения человеком."""
+    if policy not in ("warn", "reject_clipping"):
+        return 'policy: "warn" или "reject_clipping"'
+    return await _gated("Политика качества голосов", {"group": group, "policy": policy},
+                        lambda: [f"Группа: {group or 'умолчание новых групп'}", f"Политика качества: {policy}",
+                                 "reject_clipping отбраковывает только источник с клиппингом; "
+                                 "тихая речь не отбраковывается."],
+                        lambda: core.set_voice_quality_policy(policy, group))
+
+
+@mcp.tool()
+def voice_refresh_plan(group: str = "") -> str:
+    """Показать, у каких источников изменились стенограмма/аудио или остался старый отбор.
+    Только чтение: профиль не меняется. Обновление — отдельно через preview_voice_profiles
+    и update_voice_profiles для задачи из поля job_id."""
+    try:
+        return json.dumps(core.voice_refresh_plan(group), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+async def backup_voice_profiles(group: str = "") -> str:
+    """Сохранить резервные копии профилей одной группы или всех групп в voice-backups.
+    Это биометрия в открытом виде; копии не входят в экспорт и автоматически не удаляются."""
+    try:
+        return await _gated("Резервное копирование голосовых профилей", {"group": group},
+                            lambda: [f"Группа: {group or 'все группы'}",
+                                     "Резерв — биометрия в открытом виде.",
+                                     "Старые резервы не заменяются и не удаляются."],
+                            lambda: core.backup_voice_profiles(group))
+    except core.CoreError as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
 def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -> str:
     """Решение человека по тёзке из карантина профиля (см. voice_profiles → quarantine): голос с именем
     name в записи recording (имя файла расшифровки или записи, можно часть) не похож на собранный профиль.
@@ -708,8 +759,18 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
             tmp = f.name
         os.replace(tmp, pf)
     if decision == "different":
+        remaining = sorted(n for n, s in (d.get("speakers") or {}).items()
+                           if akey in (s.get("parts") or {}))
         return json.dumps({"group": pf.parent.name, "name": name, "recording": akey,
-                           "done": "в этот профиль запись по этому имени больше не идёт"}, ensure_ascii=False)
+                           "done": "в этот профиль запись по этому имени больше не идёт",
+                           "remaining_contributions": remaining,
+                           "revoke_removes_all_source_contributions": bool(remaining),
+                           "warning": ("Прежний вклад этой записи остался. Штатный "
+                                       "revoke_voice_profiles удалит вклады этой записи у всех "
+                                       "участников, не только у выбранного имени; сначала проверьте "
+                                       "preview_voice_profiles." if remaining else
+                                       "Вкладов этой записи в профиле нет.")},
+                          ensure_ascii=False)
     return json.dumps({"group": pf.parent.name, "name": name, "recording": akey,
                        "done": "личность подтверждена; профиль пока не изменён",
                        "hint": "Для пересчёта вызовите update_voice_profiles для задачи этой расшифровки и подтвердите план."},

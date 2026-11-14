@@ -18,6 +18,8 @@ import sys
 import tempfile
 import time
 import traceback
+import ast
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +48,25 @@ EMO_MIN = 2.0      # эмоцию считаем только на фрагме�
 GENDER_MARGIN = 0.05  # род глагола переносит реплику, только если и голос ближе к новому участнику
 
 EMO_RU = {"angry": "раздражение", "sad": "грусть", "neutral": "нейтрально", "positive": "позитив"}
+
+def asr_run_metadata():
+    """Компактное описание запуска без загрузки сервера и обращения к сети."""
+    version = None
+    try:
+        tree = ast.parse((HERE / "server.py").read_text(encoding="utf-8"))
+        version = next(ast.literal_eval(n.value) for n in tree.body
+                       if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERSION"
+                                                            for t in n.targets))
+    except (OSError, SyntaxError, ValueError, StopIteration):
+        pass
+    packages = {}
+    for name in ("onnx-asr", "onnxruntime", "onnxruntime-openvino", "openvino"):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            pass
+    return {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "program": version, "packages": packages, "models": {}}
 
 
 def wait_slot(st, cfg, status_path):
@@ -380,6 +401,9 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
 
     st.set(stage="распознавание", progress=38, asr_backend=asr.name, asr_fallbacks=asr_errors or None)
     asr_diag = quality.setdefault("asr_diagnostics", {})
+    run_meta = quality.setdefault("asr_run", asr_run_metadata())
+    run_meta["models"]["primary"] = {"id": getattr(asr, "model_name", cfg.get("asr_model")),
+                                      "backend": asr.name, "revision": None}
     primary_diag = []
     asr_diag["primary"] = {"backend": asr.name, "chunks": primary_diag}
     words = W.transcribe(asr, audio, chunks, progress=prog(38, 62, "распознавание"),
@@ -407,6 +431,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             asr2, _ = make_asr(second_cfg)
             second_diag = []
             asr_diag["second"] = {"backend": asr2.name, "chunks": second_diag}
+            run_meta["models"]["second"] = {"id": getattr(asr2, "model_name", second),
+                                             "backend": asr2.name, "revision": None}
             alt = W.transcribe(asr2, audio, chunks, progress=prog(62, 68, "второй проход распознавания (CTC)"),
                                diagnostics=second_diag)
             del asr2
@@ -414,6 +440,11 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         except Exception as ex:
             quality["asr2_error"] = f"{type(ex).__name__}: {ex}"[:300]
             print(f"[words] второй проход не выполнен: {ex}", file=sys.stderr, flush=True)
+            asr_diag["second"] = {"backend": None, "chunks": [
+                {"index": i, "state": "error", "audio_span": [c["a"], c["b"]],
+                 "own_span": list(c["own"]), "attempts": [{"result": "error", "error_type": type(ex).__name__}]}
+                for i, c in enumerate(chunks)]}
+            run_meta["models"]["second"] = {"id": second, "backend": None, "revision": None}
     wh_words = None
     third = cfg.get("asr_third_model", "onnx-community/whisper-large-v3-turbo")
     wmode = (getattr(a, "whisper", "") or cfg.get("asr_third_mode", "all")).lower()
@@ -439,6 +470,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             dev = "CPU"
         tries = ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
             + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
+        outer_attempts = []
+        whisper_finished = False
         for backend, device, quant in tries:
             try:
                 t3 = time.time()
@@ -456,9 +489,41 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                                            "name": getattr(asr3, "name", None)})
                 whisper_diag = []
                 asr_diag["whisper"] = {"backend": asr3.name, "chunks": whisper_diag}
+                run_meta["models"]["whisper"] = {"id": third, "backend": asr3.name, "revision": None}
                 texts = asr3.transcribe_texts(wpieces, progress=prog(68, 74, f"третья модель (Whisper, {device})"),
                                               diagnostics=whisper_diag)
                 del asr3
+                for rec in whisper_diag:
+                    rec["attempts"][:0] = [dict(attempt) for attempt in outer_attempts]
+                    for attempt in rec["attempts"]:
+                        attempt.setdefault("backend", backend + ":" + device)
+                failed_indices = [i for i, rec in enumerate(whisper_diag) if rec["state"] == "error"]
+                if device == "GPU" and failed_indices:
+                    try:
+                        st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
+                        cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",
+                                           "asr_device": "CPU", "asr_quant": cfg.get("asr_third_quant_cpu", "int8"),
+                                           "asr_quant_cpu": cfg.get("asr_third_quant_cpu", "int8"),
+                                           "asr_language": "ru", "asr_batch": int(cfg.get("asr_third_batch", 4))})
+                        cpu_diag = []
+                        cpu_texts = cpu.transcribe_texts([wpieces[i] for i in failed_indices], diagnostics=cpu_diag,
+                                                        progress=prog(74, 74, "повтор Whisper на CPU"))
+                        if len(cpu_texts) != len(failed_indices) or len(cpu_diag) != len(failed_indices):
+                            raise ValueError("неверное количество результатов CPU")
+                        for pos, i in enumerate(failed_indices):
+                            rec, replacement = whisper_diag[i], cpu_diag[pos]
+                            for attempt in replacement["attempts"]:
+                                attempt["backend"] = "onnx-cpu:CPU"
+                                attempt["batch"] = [failed_indices[j] for j in attempt["batch"]]
+                            rec["attempts"].extend(replacement["attempts"])
+                            rec["state"] = replacement["state"]
+                            texts[i] = cpu_texts[pos]
+                        del cpu
+                    except Exception as ex:
+                        for i in failed_indices:
+                            whisper_diag[i]["attempts"].append(
+                                {"result": "error", "backend": "onnx-cpu:CPU",
+                                 "error_type": type(ex).__name__, "fallback": True})
                 by_k = dict(zip(selected, texts))
                 diag_by_k = dict(zip(selected, whisper_diag))
                 wh_words, removed = [], 0
@@ -483,11 +548,41 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                               asr3_fallbacks=errs3 or None,
                               asr3_compile_sec=getattr(asr3_meta, "compile_sec", None),
                               asr3_name=getattr(asr3_meta, "name", None))
+                whisper_finished = True
                 break
             except Exception as ex:
+                outer_attempts.append({"result": "error", "backend": backend + ":" + device,
+                                       "error_type": type(ex).__name__})
                 quality.setdefault("asr3_errors", []).append(f"{backend}:{device}: {type(ex).__name__}: {ex}"[:300])
                 print(f"[words] Whisper ({backend}:{device}) не выполнен: {ex}", file=sys.stderr, flush=True)
-    if alt is not None and wh_words is not None:
+        if not whisper_finished:
+            records = [{"index": i, "chunk_index": k, "state": "error",
+                        "audio_span": [wchunks[k]["a"], wchunks[k]["b"]],
+                        "own_span": list(wchunks[k]["own"]), "attempts": [dict(x) for x in outer_attempts]}
+                       for i, k in enumerate(selected)]
+            asr_diag["whisper"] = {"backend": None, "chunks": records}
+            run_meta["models"]["whisper"] = {"id": third, "backend": None, "revision": None}
+    # Свидетельства других проходов фиксируем до изменения слов голосованием.
+    whisper_evidence = []
+    for rec in (asr_diag.get("whisper") or {}).get("chunks", []):
+        reason = "filtered" if rec.get("filtered_all") else rec.get("state")
+        if reason not in ("error", "empty_unknown", "filtered"):
+            continue
+        start, end = rec["own_span"]
+        sources = [name for name, ws in (("primary", words), ("second", alt or []))
+                   if any(start <= w["s"] < end for w in ws)]
+        whisper_evidence.append((start, end, reason, sources))
+    other_evidence = []
+    for name in ("primary", "second"):
+        for rec in (asr_diag.get(name) or {}).get("chunks", []):
+            if rec.get("state") not in ("error", "empty_unknown") or not rec.get("own_span"):
+                continue
+            start, end = rec["own_span"]
+            other = "second" if name == "primary" else "primary"
+            other_words = (alt or []) if name == "primary" else words
+            sources = [other] if any(start <= w["s"] < end for w in other_words) else []
+            other_evidence.append((start, end, name, rec["state"], sources))
+    if alt is not None and wh_words is not None and not whisper_evidence and not other_evidence:
         quality["vote"] = W.vote3(words, alt, wh_words)
         prev = None
         for wd in words:                      # что заменило голосование — в список исправлений
@@ -504,6 +599,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
             else:
                 prev = None
     elif alt is not None:
+        if whisper_evidence or (other_evidence and wh_words is not None):
+            # vote3 выравнивает всю запись целиком и не умеет исключать отдельные интервалы.
+            # Не превращаем неизвестный результат Whisper в голос за пустоту.
+            quality["vote3_skipped"] = "whisper_incomplete" if whisper_evidence else "asr_incomplete"
         W.mark_alt(words, alt)
 
     failed = sum(1 for stage in asr_diag.values() for item in stage["chunks"] if item["state"] == "error")
@@ -594,6 +693,26 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                 wd.pop("sims", None)
     missed = W.missed_speech(words, turns) if cfg.get("review_missed", True) else []
     items = W.review_items(segments, missed=missed, name_of=label_name)
+    for item in items:
+        if item.get("alt_whisper"):
+            start, end = item.get("t1", item["t"]), item.get("t2", item["t"])
+            item["gap"] = [start, max(end + 0.04, start + 0.04)]
+            item["asr_problem"] = {"model": "whisper", "state": "disagreement", "words_from": ["primary", "second"]}
+    for start, end, reason, sources in whisper_evidence:
+        has_words = any(start <= w.get("s", -1) < end for seg in segments for w in seg.get("words") or [])
+        items.append({"id": "", "t": start, "t1": start, "t2": end, "gap": [start, end],
+                      "speaker": None, "text": "", "reasons": ["asr"] if has_words else ["asr", "missed"],
+                      "asr_problem": {"model": "whisper", "state": reason, "words_from": sources},
+                      "note": "Результат Whisper неполон или неизвестен; прослушайте фрагмент."})
+    for start, end, model, reason, sources in other_evidence:
+        has_words = any(start <= w.get("s", -1) < end for seg in segments for w in seg.get("words") or [])
+        items.append({"id": "", "t": start, "t1": start, "t2": end, "gap": [start, end],
+                      "speaker": None, "text": "", "reasons": ["asr"] if has_words else ["asr", "missed"],
+                      "asr_problem": {"model": model, "state": reason, "words_from": sources},
+                      "note": "Результат прохода неполон или неизвестен; прослушайте фрагмент."})
+    items.sort(key=lambda item: item["t"])
+    for index, item in enumerate(items, 1):
+        item["id"] = f"r{index}"
     quality["missed_speech"] = [{"t1": s, "t2": e} for s, e, _ in missed]
     for seg in segments:
         for wd in seg["words"]:
@@ -647,16 +766,23 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
     with settings.group_voice_lock(group):
         prof, profile_ok = load_group_profile_for_recognition(ppath, quality)
         selection_report = {}
+        quality_report = {}
         learned = []
         if profile_ok:
+            def run_learn():
+                try:
+                    policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
+                except (ValueError, OSError):
+                    policy = "warn"
+                return voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
+                                    selection_report=selection_report, quality_policy=policy,
+                                    quality_report=quality_report,
+                                    stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"])
             learned, quality["voice_auto_learn"] = voices.auto_learn_group(
-                prof, group, names,
-                lambda: voices.learn(prof, src.parent, embedder, load_audio, names=names or None, group=group,
-                                     selection_report=selection_report,
-                                     stop_when=lambda: voices.profile_sufficiency(prof, names)["sufficient"]),
-                lambda: voices.save_profile(ppath, prof))
+                prof, group, names, run_learn, lambda: voices.save_profile(ppath, prof))
         quality["voice_selection_report"] = selection_report
         quality["voice_selection_explanation"] = voices.explain_selection_report(selection_report)
+        quality["voice_audio_quality"] = quality_report
     return ppath, prof, learned
 
 
@@ -699,11 +825,19 @@ def learn_only(a, st, cfg, src):
             prof = voices.load_profile(ppath)
             st.set(stage="профили: пересчёт по ответам человека", progress=40)
             selection_report = {}
+            quality_report = {}
+            try:
+                quality_policy = settings.group_voice_settings(group).get("audio_quality_policy", "warn")
+            except (ValueError, OSError):
+                quality_policy = "warn"
+            before_provenance = prof.get("provenance_revision", 0)
             learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
                                    only=[a.learn_only], group=group, selection_report=selection_report,
-                                   allow_replace=authorized)
+                                   allow_replace=authorized, quality_policy=quality_policy,
+                                   quality_report=quality_report)
+            provenance_updated = prof.get("provenance_revision", 0) != before_provenance
             backup = None
-            if learned:
+            if learned or provenance_updated:
                 if authorized:
                     if core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
                         raise RuntimeError("стенограмма или профиль изменились во время пересчёта; запись отменена")
@@ -713,6 +847,7 @@ def learn_only(a, st, cfg, src):
         st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
                revision=prof.get("revision"), last=last, selection_report=selection_report,
                selection_explanation=voices.explain_selection_report(selection_report), backup=backup,
+               provenance_updated=provenance_updated, audio_quality=quality_report,
                quarantine={n: q for qa in (prof.get("quarantine") or {}).values() for n, q in qa.items()
                            if last and q.get("from") == last.get("from")},
                warnings=[w for w in prof.get("warnings", []) if last and w.get("from") == last.get("from")])
@@ -769,6 +904,7 @@ def main():
         out_dir.mkdir(exist_ok=True)
         md_path = out_dir / (stem + ".transcript.md")
         json_path = out_dir / (stem + ".transcript.json")
+        transcript.ensure_new_result(json_path, md_path)
 
         vocab_path, vocab, vgroup = resolve_vocab(src, a, cfg)
         # общий словарь без "group" (и группа не задана явно): словарь применяется, профили голосов групп — нет
@@ -897,12 +1033,13 @@ def main():
                 data["no_profile"] = True
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
-            transcript.save(data, json_path, md_path)
+            transcript.save_new(data, json_path, md_path)
             st.set(state="done", stage="готово", progress=100, markdown=str(md_path), json=str(json_path),
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
-                                           "review_items": len(data.get("review", [])),
-                                           "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
+                                            "review_items": len(data.get("review", [])),
+                                            "asr_incomplete_chunks": quality.get("asr_incomplete_chunks"),
+                                            "vote3_skipped": quality.get("vote3_skipped"),
                                            "emotions_error": quality.get("emotions_error"),
                                            "speaker_fixes": len(quality["speaker_fixes"]),
                                            "vocab_fixes": sum(len(v["fixes"]) for v in quality["vocab_fixes"]),
@@ -1015,7 +1152,7 @@ def main():
         if label_name:
             data.update(speaker_names={l: label_name[l] for l in labels if l in label_name},
                         names_source="voices", names_confirmed=False)
-        transcript.save(data, json_path, md_path)
+        transcript.save_new(data, json_path, md_path)
 
         st.set(state="done", stage="готово", progress=100, markdown=str(md_path),
                json=str(json_path), timing=timing,

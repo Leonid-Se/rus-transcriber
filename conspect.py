@@ -20,12 +20,124 @@
 """
 import json
 import re
+import base64
+import hashlib
+import os
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from collections import Counter
 from pathlib import Path
 
 import quotes as Q
 
 PLACE = re.compile(r"\{\{q:(\d+)\}\}")
+_locks_guard = threading.Lock()
+_thread_locks = {}
+_held_locks = threading.local()
+
+
+@contextmanager
+def write_lock(json_path):
+    """Общая блокировка записи; вложенные вызовы того же потока допускаются."""
+    import jobslots
+    key = os.path.normcase(str(Path(json_path).resolve()))
+    with _locks_guard:
+        lock = _thread_locks.setdefault(key, threading.RLock())
+    with lock:
+        held = getattr(_held_locks, "keys", None)
+        if held is None:
+            held = _held_locks.keys = set()
+        if key in held:
+            yield
+            return
+        path = Path(key + ".conspect.lock")
+        with path.open("a+b") as f:
+            while not jobslots._try_lock(f):
+                time.sleep(0.1)
+            held.add(key)
+            try:
+                yield
+            finally:
+                held.remove(key)
+
+
+def _digest(value):
+    return None if value is None else hashlib.sha256(value).hexdigest()
+
+
+def _read_bytes(path):
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _replace_bytes(path, value):
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with tmp.open("xb") as f:
+            f.write(value)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _journal_path(json_path):
+    return Path(str(json_path) + ".conspect.pending")
+
+
+def recover_pending(json_path):
+    """Под блокировкой откатить прерванную запись, только если файлы не менялись извне."""
+    journal = _journal_path(json_path)
+    if not journal.exists():
+        return False
+    record = json.loads(journal.read_text(encoding="utf-8"))
+    if record.get("version") != 1 or not isinstance(record.get("files"), list):
+        raise ValueError("повреждён журнал конспекта; требуется ручное восстановление")
+    entries = []
+    parent = Path(json_path).parent.resolve()
+    for item in record["files"]:
+        name = item["name"]
+        if not isinstance(name, str) or Path(name).name != name or not name.endswith((".conspect.json", ".conspect.md")):
+            raise ValueError("неверный путь в журнале конспекта")
+        path = parent / name
+        old = None if item["old"] is None else base64.b64decode(item["old"], validate=True)
+        current = _digest(_read_bytes(path))
+        if current not in (item["old_hash"], item["new_hash"]) or _digest(old) != item["old_hash"]:
+            raise ValueError("файлы конспекта изменились после сбоя; требуется ручное восстановление")
+        entries.append((path, old))
+    for path, old in entries:
+        if old is None:
+            if path.exists():
+                path.unlink()
+        else:
+            _replace_bytes(path, old)
+    journal.unlink()
+    return True
+
+
+def write_files(json_path, files, create=False):
+    """Под блокировкой записать набор файлов; при сбое оставить журнал для отката."""
+    journal = _journal_path(json_path)
+    if journal.exists():
+        raise ValueError("есть незавершённая запись конспекта")
+    entries = []
+    for path, value in files:
+        path = Path(path)
+        old = _read_bytes(path)
+        if create and old is not None:
+            raise FileExistsError("конспект уже существует")
+        entries.append({"name": path.name, "old": None if old is None else base64.b64encode(old).decode("ascii"),
+                        "old_hash": _digest(old), "new_hash": _digest(value)})
+    _replace_bytes(journal, json.dumps({"version": 1, "files": entries}, ensure_ascii=False).encode("utf-8"))
+    for path, value in files:
+        _replace_bytes(Path(path), value)
+    journal.unlink()
 
 
 def _tokens(data):
@@ -140,7 +252,7 @@ def link(conspect_md, data, min_score=0.75, selections=None):
         parts, ok = [], True
         # До отдельной реализации согласованного выбора частей не связывать
         # разорванную цитату с независимо найденными разными местами.
-        if len([p for p in raw_parts if Q.WORD.findall(p)]) != 1 or not data.get("recording_id"):
+        if len(raw_parts) != 1 or not data.get("recording_id"):
             unlinked.append(q)
             continue
         for p in raw_parts:
@@ -205,6 +317,9 @@ def link(conspect_md, data, min_score=0.75, selections=None):
 def render(obj, data, update_last=True):
     """-> (markdown, отчёт). Отчёт: что обновилось из стенограммы с прошлой сборки и с момента связывания."""
     rep = {"changed_since_last": [], "changed_since_link": 0, "speaker_changed": [], "missing": []}
+    rep["rendered_source_revision"] = data.get("source_revision")
+    rep["analysis_revision"] = obj.get("analysis_revision")
+    rep["external_publication"] = "not_tracked"
     rep["analysis_needs_review"] = (obj.get("analysis_revision") is None or data.get("source_revision") is None or
                                     obj.get("analysis_revision") != data.get("source_revision") or
                                     not obj.get("recording_id") or obj.get("recording_id") != data.get("recording_id"))
@@ -244,6 +359,9 @@ def render(obj, data, update_last=True):
         return (f"{spk}: " if spk else "") + f"«{body}»"
 
     md = PLACE.sub(sub, obj["template"])
+    if update_last and not source_conflict:
+        obj["assembly_revision"] = data.get("source_revision")
+    rep["assembly_revision"] = obj.get("assembly_revision")
     return md, rep
 
 
@@ -265,20 +383,34 @@ def path_for(json_path, name):
 
 
 def save_linked(json_path, name, conspect_md):
+    with write_lock(json_path):
+        recover_pending(json_path)
+        return _save_linked_locked(json_path, name, conspect_md)
+
+
+def _save_linked_locked(json_path, name, conspect_md):
     data = json.loads(Path(json_path).read_text(encoding="utf-8"))
     obj, rep = link(conspect_md, data)
     obj.update(name=name, job_json=str(json_path))
     cj, cm = path_for(json_path, name)
     md, rrep = render(obj, data)
-    cj.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
-    cm.write_text(md, encoding="utf-8")
+    write_files(json_path, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
+                            (cm, md.encode("utf-8"))])
     check = Q.check(md, data)["summary"]
     return {"conspect_json": str(cj), "conspect_md": str(cm), **rep,
-            "analysis_needs_review": rrep["analysis_needs_review"], "check": check}
+            "analysis_needs_review": rrep["analysis_needs_review"],
+            "assembly_revision": rrep["assembly_revision"], "analysis_revision": rrep["analysis_revision"],
+            "external_publication": rrep["external_publication"], "check": check}
 
 
 def rerender(json_path, name=None):
     """Пересобирает конспект(ы) записи из текущей стенограммы. -> {название: отчёт}."""
+    with write_lock(json_path):
+        recover_pending(json_path)
+        return _rerender_locked(json_path, name)
+
+
+def _rerender_locked(json_path, name=None):
     jp = Path(json_path)
     data = json.loads(jp.read_text(encoding="utf-8"))
     stem = jp.name[:-len(".transcript.json")] if jp.name.endswith(".transcript.json") else jp.stem
@@ -288,9 +420,9 @@ def rerender(json_path, name=None):
         if name and obj.get("name") != name:
             continue
         md, rep = render(obj, data)
-        cj.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
         cm = Path(str(cj)[:-len(".json")] + ".md")
-        cm.write_text(md, encoding="utf-8")
+        write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
+                         (cm, md.encode("utf-8"))])
         chk = Q.check(md, data)
         out[obj.get("name", cj.name)] = {"conspect_md": str(cm), **rep, "check": chk["summary"],
                                          "check_problems": chk["problems"][:20], "markdown_chars": len(md)}

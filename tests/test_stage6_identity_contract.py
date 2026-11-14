@@ -71,6 +71,102 @@ class Stage6IdentityContract(unittest.TestCase):
         _, report = conspect.link("Анна: «альфа бета»", data)
         self.assertEqual(report["linked"], 0)
 
+    def test_explicit_omissions_and_edits_never_link_automatically(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        for quote in ("«…альфа бета»", "«альфа бета…»", "«...альфа бета»",
+                      "«альфа бета...»", "«[правка] альфа бета»",
+                      "«альфа бета [правка]»"):
+            with self.subTest(quote=quote):
+                obj, report = conspect.link(quote, data)
+                self.assertEqual(report["linked"], 0)
+                self.assertFalse(obj["quotes"])
+                checked = quotes.check(quote, data)
+                self.assertEqual(checked["summary"]["verbatim"], 0)
+                self.assertTrue(checked["problems"])
+
+    def test_legacy_source_without_identity_or_word_ids_is_not_linked(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        data.pop("recording_id")
+        data.pop("source_revision")
+        for word in data["segments"][0]["words"]:
+            word.pop("word_id")
+        obj, report = conspect.link("Анна: «альфа бета»", data)
+        self.assertEqual(report["linked"], 0)
+        self.assertFalse(obj["quotes"])
+
+    def test_recording_identity_does_not_replace_missing_word_ids(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        data["segments"][0]["words"][0].pop("word_id")
+        _, report = conspect.link("Анна: «альфа бета»", data)
+        self.assertEqual(report["linked"], 0)
+
+    def test_reordered_segments_invalidate_existing_quote(self):
+        data = recording(segment("Анна", "альфа", 0.0), segment("Анна", "бета", 1.0))
+        obj, report = conspect.link("Анна: «альфа бета»", data)
+        self.assertEqual(report["linked"], 1)
+        data["segments"].reverse()
+        _, report = conspect.render(obj, data, update_last=False)
+        self.assertTrue(report["missing"])
+
+    def test_rebuild_rejects_duplicate_ids_and_inserted_same_speaker_word(self):
+        for mode in ("duplicate", "inserted"):
+            with self.subTest(mode=mode):
+                data = recording(segment("Анна", "альфа бета", 0.0))
+                obj, _ = conspect.link("Анна: «альфа бета»", data)
+                words = data["segments"][0]["words"]
+                if mode == "duplicate":
+                    words.append(dict(words[0]))
+                else:
+                    words.insert(1, {"w": "новое", "s": 0.1, "e": 0.15, "word_id": "new"})
+                text, report = conspect.render(obj, data, update_last=False)
+                self.assertTrue(report["missing"])
+                self.assertIn("место в стенограмме не найдено", text)
+
+    def test_legacy_readonly_render_does_not_mutate_object(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        obj = {"version": 1, "template": "{{q:1}}", "quotes": {"1": {
+            "author": "альфа бета", "speaker": "Анна", "base": "альфа бета",
+            "base_speaker": "Анна", "parts": [{"t1": 0.0, "t2": 0.2}]}}}
+        before = copy.deepcopy(obj)
+        _, report = conspect.render(obj, data, update_last=False)
+        self.assertTrue(report["legacy_unverified"])
+        self.assertTrue(report["analysis_needs_review"])
+        self.assertEqual(obj, before)
+
+    def test_legacy_file_preview_does_not_migrate_or_write_files(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        obj = {"version": 1, "template": "{{q:1}}", "quotes": {"1": {
+            "author": "альфа бета", "speaker": "Анна", "base": "альфа бета",
+            "base_speaker": "Анна", "parts": [{"t1": 0.0, "t2": 0.2}]}}}
+        with tempfile.TemporaryDirectory() as directory:
+            jp = Path(directory) / "demo.transcript.json"
+            cj, cm = conspect.path_for(jp, "demo")
+            jp.write_text(json.dumps(data), encoding="utf-8")
+            cj.write_text(json.dumps(obj), encoding="utf-8")
+            cm.write_text("исходный файл", encoding="utf-8")
+            before = {p: p.read_bytes() for p in (jp, cj, cm)}
+            _, report = conspect.render(json.loads(cj.read_text(encoding="utf-8")),
+                                        json.loads(jp.read_text(encoding="utf-8")), update_last=False)
+            self.assertTrue(report["legacy_unverified"])
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            self.assertEqual(set(Path(directory).iterdir()), set(before))
+
+    def test_rerender_other_recording_does_not_substitute_foreign_words(self):
+        data = recording(segment("Анна", "альфа бета", 0.0))
+        other = recording(segment("Анна", "гамма дельта", 0.0))
+        other["recording_id"] = "other"
+        with tempfile.TemporaryDirectory() as directory:
+            jp = Path(directory) / "demo.transcript.json"
+            jp.write_text(json.dumps(data), encoding="utf-8")
+            created = conspect.save_linked(jp, "demo", "Анна: «альфа бета»")
+            jp.write_text(json.dumps(other), encoding="utf-8")
+            report = conspect.rerender(jp, "demo")["demo"]
+            rendered = Path(created["conspect_md"]).read_text(encoding="utf-8")
+            self.assertIn("source_conflict", report)
+            self.assertTrue(report["analysis_needs_review"])
+            self.assertNotIn("гамма", rendered)
+            self.assertIn("место в стенограмме не найдено", rendered)
+
     def test_rebuild_after_source_change_requires_analysis_review(self):
         data = recording(segment("Анна", "альфа бета", 0.0))
         obj, _ = conspect.link("Вывод. Анна: «альфа бета»", data)

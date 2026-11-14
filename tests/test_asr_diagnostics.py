@@ -16,7 +16,7 @@ import words as W
 
 
 def result(text="слово"):
-    return SimpleNamespace(tokens=[" " + text] if text else [], timestamps=[0.1] if text else [],
+    return SimpleNamespace(tokens=[" " + text] if text else [], timestamps=[0.0001] if text else [],
                            logprobs=[-0.1] if text else [], text=text)
 
 
@@ -65,6 +65,15 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(observed, [])
         self.assertEqual((d[0]["decoded_words"], d[0]["owned_words"]), (1, 0))
 
+    def test_dedup_removal_is_counted_for_originating_chunk(self):
+        audio = np.ones(32000, np.float32)
+        chunks = [{"a": 0, "b": 1, "own": (0, 1)}, {"a": 0, "b": 2, "own": (0, 2)}]
+        f, d = Fake(lambda xs, n: [result() for _ in xs]), []
+        out = W.transcribe(backend(f), audio, chunks, diagnostics=d)
+        self.assertEqual(len(out), 1)
+        self.assertEqual([r["owned_words"] for r in d], [1, 1])
+        self.assertEqual([r["dedup_removed_words"] for r in d], [0, 1])
+
     def test_batch_error_retry_only_affected_and_preserves_indices(self):
         def call(xs, n):
             if n == 1:
@@ -96,6 +105,21 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(d[0]["state"], "empty_unknown")
         self.assertEqual(len(f.calls), 1)
 
+    def test_empty_with_optional_none_arrays_is_not_error(self):
+        empty = SimpleNamespace(tokens=None, timestamps=None, logprobs=None, text="")
+        f, d = Fake(lambda xs, n: [empty for _ in xs]), []
+        backend(f, 1).transcribe_timestamped([np.zeros(10)], diagnostics=d)
+        self.assertEqual(d[0]["state"], "empty_unknown")
+        self.assertEqual(len(f.calls), 1)
+
+    def test_zero_length_input_does_not_call_model(self):
+        f, d = Fake(lambda xs, n: [result() for _ in xs]), []
+        result_ = backend(f, 1).transcribe_timestamped([np.zeros(0)], diagnostics=d)
+        self.assertEqual(result_, [None])
+        self.assertEqual(d[0]["state"], "error")
+        self.assertEqual(len(d[0]["attempts"]), 2)
+        self.assertEqual(f.calls, [])
+
     def test_malformed_response_retries_instead_of_splitting_string(self):
         f = Fake(lambda xs, n: "да" if n == 1 else ["восстановлено"])
         a = B.WhisperOV.__new__(B.WhisperOV)
@@ -125,6 +149,47 @@ class DiagnosticTests(unittest.TestCase):
         a.transcribe_timestamped([np.ones(16000, np.float32)], diagnostics=d)
         self.assertEqual(d[0]["samples"], 16000)
         self.assertEqual(d[0]["attempts"][0]["input_samples"], 32000)
+
+    def test_inconsistent_timestamp_result_is_not_success(self):
+        bad = SimpleNamespace(tokens=[" один", " два"], timestamps=[0.1], logprobs=[-0.1, -0.1],
+                              text="один два")
+        f, d = Fake(lambda xs, n: [bad for _ in xs]), []
+        r = backend(f, 1).transcribe_timestamped([np.zeros(10)], diagnostics=d)
+        self.assertEqual(r, [None])
+        self.assertEqual(d[0]["state"], "error")
+        self.assertEqual(len(f.calls), 2)
+
+    def test_text_without_tokens_is_error_not_silence(self):
+        bad = SimpleNamespace(tokens=[], timestamps=[], logprobs=[], text="текст")
+        f, d = Fake(lambda xs, n: [bad for _ in xs]), []
+        backend(f, 1).transcribe_timestamped([np.zeros(10)], diagnostics=d)
+        self.assertEqual(d[0]["state"], "error")
+
+    def test_invalid_timestamps_and_probabilities_are_retried(self):
+        for times, scores in [([0.2, 0.1], [-0.1, -0.1]),
+                              ([0.1, float("nan")], [-0.1, -0.1]),
+                              ([0.1, 0.2], [-0.1, float("inf")]),
+                              ([-0.1, 0.2], [-0.1, -0.1])]:
+            with self.subTest(times=times, scores=scores):
+                bad = SimpleNamespace(tokens=[" один", " два"], timestamps=times, logprobs=scores, text="один два")
+                f, d = Fake(lambda xs, n: [bad for _ in xs]), []
+                backend(f, 1).transcribe_timestamped([np.zeros(10)], diagnostics=d)
+                self.assertEqual(d[0]["state"], "error")
+                self.assertEqual(len(f.calls), 2)
+
+    def test_timestamp_after_prepared_audio_is_error(self):
+        bad = SimpleNamespace(tokens=[" слово"], timestamps=[0.3], logprobs=[-0.1], text="слово")
+        f, d = Fake(lambda xs, n: [bad for _ in xs]), []
+        backend(f, 1).transcribe_timestamped([np.zeros(1600)], diagnostics=d)
+        self.assertEqual(d[0]["state"], "error")
+        self.assertEqual(len(f.calls), 2)
+
+    def test_chunking_can_include_long_internal_pause(self):
+        # Характеризация, не разрешение автоматически вырезать тишину или тихую речь.
+        audio = np.zeros(20 * W.SR, np.float32)
+        chunks = W.make_chunks(audio, [(0.0, 1.0), (15.0, 16.0)])
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual((chunks[0]["a"], chunks[0]["b"]), (0.0, 16.0))
 
 
 if __name__ == "__main__":

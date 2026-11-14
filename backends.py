@@ -149,14 +149,35 @@ def _observed_recognize(model, pieces, batches, *, pad=None, kwargs=None, progre
         start = time.monotonic()
         inputs = []
         try:
+            if any(len(pieces[i]) == 0 for i in indices):
+                raise ValueError("пустой аудиофрагмент")
             inputs = [prepare(pieces[i]) for i in indices]
             result = model.recognize(inputs, sample_rate=SR, **kwargs)
             if not isinstance(result, (list, tuple)) or len(result) != len(indices):
                 raise TypeError("неверный формат или количество результатов пакета")
             if timestamped:
-                for r in result:
+                for pos, r in enumerate(result):
                     if r is None or not all(hasattr(r, k) for k in ("tokens", "timestamps", "logprobs")):
                         raise TypeError("неверный формат результата со временем")
+                    tokens, timestamps, logprobs = r.tokens, r.timestamps, r.logprobs
+                    # onnx-asr допускает None для необязательных массивов; полностью
+                    # пустой ответ — неизвестная пустота, а не техническая ошибка.
+                    if not tokens and not str(getattr(r, "text", "") or "").strip():
+                        if (timestamps is None or len(timestamps) == 0) and \
+                                (logprobs is None or len(logprobs) == 0):
+                            continue
+                    if tokens is None or timestamps is None or logprobs is None:
+                        raise TypeError("неполный результат со временем")
+                    if len(tokens) != len(timestamps) or len(tokens) != len(logprobs):
+                        raise ValueError("несогласованные размеры результата")
+                    if not tokens and str(getattr(r, "text", "") or "").strip():
+                        raise ValueError("текст без токенов")
+                    if any(not isinstance(t, str) for t in tokens):
+                        raise TypeError("неверный тип токена")
+                    if any(not np.isfinite(t) or t < 0 or t > len(inputs[pos]) / SR for t in timestamps) or \
+                            any(a > b for a, b in zip(timestamps, timestamps[1:])) or \
+                            any(not np.isfinite(p) or p > 0 for p in logprobs):
+                        raise ValueError("неверные времена или вероятности")
                 values = result
             else:
                 if any(r is None or not (isinstance(r, str) or hasattr(r, "text") or

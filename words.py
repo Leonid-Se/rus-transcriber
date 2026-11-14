@@ -146,6 +146,7 @@ def transcribe(asr, audio, chunks, progress=None, diagnostics=None):
     else:
         results = asr.transcribe_timestamped(pieces, progress=progress, diagnostics=diagnostics)
     words = []
+    origins = {}
     for index, (c, r) in enumerate(zip(chunks, results)):
         rec = diagnostics[index] if diagnostics is not None else None
         if rec is not None:
@@ -161,14 +162,18 @@ def transcribe(asr, audio, chunks, progress=None, diagnostics=None):
         for w in decoded:
             if s - 1e-3 <= w["s"] < e + 1e-3:
                 words.append(w)
+                if rec is not None:
+                    origins[id(w)] = rec
                 accepted += 1
         if rec is not None:
-            rec.update(decoded_words=len(decoded), owned_words=accepted)
+            rec.update(decoded_words=len(decoded), owned_words=accepted, dedup_removed_words=0)
     words.sort(key=lambda w: w["s"])
     # нахлёст: одно и то же слово на стыке двух кусков
     out = []
     for w in words:
         if out and norm_word(w["w"]) == norm_word(out[-1]["w"]) and w["s"] - out[-1]["s"] < 0.3:
+            if id(w) in origins:
+                origins[id(w)]["dedup_removed_words"] += 1
             continue
         out.append(w)
     return out

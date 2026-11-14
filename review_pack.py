@@ -104,6 +104,12 @@ def build(json_path, items, base_url_note=None):
             skipped.append({"id": q.get("id"), "why": "нет такого места"})
             continue
         opts = q.get("options") or []
+        if it.get("asr_problem"):
+            opts = [{"label": "Я прослушал: слова в стенограмме верны", "decision": {"listened": "words"}},
+                    {"label": "Я прослушал: здесь тишина", "decision": {"listened": "silence"}}]
+        else:
+            opts = [{**o, "decision": {k: v for k, v in (o.get("decision") or {}).items() if k != "listened"}}
+                    for o in opts]
         if not 1 <= len(opts) <= 4:
             skipped.append({"id": it["id"], "why": "нужно 1–4 варианта"})
             continue
@@ -115,6 +121,15 @@ def build(json_path, items, base_url_note=None):
         target_words = data["segments"][loc[0]]["words"][loc[1]:loc[2]] if loc else []
         ids = [w.get("word_id") for w in target_words]
         target = {"word_ids": ids} if ids and all(ids) and len(set(ids)) == len(ids) else {}
+        question = q.get("question") or "Как правильно?"
+        if it.get("asr_problem"):
+            problem = it["asr_problem"]
+            models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
+            names = [(models.get(key) or {}).get("id") or key for key in problem.get("words_from") or []]
+            model = (models.get(problem.get("model")) or {}).get("id") or problem.get("model") or "ASR"
+            question = (str(model) + ": " + str(problem.get("state")) +
+                        ("; слова других проходов: " + ", ".join(names) if names else "") +
+                        ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
         out.append({
             "id": it["id"], "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
             **target,
@@ -122,9 +137,9 @@ def build(json_path, items, base_url_note=None):
             "speaker": it.get("speaker"), "text": it.get("text"),
             "reply": row.get("reply"), "before": row.get("before"), "after": row.get("after"),
             "reasons": it.get("reasons"), "voices": it.get("voices"),
-            "question": q.get("question") or "Как правильно?",
+            "question": question,
             "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
-            "recommended": q.get("recommended"), "note": q.get("note")})
+            "recommended": None if it.get("asr_problem") else q.get("recommended"), "note": q.get("note")})
     keep = {f"{r['id']}.mp3" for r in out}
     for f in (pd / "clips").glob("*.mp3"):
         if f.name not in keep:
@@ -398,6 +413,9 @@ def decisions(json_path):
             rep["changed"].append(aid)
         if k in ("option", "recommended"):
             d = dict(it["options"][a["option"]]["decision"] or {})
+            if d.get("listened") and man.get("source_revision") != data.get("source_revision"):
+                rep.setdefault("source_conflict", "стенограмма изменилась после создания карточек; пересоберите пакет")
+                continue
             if "word_ids" in it:
                 d["word_ids"] = it["word_ids"]
             note = f"{src}: {it['options'][a['option']]['label']}"
@@ -439,6 +457,12 @@ def free_answers(json_path):
 
 def apply_free(json_path, md_path, free, dry_run=False):
     """Свободные ответы → правки слов (freeform.plan) → transcript.apply_word_edits. -> отчёт для человека."""
+    import conspect
+    with conspect.write_lock(json_path):
+        return _apply_free_locked(json_path, md_path, free, dry_run=dry_run)
+
+
+def _apply_free_locked(json_path, md_path, free, dry_run=False):
     from collections import Counter
     import freeform as F
     import transcript as T

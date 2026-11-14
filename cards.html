@@ -197,8 +197,10 @@ audio{width:100%;height:36px}
     if (d.speaker) parts.push(`говорящий → ${d.speaker}`);
     if (d.human_after || d.status === "human") parts.push("оставить человеку для проверки");
     if (d.reopen) parts.push("снова открыть место");
+    if (d.listened === "silence") parts.push("подтвердить после прослушивания: тишина");
+    if (d.listened === "words") parts.push("подтвердить после прослушивания: слова верны");
     if (d.note) parts.push(`примечание: ${d.note}`);
-    const other = Object.keys(d).filter(k => !["text", "speaker", "human_after", "status", "reopen", "note"].includes(k));
+    const other = Object.keys(d).filter(k => !["text", "speaker", "human_after", "status", "reopen", "note", "listened"].includes(k));
     if (other.length) parts.push("другие параметры: " + other.map(k => `${k}: ${JSON.stringify(d[k])}`).join(", "));
     return parts.join("; ") || "оставить как есть";
   }

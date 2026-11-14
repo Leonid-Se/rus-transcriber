@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -123,6 +124,8 @@ def save_cases(cases):
 def transcribe(case, tag="eval"):
     """Запускает worker.py и возвращает путь к json расшифровки."""
     audio = Path(case["audio"])
+    tag = "".join(ch for ch in tag if ch.isalnum() or ch in "-_")
+    tag = f"{tag or 'eval'}-{uuid.uuid4().hex}"
     cmd = [sys.executable, str(ROOT / "worker.py"), str(audio), "--tag", tag]
     if case.get("names"):
         cmd += ["--names", case["names"]]

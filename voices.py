@@ -11,6 +11,7 @@
 import json
 import bisect
 import copy
+import hashlib
 import math
 import sys
 import time
@@ -194,6 +195,103 @@ def voice_vectors(prof, exclude_audio=None):
     return out
 
 
+def source_fingerprint(transcript_path, audio_path):
+    """Отпечаток происхождения источника: содержимое стенограммы и размер/mtime аудио.
+
+    mtime стенограммы остаётся для совместимости со старыми записями, но одного mtime мало:
+    содержимое может измениться при том же времени. Отпечаток не даёт права автоматически
+    заменять существующий вклад — для этого по-прежнему нужен просмотр и подтверждение.
+    """
+    jp, src = Path(transcript_path), Path(audio_path)
+    data = jp.read_bytes()
+    st = src.stat()
+    return {"transcript_sha256": hashlib.sha256(data).hexdigest(),
+            "transcript_size": len(data),
+            "audio_size": int(st.st_size),
+            "audio_mtime": round(float(st.st_mtime), 3)}
+
+
+def source_fingerprint_status(stored, current, transcript_mtime):
+    """Сравнить запись sources с текущим состоянием: unchanged/changed/legacy_*/absent."""
+    if stored is None:
+        return "absent"
+    if isinstance(stored, dict):
+        return "unchanged" if all(stored.get(k) == current.get(k) for k in FINGERPRINT_KEYS) else "changed"
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored):
+        same = math.isclose(float(stored), float(transcript_mtime), rel_tol=0, abs_tol=1e-6)
+        return "legacy_unchanged" if same else "legacy_changed"
+    return "changed"
+
+
+def audio_quality(audio):
+    """Приблизительные измерения записи без изменения отбора и без моделей.
+
+    Возвращает длительность, пик, RMS, долю клиппинга, долю тишины и грубую оценку SNR
+    по кадрам 30 мс. Тихая речь не считается плохой: это только предупреждение.
+    Нулевой или нечитаемый сигнал не прерывает обучение.
+    """
+    try:
+        a = np.asarray(audio, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "сигнал не прочитан", "warnings": []}
+    if not a.size:
+        return {"available": False, "reason": "пустой сигнал", "warnings": ["silent"]}
+    if not np.all(np.isfinite(a)):
+        return {"available": False, "reason": "сигнал содержит нечисловые значения", "warnings": []}
+    duration = a.size / SR
+    peak = float(np.max(np.abs(a)))
+    rms = float(np.sqrt(np.mean(a * a)))
+    clipping_ratio = float(np.mean(np.abs(a) >= CLIP_LEVEL))
+    frame = max(1, int(round(0.03 * SR)))
+    frames = a.size // frame
+    snr = None
+    silence_ratio = 1.0
+    if frames:
+        blocks = a[:frames * frame].reshape(frames, frame)
+        levels = np.sqrt(np.mean(blocks * blocks, axis=1))
+        silence_ratio = float(np.mean(levels <= 10 ** (-50 / 20)))
+        noise = float(np.percentile(levels, 10))
+        speech = float(np.percentile(levels, 90))
+        if noise > 1e-7 and speech > 0:
+            snr = round(20 * math.log10(speech / noise), 1)
+    warnings = []
+    if clipping_ratio >= 0.0005:
+        warnings.append("clipping")
+    if peak <= 1e-7:
+        warnings.append("silent")
+    elif peak < 10 ** (QUIET_PEAK_DBFS / 20):
+        warnings.append("very_quiet")
+    if snr is not None and snr < NOISY_SNR_DB:
+        warnings.append("noisy_estimate")
+
+    def dbfs(value):
+        return round(20 * math.log10(max(value, 1e-8)), 1)
+
+    return {"available": True, "duration_sec": round(duration, 2), "peak_dbfs": dbfs(peak),
+            "rms_dbfs": dbfs(rms), "clipping_ratio": round(clipping_ratio, 6), "clipped": "clipping" in warnings,
+            "silence_ratio": round(silence_ratio, 3), "snr_db_estimate": snr,
+            "warnings": warnings, "approximate": True}
+
+
+def explain_audio_quality(quality):
+    """Короткие русские пояснения к кодам предупреждений качества."""
+    return [AUDIO_QUALITY_NOTES.get(code, code) for code in (quality or {}).get("warnings") or []]
+
+
+def validate_quality_policy(policy):
+    if policy not in AUDIO_QUALITY_POLICIES:
+        raise ValueError("политика качества: warn или reject_clipping")
+    return policy
+
+
+def trim_quality_map(prof, limit=200):
+    """Ограничить историю измерений качества последними записями (векторы не затрагиваются)."""
+    items = prof.get("audio_quality")
+    if isinstance(items, dict) and len(items) > limit:
+        for key in list(items)[:-limit]:
+            items.pop(key, None)
+
+
 def voice_weight_diagnostics(prof):
     """Доли численных весов частей без векторов; не измерение влияния или качества узнавания."""
     result = {}
@@ -239,6 +337,22 @@ SAME_MARGIN = 0.05    # или вклад ближе к другому учас�
 GATE_MIN_SEC = 20.0   # проверка — когда у имени уже есть столько секунд из других записей
 GATE_PART_SEC = 4.0   # и вклад записи не короче (короткие отрезки слишком шумные для вывода)
 
+# Качество записи: сейчас только измерения и предупреждения. Автоматическая отбраковка
+# по клиппингу включается решением человека для группы; тихая речь и оценка SNR сами по себе
+# ничего не отбраковывают. SNR без чистого эталона приблизителен.
+AUDIO_QUALITY_POLICIES = ("warn", "reject_clipping")
+CLIP_LEVEL = 0.999
+CLIP_REJECT_RATIO = 0.005
+QUIET_PEAK_DBFS = -30.0
+NOISY_SNR_DB = 10.0
+AUDIO_QUALITY_NOTES = {
+    "clipping": "есть клиппинг (перегрузка)",
+    "silent": "сигнал почти отсутствует",
+    "very_quiet": "очень тихая запись",
+    "noisy_estimate": "оценка шума высокая",
+}
+FINGERPRINT_KEYS = ("transcript_sha256", "transcript_size", "audio_size", "audio_mtime")
+
 
 SELECTION_REASONS = {
     "unknown_speaker": "Реплика пропущена: участник не определён",
@@ -258,6 +372,8 @@ SELECTION_REASONS = {
     "unconfirmed_source": "Расшифровка пропущена: нет подтверждённых имён или действующих правок",
     "missing_audio": "Расшифровка пропущена: исходное аудио недоступно",
     "already_processed": "Расшифровка пропущена: эта версия уже учтена",
+    "source_changed_requires_preview": "Источник изменился после прежнего учёта; нужен просмотр и подтверждение",
+    "audio_quality_rejected": "Источник пропущен: политика группы отбраковала клиппинг",
     "source_needs_review": "Прежний источник не подтверждён текущими правилами отбора; требуется проверка",
     "existing_requires_preview": "Вклад сохранён без изменений: требуется отдельное подтверждение обновления",
     "no_usable_vectors": "Новый вклад не создан: нет подходящих фрагментов или пригодных отпечатков",
@@ -327,12 +443,16 @@ def auto_learn_group(prof, group, expected_names, learn_fn, save_fn):
     sufficiency = profile_sufficiency(prof, expected_names)
     learned = []
     if not sufficiency["sufficient"]:
+        before_provenance = prof.get("provenance_revision", 0)
         learned = learn_fn()
-        if learned:
+        if learned or prof.get("provenance_revision", 0) != before_provenance:
             save_fn()
         sufficiency = profile_sufficiency(prof, expected_names)
     if sufficiency["sufficient"]:
-        settings.save_group_voice_settings(group, {"auto_learn": False, "reason": "sufficient"})
+        data = {"auto_learn": False, "reason": "sufficient"}
+        if policy.get("audio_quality_policy_source") == "group":
+            data["audio_quality_policy"] = policy["audio_quality_policy"]
+        settings.save_group_voice_settings(group, data)
         return learned, {"enabled": False, "reason": "sufficient"}
     return learned, {"enabled": True, "reason": policy.get("reason", "default")}
 
@@ -482,7 +602,7 @@ def _source_needs_review(prof, audio_key):
 
 
 def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
-          stop_when=None, allow_replace=False):
+          stop_when=None, allow_replace=False, quality_policy="warn", quality_report=None):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
     Вклад каждой записи хранится отдельно (ключ — путь к аудио). До реализации подтверждаемого
     предпросмотра существующий вклад не заменяется и не отзывается автоматически. На одну запись берётся самая
@@ -493,7 +613,12 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
     это записывается в warnings. only — учесть только эти файлы .transcript.json.
     Защита от тёзок: расшифровка другой группы (group) пропускается; вклад записи, непохожий на уже
     собранный голос этого имени (SAME_MIN, SAME_MARGIN), в профиль не идёт, а ждёт решения человека
-    в prof["quarantine"] (resolve_voice: тот же человек или другой)."""
+    в prof["quarantine"] (resolve_voice: тот же человек или другой).
+    quality_policy: warn — только измерить и предупредить; reject_clipping — не учитывать источник
+    с клиппингом. quality_report получает измерение последнего источника и признак отбраковки."""
+    quality_policy = quality_policy if quality_policy in AUDIO_QUALITY_POLICIES else "warn"
+    if quality_report is not None:
+        quality_report["policy"] = quality_policy
     learned = []
     def note(reason):
         if selection_report is not None:
@@ -548,11 +673,29 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         if len(learned) >= limit or (stop_when is not None and stop_when()):
             break
         key = str(jp.resolve())
-        if prof["sources"].get(key) == mt and not only:
-            version = (prof.get("source_selection_versions") or {}).get(key)
-            note("already_processed" if version == SELECTION_VERSION and not _source_needs_review(prof, akey)
-                 else "source_needs_review")
-            continue
+        current_fp = source_fingerprint(jp, src)
+        status = source_fingerprint_status(prof["sources"].get(key), current_fp, mt)
+        if not only:
+            if status in ("unchanged", "legacy_unchanged"):
+                if status == "legacy_unchanged":
+                    # Старый источник уже был учтён до появления отпечатков. Принимаем текущее
+                    # состояние как исходное, но не пересчитываем вклад автоматически.
+                    prof["sources"][key] = current_fp
+                    prof["provenance_revision"] = int(prof.get("provenance_revision", 0)) + 1
+                    prof.setdefault("history", []).append({
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"), "from": jp.name,
+                        "kind": "source_fingerprint_accepted",
+                        "note": "старый источник принят как исходный; вклад не пересчитывался"})
+                version = (prof.get("source_selection_versions") or {}).get(key)
+                note("already_processed" if version == SELECTION_VERSION and not _source_needs_review(prof, akey)
+                     else "source_needs_review")
+                continue
+            if status == "changed":
+                note("source_changed_requires_preview")
+                continue
+            if status == "legacy_changed" and any(akey in s.get("parts", {}) for s in prof["speakers"].values()):
+                note("source_changed_requires_preview")
+                continue
         before_update = copy.deepcopy(prof)
         before_report = dict(selection_report) if selection_report is not None else None
         try:
@@ -575,6 +718,16 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             per = {}
             if spans:
                 audio = load_audio(src)
+                quality = audio_quality(audio)
+                if quality_report is not None:
+                    quality_report.update(quality)
+                if (quality_policy == "reject_clipping" and quality.get("available")
+                        and quality.get("clipping_ratio", 0.0) >= CLIP_REJECT_RATIO):
+                    note("audio_quality_rejected")
+                    if quality_report is not None:
+                        quality_report["rejected"] = True
+                        quality_report["reject_reason"] = "clipping"
+                    continue
                 vecs = embedder.spans(audio, [(s, e) for _, s, e, _ in spans], cap=LEARN_CAP)
                 for (name, s, e, human), v in zip(spans, vecs):
                     if v is not None:
@@ -636,6 +789,18 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             if not changed_names and not quarantined_names:
                 note("no_profile_change")
                 continue
+            prof.setdefault("audio_quality", {})[akey] = {
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"), "from": jp.name,
+                **{k: v for k, v in quality.items() if k != "warnings"},
+                "warnings": quality.get("warnings") or []}
+            trim_quality_map(prof)
+            if quality.get("warnings"):
+                prof["warnings"].append({
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"), "speaker": "вся запись",
+                    "from": jp.name, "kind": "audio_quality",
+                    "quality_warnings": list(quality["warnings"]),
+                    "note": "Качество аудио: " + ", ".join(explain_audio_quality(quality))
+                            + ". Это измерение, а не автоматический отказ; решение — за человеком."})
             pairs = _human_pairs(data)
             prof["confusions"][akey] = {f"{a}|{b}": n for (a, b), n in pairs.items()}
             after = voice_vectors(prof)
@@ -660,7 +825,7 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
             prof["revision"] = int(prof.get("revision", 0)) + 1
             learned.append(jp.name)
             _log(f"профиль пополнен из {jp.name}: {sorted(per)} за {time.time() - t0:.1f} с")
-            prof["sources"][key] = mt
+            prof["sources"][key] = current_fp
             prof.setdefault("source_selection_versions", {})[key] = SELECTION_VERSION
         except Exception as ex:
             prof.clear()

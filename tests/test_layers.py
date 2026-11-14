@@ -215,6 +215,20 @@ class ServerGateTests(unittest.TestCase):
             self.assertTrue(any("Анна" in line for line in ask.call_args.args[2]))
             self.assertTrue(any("наложение: 2" in line for line in ask.call_args.args[2]))
 
+    def test_resolve_voice_reports_remaining_contribution_and_scope(self):
+        gd = put_group("lay-gate")
+        audio_key = str((paths.DATA_DIR / "demo.wav").resolve())
+        profile = {"version": 3, "sources": {},
+                   "speakers": {"Анна": {"parts": {audio_key: {"vec": [1], "sec": 1}}},
+                                "Борис": {"parts": {audio_key: {"vec": [2], "sec": 2}}}},
+                   "quarantine": {audio_key: {"Анна": {"from": "demo.transcript.json"}}}}
+        (gd / "voices.json").write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+        with mock.patch.object(confirm, "require"):
+            result = json.loads(self.server.resolve_voice("Анна", "demo.transcript.json", "different", "lay-gate"))
+        self.assertEqual(result["remaining_contributions"], ["Анна", "Борис"])
+        self.assertTrue(result["revoke_removes_all_source_contributions"])
+        self.assertIn("у всех", result["warning"])
+
     def test_selected_quote_requires_person(self):
         snapshot = {"source_revision": 3, "source_hash": "abc", "request_hash": "def"}
         report = {"candidates": [{"quote_index": 1, "quote": "альфа бета", "candidates": [

@@ -123,7 +123,7 @@ def check(conspect_text, data, names=None):
         i, L = where if where is not None else (0, 0)
         found_spk = spks.most_common(1)[0][0] if spks else None
         rows.append({"quote": q, "speaker": spk, "score": round(score, 2),
-                     "verdict": "дословно" if score == 1.0 and len(parts) == 1 and "[" not in q and not ambiguous else ("близко" if score >= 0.6 else "не найдено"),
+                     "verdict": "дословно" if score == 1.0 and len(parts) == 1 and "[" not in q and "…" not in q and "..." not in q and not ambiguous else ("близко" if score >= 0.6 else "не найдено"),
                      "t": toks[i][2] if toks else 0, "transcript": " ".join(seq[max(0, i - 2):i + L + 2]),
                      "transcript_speaker": found_spk,
                      "speaker_ok": None if not spk else spk == found_spk,

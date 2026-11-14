@@ -785,6 +785,7 @@ def main():
         out_dir.mkdir(exist_ok=True)
         md_path = out_dir / (stem + ".transcript.md")
         json_path = out_dir / (stem + ".transcript.json")
+        transcript.ensure_new_result(json_path, md_path)
 
         vocab_path, vocab, vgroup = resolve_vocab(src, a, cfg)
         # общий словарь без "group" (и группа не задана явно): словарь применяется, профили голосов групп — нет
@@ -913,7 +914,7 @@ def main():
                 data["no_profile"] = True
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
-            transcript.save(data, json_path, md_path)
+            transcript.save_new(data, json_path, md_path)
             st.set(state="done", stage="готово", progress=100, markdown=str(md_path), json=str(json_path),
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
@@ -1031,7 +1032,7 @@ def main():
         if label_name:
             data.update(speaker_names={l: label_name[l] for l in labels if l in label_name},
                         names_source="voices", names_confirmed=False)
-        transcript.save(data, json_path, md_path)
+        transcript.save_new(data, json_path, md_path)
 
         st.set(state="done", stage="готово", progress=100, markdown=str(md_path),
                json=str(json_path), timing=timing,

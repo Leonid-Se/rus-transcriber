@@ -9,7 +9,19 @@ import hashlib
 import json
 import re
 import uuid
+from functools import wraps
 from pathlib import Path
+
+
+def recording_locked(func):
+    """Сериализовать всю операцию с записью, включая вложенную пересборку."""
+    @wraps(func)
+    def wrapped(json_path, *args, **kwargs):
+        import conspect
+        with conspect.write_lock(json_path):
+            return func(json_path, *args, **kwargs)
+    return wrapped
+
 
 REASON_RU = {"asr": "модели распознали по-разному", "conf": "модель не уверена в слове",
              "voice": "голоса близки — говорящий под вопросом", "overlap": "говорят одновременно",
@@ -169,6 +181,28 @@ def render_md(data, text_only=False):
 
 
 def save(data, json_path, md_path):
+    import conspect
+    with conspect.write_lock(json_path):
+        return _save_locked(data, json_path, md_path)
+
+
+def ensure_new_result(json_path, md_path):
+    """Под блокировкой проверить, что оба пути результата свободны."""
+    import conspect
+    with conspect.write_lock(json_path):
+        if Path(json_path).exists() or Path(md_path).exists():
+            raise FileExistsError("результат уже существует; выберите другую метку (tag)")
+
+
+def save_new(data, json_path, md_path):
+    """Создать результат worker, не заменяя существующие файлы."""
+    import conspect
+    with conspect.write_lock(json_path):
+        ensure_new_result(json_path, md_path)
+        return _save_locked(data, json_path, md_path)
+
+
+def _save_locked(data, json_path, md_path):
     # Идентификаторы не зависят от времени слова или его позиции в отображении.
     # Старые файлы получают их при первом сохранении; дубликаты после разрезания
     # реплик получают новые ID. Это не межпроцессная блокировка.
@@ -234,6 +268,7 @@ def _restore_patches(rows, patches):
     return result
 
 
+@recording_locked
 def undo_answer(json_path, md_path, aid, snapshot):
     """Отменяет ответ только если состояние после него осталось неизменным."""
     data = load(json_path)
@@ -272,6 +307,7 @@ def undo_answer(json_path, md_path, aid, snapshot):
     return {"id": aid, "reverted": True, "conspects": _refresh_conspects(json_path)}
 
 
+@recording_locked
 def rename(json_path, md_path, mapping):
     """mapping: {"Спикер 4": "Анна", ...}. Ключом может быть исходная метка или уже данное имя.
     Исходная метка сохраняется в поле label каждого сегмента, поэтому переименовывать можно повторно."""
@@ -411,6 +447,7 @@ def review_list(json_path, offset=0, limit=40, reasons=None, min_sec=0.0, brief=
     return res
 
 
+@recording_locked
 def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="claude", resolve=True):
     """Правка произвольного отрезка стенограммы: слова, начинающиеся в [t1, t2] с, заменяются текстом text
     (по словам: совпадающие сохраняют время), speaker — подписать отрезок этим говорящим (реплика делится).
@@ -455,6 +492,7 @@ def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="cla
                    "conspects": rep.get("conspects")}
 
 
+@recording_locked
 def reopen(json_path, md_path, ids):
     """Снова открывает места разбора (закрытые или оставленные человеку), чтобы решить их заново."""
     data = load(json_path)
@@ -581,6 +619,7 @@ def vocab_candidate(word, data=None):
     return True
 
 
+@recording_locked
 def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers=None, log_note=None, dry_run=False):
     """Правки по словам, а не по местам (свободные ответы человека, freeform.py; правка отрезка edit_span).
     edits: [{"op": "relabel", "t", "speaker"} | {"op": "replace", "t", "text"} |
@@ -925,6 +964,7 @@ def apply_word_edits(json_path, md_path, edits, by="human", closed=None, answers
     return data, rep
 
 
+@recording_locked
 def apply_review(json_path, md_path, decisions, by="claude"):
     """decisions: [{"id": "r5", "speaker"?: имя, "text"?: новый текст места, "status"?: "resolved"|"human",
     "note"?: str}]. Без speaker и text — место принято как есть. status "human" — оставить человеку.

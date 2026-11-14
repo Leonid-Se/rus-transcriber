@@ -439,6 +439,12 @@ def free_answers(json_path):
 
 def apply_free(json_path, md_path, free, dry_run=False):
     """Свободные ответы → правки слов (freeform.plan) → transcript.apply_word_edits. -> отчёт для человека."""
+    import conspect
+    with conspect.write_lock(json_path):
+        return _apply_free_locked(json_path, md_path, free, dry_run=dry_run)
+
+
+def _apply_free_locked(json_path, md_path, free, dry_run=False):
     from collections import Counter
     import freeform as F
     import transcript as T

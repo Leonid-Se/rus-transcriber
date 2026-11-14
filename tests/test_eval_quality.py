@@ -83,17 +83,22 @@ class T(unittest.TestCase):
         from unittest import mock
         audio = self.d / "rec.mp3"
         audio.write_bytes(b"x")
-        out = self.d / "rec.rus-transcriber" / "rec.eval.transcript.json"
-        out.parent.mkdir()
-        out.write_text("{}", encoding="utf-8")
+        out_dir = self.d / "rec.rus-transcriber"
+        out_dir.mkdir()
         seen = {}
 
         def fake_run(cmd, **kw):
             seen["cmd"] = cmd
+            tag = cmd[cmd.index("--tag") + 1]
+            (out_dir / f"rec.{tag}.transcript.json").write_text("{}", encoding="utf-8")
             return mock.Mock(returncode=0, stdout="", stderr="")
         case = {"audio": str(audio), "names": "Анна, Борис", "group": "example", "whisper": "doubt"}
         with mock.patch.object(E.subprocess, "run", fake_run):
-            self.assertEqual(E.transcribe(case), out)
+            first = E.transcribe(case)
+            second = E.transcribe(case)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
         cmd = seen["cmd"]
         self.assertIn("--names", cmd)
         self.assertEqual(cmd[cmd.index("--group") + 1], "example")

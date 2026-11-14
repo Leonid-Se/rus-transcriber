@@ -2,6 +2,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 os.environ.setdefault("RUS_TRANSCRIBER_DATA", tempfile.mkdtemp(prefix="review_cli_"))
@@ -12,6 +13,7 @@ import rt
 class ReviewCLI(unittest.TestCase):
     def test_only_successful_answers_are_marked_applied(self):
         with patch.object(core, "job_json", return_value=("demo.json", "demo.md")), \
+                patch("conspect.write_lock", return_value=nullcontext()), \
                 patch("review_pack.decisions", return_value=([{"id": "r1"}, {"id": "r2"}], {"human": []})), \
                 patch("transcript.load", return_value={"review": []}), \
                 patch("transcript.answer_snapshot", return_value={"snapshot": True}), \

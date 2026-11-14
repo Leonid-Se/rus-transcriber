@@ -455,6 +455,14 @@ def prepare_selected_conspect(job_id, name, text, selections):
 
 def save_selected_conspect(snapshot, text, selections):
     import conspect
+    jp = Path(_done_json(snapshot["job_id"])["json"])
+    with conspect.write_lock(jp):
+        conspect.recover_pending(jp)
+        return _save_selected_conspect_locked(snapshot, text, selections)
+
+
+def _save_selected_conspect_locked(snapshot, text, selections):
+    import conspect
     current, _ = prepare_selected_conspect(snapshot["job_id"], snapshot["name"], text, selections)
     if current != snapshot:
         raise CoreError("стенограмма или выбор изменились после подтверждения")
@@ -467,18 +475,27 @@ def save_selected_conspect(snapshot, text, selections):
         raise CoreError("стенограмма или выбор изменились после подтверждения")
     cj, cm = conspect.path_for(jp, snapshot["name"])
     try:
-        with cj.open("x", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1)
-        with cm.open("x", encoding="utf-8") as f:
-            f.write(md)
+        conspect.write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
+                                  (cm, md.encode("utf-8"))], create=True)
     except OSError as ex:
         raise CoreError("не удалось полностью сохранить конспект; проверьте файлы результата") from ex
     return {**report, "conspect_json": str(cj), "conspect_md": str(cm),
-            "analysis_needs_review": render_report["analysis_needs_review"]}
+            "analysis_needs_review": render_report["analysis_needs_review"],
+            "assembly_revision": render_report["assembly_revision"],
+            "analysis_revision": render_report["analysis_revision"],
+            "external_publication": render_report["external_publication"]}
 
 
 def confirm_conspect_analysis(snapshot):
     """Записать подтверждение только если файлы не изменились после показа человеку."""
+    import conspect
+    jp = Path(_done_json(snapshot["job_id"])["json"])
+    with conspect.write_lock(jp):
+        conspect.recover_pending(jp)
+        return _confirm_conspect_analysis_locked(snapshot)
+
+
+def _confirm_conspect_analysis_locked(snapshot):
     import conspect
     current = describe_conspect_confirmation(snapshot["job_id"], snapshot["name"])
     if current != snapshot:
@@ -488,13 +505,13 @@ def confirm_conspect_analysis(snapshot):
     obj = json.loads(cj.read_text(encoding="utf-8"))
     data = json.loads(jp.read_text(encoding="utf-8"))
     conspect.confirm_analysis(obj, data)
-    # Перед заменой повторно проверяем снимок; общей межпроцессной блокировки пока нет.
+    # Повторно проверяем снимок; внешние писатели могут не соблюдать блокировку.
     if describe_conspect_confirmation(snapshot["job_id"], snapshot["name"]) != snapshot:
         raise CoreError("конспект или стенограмма изменились после запроса подтверждения")
-    tmp = cj.with_name(cj.name + "." + uuid.uuid4().hex + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(cj)
-    return {"name": snapshot["name"], "source_revision": snapshot["source_revision"], "analysis_needs_review": False}
+    conspect.write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8"))])
+    return {"name": snapshot["name"], "source_revision": snapshot["source_revision"],
+            "analysis_revision": snapshot["source_revision"], "analysis_needs_review": False,
+            "external_publication": "not_tracked"}
 
 
 def apply_answers(job_id):
@@ -507,6 +524,12 @@ def apply_answers(job_id):
 
 def apply_answers_files(jp, md):
     """Применить ответы к указанной паре файлов готовой задачи."""
+    import conspect
+    with conspect.write_lock(jp):
+        return _apply_answers_files_locked(jp, md)
+
+
+def _apply_answers_files_locked(jp, md):
     import review_pack as P
     import transcript
     decisions, rep = P.decisions(jp)

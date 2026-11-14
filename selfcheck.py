@@ -102,9 +102,14 @@ def run_check_repo():
         problems, words, is_git = m.check(False)
     except Exception as ex:
         return {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:300]}
-    return {"ok": bool(words) and not problems, "words": len(words), "violations": len(problems),
-            "where": mask(problems)[:20], "mode": "git" if is_git else "папка без git",
-            **({"note": "список запрещённых слов пуст — проверка слов не выполнена"} if not words else {})}
+    if not words:
+        # на домашней установке приватный список запрещённых слов недоступен: это не поломка.
+        # Проверка путей и формата выполнена; проверку слов владелец делает на своей машине.
+        return {"ok": not problems, "partial": True, "words": 0, "violations": len(problems),
+                "where": mask(problems)[:20], "mode": "git" if is_git else "папка без git",
+                "note": "список запрещённых слов пуст — проверка слов не выполнена (проверка путей выполнена)"}
+    return {"ok": not problems, "words": len(words), "violations": len(problems),
+            "where": mask(problems)[:20], "mode": "git" if is_git else "папка без git"}
 
 
 def run_morph():

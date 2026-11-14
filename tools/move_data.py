@@ -1,12 +1,12 @@
 r"""Переносит данные rus-transcriber в обычную (не «пакетную») папку, например %APPDATA%\\rus-transcriber-data.
 
-Запускать обычным Python из PowerShell при ЗАКРЫТОМ Claude Desktop:
+Запускать обычным Python из PowerShell при ЗАКРЫТОМ приложении ИИ-агента (например, Claude Desktop):
     python move_data.py --dry-run      # только показать, что найдено и что будет сделано
     python move_data.py                # перенести в %APPDATA%\\rus-transcriber-data
     python move_data.py --dest D:\\rus-transcriber-data
 
 Где ищет данные (если папка существует и это не папка назначения):
-  - Packages\\Claude_*\\LocalCache\\{Local,Roaming}\\rus-transcriber-data   (скрытые папки Store-версии Claude)
+  - Packages\\Claude_*\\LocalCache\\{Local,Roaming}\\rus-transcriber-data   (скрытые папки Store-версии клиента, например Claude)
   - %LOCALAPPDATA%\\rus-transcriber-data, %APPDATA%\\rus-transcriber-data, %USERPROFILE%\\rus-transcriber-data
   - любые, указанные через --src
 Правила: копируются только отсутствующие файлы; при расхождении остаётся более новый, старый кладётся в
@@ -130,7 +130,7 @@ def main():
     dest.mkdir(parents=True, exist_ok=True)
     with open(dest / "migration.log", "a", encoding="utf-8") as f:
         f.write("\n".join(log_lines) + "\n")
-    print("Готово. Запустите Claude Desktop и попросите проверить get_settings.")
+    print("Готово. Запустите приложение ИИ-агента (например, Claude Desktop) и попросите проверить get_settings.")
 
 
 if __name__ == "__main__":

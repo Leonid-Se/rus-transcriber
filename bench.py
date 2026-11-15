@@ -82,6 +82,8 @@ VARIANTS = [
      "asr_third_device": "GPU", "asr_third_quant": "fp16", "label": "Whisper, видеокарта Arc (fp16)"},
     {"id": "whisper-cpu", "family": WHISPER, "device": "CPU", "asr_backend": "whisper-cpu",
      "asr_third_device": "CPU", "asr_third_quant_cpu": "int8", "label": "Whisper, процессор (int8)"},
+    {"id": "whisper-ct2", "family": WHISPER, "device": "CPU", "asr_backend": "whisper-ct2",
+     "label": "Whisper, faster-whisper (int8)"},
     {"id": "whisper-dml", "family": WHISPER, "device": "GPU", "asr_backend": "dml",
      "asr_quant": "int8", "label": "Whisper, DirectML (int8)"},
 ]
@@ -94,7 +96,7 @@ DEFAULT_NPU = "ov-npu-pad22,ctc-npu-pad22"
 
 CONFIG_KEYS = ("asr_backend", "asr_device", "pad_to_seconds", "asr_model", "asr_batch",
                "asr_allow_npu", "asr_second_backend", "asr_second_device", "asr_second_batch",
-               "asr_third_device", "asr_third_quant", "asr_third_quant_cpu",
+               "asr_third_device", "asr_third_quant", "asr_third_quant_cpu", "asr_third_backend",
                "bench_min_similarity")
 
 
@@ -208,7 +210,7 @@ def choice_summary(results, family, threshold):
 
 def run_one(variant, npy, model, chunk_max):
     """Выполняется в дочернем процессе: грузит бэкенд, распознаёт куски, печатает JSON."""
-    from backends import OnnxASR, TorchASR, WhisperOV, make_asr
+    from backends import OnnxASR, TorchASR, WhisperCT2, WhisperOV, make_asr
     from worker import split_at_pauses
     audio = np.load(npy)
     family = variant.get("family", RNNT)
@@ -234,6 +236,8 @@ def run_one(variant, npy, model, chunk_max):
                                "asr_quant": variant.get("asr_quant", "int8"),
                                "asr_quant_cpu": variant.get("asr_quant", "int8"),
                                "asr_language": "ru", "asr_batch": 4})
+        elif variant["asr_backend"] == "whisper-ct2":
+            asr = WhisperCT2()
         else:
             asr, _ = make_asr({"asr_model": third, "asr_backend": "onnx-cpu", "asr_device": "CPU",
                                "asr_quant_cpu": variant.get("asr_third_quant_cpu", "int8"),
@@ -320,7 +324,12 @@ def saved_settings(main, second=None, whisper=None, model="v3_e2e_rnnt", min_sim
         out["asr_third_device"] = dev
         out["asr_third_quant"] = "fp16"
         out["asr_third_quant_cpu"] = "int8"
-    out["asr_allow_npu"] = any(x and device_of(x) == "NPU" for x in (main, second))
+        # выбор движка третьей модели: faster-whisper vs onnx; пусто — старое поведение
+        out["asr_third_backend"] = "whisper-ct2" if whisper.get("asr_backend") == "whisper-ct2" else ""
+    # пишем только если основной/второй проход тестировались: иначе прогон
+    # одного семейства (например, только Whisper) затёр бы выбор полного теста
+    if main or second:
+        out["asr_allow_npu"] = any(x and device_of(x) == "NPU" for x in (main, second))
     if min_similarity is not None:
         # порог, заданный ключом --min-similarity, сохраняем: иначе следующий запуск его забудет
         out["bench_min_similarity"] = round(min(max(float(min_similarity), 0.0), 1.0), 3)
@@ -447,21 +456,23 @@ def main():
         best_ctc_v = merge_variant(best_ctc, variants)
         best_whisper_v = merge_variant(best_whisper, variants)
         saved = saved_settings(best_main_v, best_ctc_v, best_whisper_v, a.model,
-                               a.min_similarity) if best_main_v else {}
+                               a.min_similarity) if (best_main_v or best_whisper_v) else {}
         if best_main:
             lines += ["", f"Основной проход: **{best_main['label']}**"]
             lines.append(f"Второй проход CTC: **{best_ctc['label']}**" if best_ctc
                          else "Второй проход CTC: не тестировался")
             lines.append(f"Whisper: **{best_whisper['label']}**" if best_whisper
                          else "Whisper: не тестировался или не прошёл порог точности")
-            if saved and not a.no_write:
-                # результат теста — это выбор этой машины, поэтому пишем его явно,
-                # даже если он совпал с общим умолчанием (например, процессор)
-                settings.update(explicit=saved.keys(), **saved)
-                lines.append("Настройки этой машины сохранены в config.json папки данных: "
-                             + ", ".join(f"{k}={v}" for k, v in saved.items()))
-            else:
-                lines.append("Настройки не записаны (--no-write).")
+        elif best_whisper:
+            lines += ["", f"Whisper: **{best_whisper['label']}**"]
+        if saved and not a.no_write:
+            # результат теста — это выбор этой машины, поэтому пишем его явно,
+            # даже если он совпал с общим умолчанием (например, процессор)
+            settings.update(explicit=saved.keys(), **saved)
+            lines.append("Настройки этой машины сохранены в config.json папки данных: "
+                         + ", ".join(f"{k}={v}" for k, v in saved.items()))
+        elif a.no_write:
+            lines.append("Настройки не записаны (--no-write).")
 
         def describe(r):
             if not r:

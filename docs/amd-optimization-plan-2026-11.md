@@ -54,6 +54,17 @@
   Предварительное исследование: `docs/research-third-whisper-2026-11.md` (2026-11-14:
   приоритет faster-whisper, замеры не выполнялись).
 
+**Статус пункта В (15.11):** bench-варианты `ctc-dml`/`whisper-dml` добавлены и
+измерены (CTC-DML +14% к CPU, Whisper-DML отклонён); whisper.cpp замерен и
+отклонён (CPU q5_0 1.72×); faster-whisper интегрирован как альтернатива
+(`WhisperCT2` в `backends.py`, ключ `asr_third_backend` в `worker.py`, вариант
+`whisper-ct2` в `bench.py`, установка с `--no-deps` в `install.ps1`). Bench
+`--only whisper-cpu,whisper-ct2`: faster-whisper 4.3× против onnx 2.7×, но
+метрика «совпадения» bench внутри семейства недостоверна при разных движках
+(эталон — текст onnx: 54%; против независимого эталона GigaAM — faster-whisper
+74.1%, onnx 44.9%). Выбор записан вручную: `asr_third_backend: "whisper-ct2"`.
+Детали и ограничения — в `docs/research-third-whisper-2026-11.md`.
+
 ### Г. Вне кода
 
 - план питания Windows «Максимальная производительность», контроль троттлинга.

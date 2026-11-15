@@ -461,14 +461,16 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
         selected = [k for k, c in enumerate(wchunks) if any(c["own"][0] <= x < c["own"][1] for x in dt)]
     wpieces = [audio[int(wchunks[k]["a"] * SR):int(wchunks[k]["b"] * SR)] for k in selected]
     if third and alt is not None:
-        # Whisper: на видеокарте Arc (OpenVINO, fp16), при сбое — процессор (int8)
+        # Whisper: faster-whisper (если выбран тестом скорости, asr_third_backend=whisper-ct2),
+        # на видеокарте Arc (OpenVINO, fp16), при сбое — процессор (int8)
         from backends import normalize_device
         dev = normalize_device(cfg.get("asr_third_device", "CPU"))
         if dev not in ("GPU", "CPU"):
             print(f"[words] Whisper: устройство {dev} не поддерживается, считаю на CPU",
                   file=sys.stderr, flush=True)
             dev = "CPU"
-        tries = ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
+        tries = ([("whisper-ct2", "CPU", "int8")] if cfg.get("asr_third_backend", "") == "whisper-ct2" else []) \
+            + ([("whisper-ov", dev, cfg.get("asr_third_quant", "fp16"))] if dev == "GPU" else []) \
             + [("onnx-cpu", "CPU", cfg.get("asr_third_quant_cpu", "int8"))]
         outer_attempts = []
         whisper_finished = False
@@ -480,6 +482,9 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                     from backends import WhisperOV
                     asr3, errs3 = WhisperOV(third, device=device, quant=quant, language="ru",
                                             batch=int(cfg.get("asr_third_batch", 4))), None
+                elif backend == "whisper-ct2":
+                    from backends import WhisperCT2
+                    asr3, errs3 = WhisperCT2(cpu_threads=int(cfg.get("torch_threads") or 0)), None
                 else:
                     asr3, errs3 = make_asr({**cfg, "asr_model": third, "asr_backend": backend, "asr_device": device,
                                             "asr_quant": quant, "asr_quant_cpu": quant, "asr_language": "ru",

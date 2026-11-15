@@ -348,6 +348,12 @@ if ($ov -ne "2025.4.1") {
     Write-Host "  OpenVINO $ov не подходит — ставлю 2025.4.1"
     & $py -m pip install "openvino==2025.4.1"; Check "OpenVINO 2025.4.1"
 } else { Write-Host "  OpenVINO 2025.4.1 — версия подходит" }
+# faster-whisper (CTranslate2) — альтернативный движок Whisper, выбирается тестом скорости (bench).
+# Ставим с --no-deps: он тянет обычный onnxruntime, взаимно исключаемый с onnxruntime-openvino;
+# onnxruntime нужен faster-whisper только для встроенного VAD, который не используется.
+# huggingface_hub уже поставлен с pyannote.audio.
+& $py -m pip install --no-deps "faster-whisper==1.2.1"; Check "faster-whisper"
+& $py -m pip install "ctranslate2==4.9.0" "tokenizers" "av"; Check "CT2/tokenizers/av"
 # после смены версии OpenVINO сохранённые модели Whisper пересоберутся при первом запуске (это нормально)
 # словарь русского языка: свободные ответы в карточках — отличать опечатку от настоящего слова
 & $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check "pymorphy3"

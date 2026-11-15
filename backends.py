@@ -507,6 +507,66 @@ class WhisperOV:
         return out
 
 
+class WhisperCT2:
+    """Whisper через faster-whisper (CTranslate2) на процессоре — альтернатива onnx-пути,
+    выбирается тестом скорости (bench записывает asr_third_backend=whisper-ct2).
+    Пакет faster-whisper ставится с --no-deps: он тянет обычный onnxruntime, который
+    взаимно исключаем с onnxruntime-openvino; onnxruntime нужен faster-whisper только
+    для встроенного VAD, который здесь не используется (vad_filter=False)."""
+
+    def __init__(self, model="large-v3-turbo", compute_type="int8", cpu_threads=0, language="ru"):
+        from faster_whisper import WhisperModel
+        threads = int(cpu_threads or 0)
+        if threads <= 0:
+            threads = os.cpu_count() or 4
+        self.model = WhisperModel(model, device="cpu", compute_type=compute_type, cpu_threads=threads)
+        self.language = language
+        self.name = f"whisper-ct2:{compute_type}:t{threads}"
+        self.model_name = model
+        self.compile_sec = None
+
+    def transcribe_texts(self, pieces, progress=None, diagnostics=None):
+        """Кусок за куском, как у onnx-пути; диагностика в том же формате (state/attempts),
+        ошибка одного куска не роняет запуск."""
+        kw = {"language": self.language} if self.language else {}
+        out = [""] * len(pieces)
+        records = [{"index": i, "samples": len(p), "attempts": [], "state": "not_attempted"}
+                   for i, p in enumerate(pieces)]
+        for i, p in enumerate(pieces):
+            t0 = time.monotonic()
+            try:
+                if len(p) == 0:
+                    raise ValueError("пустой аудиофрагмент")
+                segments, _info = self.model.transcribe(p.astype(np.float32), beam_size=1,
+                                                        vad_filter=False, **kw)
+                text = "".join(s.text for s in segments).strip()
+                out[i] = text
+                elapsed = round(time.monotonic() - t0, 4)
+                records[i]["attempts"].append({"result": "empty" if not text else "ok", "retry": False,
+                                               "batch": [i], "input_samples": len(p), "elapsed_sec": elapsed})
+                records[i]["state"] = "empty_unknown" if not text else "ok"
+            except Exception as ex:
+                elapsed = round(time.monotonic() - t0, 4)
+                records[i]["attempts"].append({"result": "error", "error_type": type(ex).__name__,
+                                               "retry": False, "batch": [i], "input_samples": len(p),
+                                               "elapsed_sec": elapsed})
+                records[i]["state"] = "error"
+                print(f"[whisper-ct2] кусок {i} не распознан ({type(ex).__name__})", file=sys.stderr, flush=True)
+            if progress:
+                progress(i + 1, len(pieces))
+        if diagnostics is not None:
+            diagnostics.extend(records)
+        return out
+
+    def transcribe(self, audio):
+        segments, _info = self.model.transcribe(audio.astype(np.float32), beam_size=1, vad_filter=False,
+                                                **({"language": self.language} if self.language else {}))
+        return "".join(s.text for s in segments).strip()
+
+    def transcribe_many(self, pieces, progress=None):
+        return self.transcribe_texts(pieces, progress=progress)
+
+
 class TorchASR:
     def __init__(self, model="v3_e2e_rnnt"):
         import gigaam

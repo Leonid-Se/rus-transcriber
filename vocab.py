@@ -1,10 +1,9 @@
 """Словарь группы: участники (имя, пол), имена и названия, явные замены.
 
-Файл — rus-transcriber.vocab.json (UTF-8). Где ищется, по порядку:
-  1) путь, переданный явно (параметр vocab_path / --vocab);
-  2) папка записи и до двух папок выше — так словарь лежит вместе с записями группы
-     и передаётся вместе с ними или отдельно;
-  3) DATA_DIR\\groups\\<группа>\\vocab.json — словарь группы (группа: параметр group, default_group, единственная).
+Поиск словаря ограничен явным путём, sidecar в папке записи и двух предках, точной папкой
+известного результата и прямой ссылкой quality.vocab. DATA_DIR — только fallback для
+однозначной группы. Несколько разных подходящих файлов или противоречие групп требуют
+явного решения; порядок обхода не выбирает словарь. Произвольные вложенные папки не обходятся.
 Голосовые профили в словарь не входят (см. voices.py): они хранятся только на этом компьютере.
 
 Формат:
@@ -33,24 +32,211 @@ _PH = str.maketrans({"ё": "и", "е": "и", "я": "и", "ы": "и", "э": "и",
                      "б": "п", "в": "ф", "г": "к", "д": "т", "ж": "ш", "з": "с", "ь": None, "ъ": None})
 
 
+class ResolutionError(RuntimeError):
+    """Отказ выбора словаря с ограниченным отчётом, не содержащим его содержимое."""
+
+    def __init__(self, message, report):
+        self.report = report
+        details = []
+        for item in report.get("candidates", [])[:8]:
+            source = item.get("source")
+            if isinstance(source, list):
+                source = ", ".join(source)
+            part = f"{source}: {item.get('status')} — {item.get('path') or 'путь некорректен'}"
+            if item.get("group"):
+                part += f" (группа {item['group']})"
+            details.append(part)
+        binding = report.get("binding") or {}
+        if binding.get("conflict"):
+            details.append(f"group={binding.get('embedded_group')}, "
+                           f"quality.vocab group={binding.get('vocab_group')} — {binding.get('vocab_path')}")
+        elif binding.get("vocab_path") and binding.get("vocab_status") != "valid":
+            details.append(f"quality.vocab: {binding['vocab_status']} — {binding['vocab_path']}")
+        super().__init__(message + (": " + "; ".join(details) if details else ""))
+
+
+def _group_key(group):
+    if not isinstance(group, str) or not group.strip():
+        return None
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in group.strip())
+
+
+def _path_key(path):
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        p = p.absolute()
+    return str(p).casefold()
+
+
+def validate(data):
+    """Проверяет внешнюю форму словаря, не возвращая его содержимое в диагностике."""
+    if not isinstance(data, dict):
+        return "root_not_object"
+    if "group" in data and (not isinstance(data["group"], str) or not data["group"].strip()):
+        return "invalid_group"
+    if not isinstance(data.get("participants", []), list):
+        return "invalid_participants"
+    for participant in data.get("participants", []):
+        if not isinstance(participant, dict) or (
+                "name" in participant and not isinstance(participant["name"], str)) or (
+                "gender" in participant and not isinstance(participant["gender"], str)):
+            return "invalid_participant"
+    if not isinstance(data.get("terms", []), list) or any(
+            not isinstance(term, str) for term in data.get("terms", [])):
+        return "invalid_terms"
+    if not isinstance(data.get("replace", {}), dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in data.get("replace", {}).items()):
+        return "invalid_replace"
+    if not isinstance(data.get("replace_if", []), list) or any(
+            not isinstance(rule, dict) for rule in data.get("replace_if", [])):
+        return "invalid_replace_if"
+    return None
+
+
+def inspect(path, source):
+    """Возвращает метаданные кандидата и данные отдельно; в отчёт словарь не попадает."""
+    if not isinstance(path, (str, Path)) or not str(path).strip():
+        return {"path": None, "source": source, "status": "invalid",
+                "group": None, "reason": "invalid_path"}, None
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        pass
+    item = {"path": str(p), "source": source, "status": "missing", "group": None}
+    try:
+        if not p.is_file():
+            return item, None
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        item.update(status="invalid", reason="invalid_json")
+        return item, None
+    except (OSError, UnicodeError):
+        item.update(status="invalid", reason="unreadable")
+        return item, None
+    problem = validate(data)
+    if problem:
+        item.update(status="invalid", reason=problem)
+        return item, None
+    item.update(status="valid", group=data.get("group"))
+    return item, data
+
+
+def resolve_candidates(candidates, expected_group=None, allow_ungrouped=False):
+    """Однозначно разрешает список точечных кандидатов; никогда не выбирает первый.
+
+    candidates — пары (путь, источник). Одинаковые нормализованные пути объединяются.
+    """
+    report = {"candidates": [], "selected": None, "group": None, "selection_reason": None}
+    unique = {}
+    for path, source in candidates:
+        key = _path_key(path)
+        if key not in unique:
+            unique[key] = [Path(path).expanduser(), []]
+        if source not in unique[key][1]:
+            unique[key][1].append(source)
+
+    inspected = []
+    for path, sources in unique.values():
+        item, data = inspect(path, sources[0] if len(sources) == 1 else sources)
+        report["candidates"].append(item)
+        if item["status"] == "valid":
+            inspected.append((item, data))
+    report["expected_group"] = expected_group
+
+    invalid = [item for item in report["candidates"] if item["status"] == "invalid"]
+    if invalid:
+        report["selection_reason"] = "invalid_candidate"
+        raise ResolutionError("Найден некорректный словарь; выбор остановлен", report)
+
+    if expected_group:
+        expected_key = _group_key(expected_group)
+        conflicts = [item for item, _ in inspected
+                     if item.get("group") and _group_key(item["group"]) != expected_key]
+        if conflicts:
+            report["selection_reason"] = "group_conflict"
+            raise ResolutionError("Группа словаря не совпадает с выбранной группой", report)
+        unknown = [item for item, _ in inspected if not item.get("group")]
+        if unknown and not allow_ungrouped:
+            report["selection_reason"] = "unknown_group"
+            raise ResolutionError("Группа одного из словарей неизвестна; требуется явный выбор", report)
+        group = expected_group
+    else:
+        groups = {_group_key(item["group"]) for item, _ in inspected if item.get("group")}
+        if len(groups) > 1:
+            report["selection_reason"] = "group_conflict"
+            raise ResolutionError("Найдены словари разных групп; требуется явный выбор", report)
+        if any(not item.get("group") for item, _ in inspected) and not allow_ungrouped:
+            report["selection_reason"] = "unknown_group"
+            raise ResolutionError("Группа словаря неизвестна; требуется явный выбор", report)
+        group = next((item["group"] for item, _ in inspected if item.get("group")), None)
+
+    if len(inspected) > 1:
+        report["selection_reason"] = "multiple_candidates"
+        raise ResolutionError("Найдено несколько словарей; укажите словарь или группу явно", report)
+    if not inspected:
+        report["group"] = group
+        report["selection_reason"] = "no_dictionary"
+        return None, {}, group, report
+
+    item, data = inspected[0]
+    if not item.get("group") and not allow_ungrouped:
+        report["selection_reason"] = "unknown_group"
+        raise ResolutionError("Группа словаря неизвестна; требуется явный выбор", report)
+    report["selected"] = item["path"]
+    report["group"] = group or item.get("group")
+    report["selection_reason"] = "explicit_candidate" if allow_ungrouped else "unique_group_candidate"
+    return Path(item["path"]), data, report["group"], report
+
+
+def transcript_binding(data):
+    """Сверяет встроенную группу и прямую ссылку quality.vocab без поиска по дереву."""
+    if not isinstance(data, dict):
+        raise ValueError("Расшифровка должна быть объектом")
+    embedded = data.get("group")
+    if embedded is not None and _group_key(embedded) is None:
+        raise ValueError("Некорректная группа в расшифровке")
+    quality = data.get("quality") or {}
+    if not isinstance(quality, dict):
+        raise ValueError("Некорректное поле quality в расшифровке")
+    ref = quality.get("vocab")
+    result = {"group": embedded, "embedded_group": embedded, "vocab_path": None,
+              "vocab_group": None, "vocab_status": "not_referenced", "conflict": False}
+    if not ref:
+        return result
+    if not isinstance(ref, (str, Path)) or not str(ref).strip():
+        result.update(vocab_status="invalid", vocab_reason="invalid_path")
+        return result
+    item, vocab = inspect(ref, "quality.vocab")
+    result.update(vocab_path=item["path"], vocab_status=item["status"],
+                  vocab_group=item.get("group"), vocab_reason=item.get("reason"))
+    if item["status"] == "valid":
+        referenced_group = item.get("group")
+        if embedded and referenced_group and _group_key(embedded) != _group_key(referenced_group):
+            result["conflict"] = True
+        else:
+            result["group"] = embedded or referenced_group
+    return result
+
+
 def find(audio_path=None, explicit=None, default_file=None):
-    """Возвращает (путь, данные) или (None, {}). default_file — словарь группы в DATA_DIR (paths.vocab_path)."""
-    cands = []
+    """Возвращает (путь, данные) или (None, {}); неоднозначность не разрешается порядком обхода."""
     if explicit:
-        cands.append(Path(explicit).expanduser())
+        candidates = [(Path(explicit).expanduser(), "explicit")]
+        path, data, _, _ = resolve_candidates(candidates, allow_ungrouped=True)
+        return path, data
+    candidates = []
     if audio_path:
-        d = Path(audio_path).resolve().parent
-        for p in [d, *list(d.parents)[:2]]:
-            cands.append(p / FILE_NAME)
+        directory = Path(audio_path).resolve().parent
+        candidates.extend((parent / FILE_NAME, "audio_sidecar")
+                          for parent in [directory, *list(directory.parents)[:2]])
     if default_file:
-        cands.append(Path(default_file))
-    for p in cands:
-        if p.is_file():
-            try:
-                return p, json.loads(p.read_text(encoding="utf-8-sig"))
-            except json.JSONDecodeError as ex:
-                raise RuntimeError(f"Словарь {p} повреждён: {ex}") from ex
-    return None, {}
+        candidates.append((Path(default_file), "default_file"))
+    path, data, _, _ = resolve_candidates(candidates)
+    return path, data
 
 
 def genders(vocab):

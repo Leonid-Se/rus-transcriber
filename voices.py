@@ -457,19 +457,18 @@ def auto_learn_group(prof, group, expected_names, learn_fn, save_fn):
     return learned, {"enabled": True, "reason": policy.get("reason", "default")}
 
 
-def group_of(data, _cache={}):
-    """Группа расшифровки: поле group, иначе group словаря, с которым она сделана (quality.vocab)."""
-    if data.get("group"):
-        return data["group"]
-    vp = (data.get("quality") or {}).get("vocab")
-    if not vp:
-        return None
-    if vp not in _cache:
-        try:
-            _cache[vp] = json.loads(Path(vp).read_text(encoding="utf-8-sig")).get("group")
-        except Exception:
-            _cache[vp] = None
-    return _cache[vp]
+def group_binding(data):
+    """Диагностика источников группы; stale-ссылка видна, конфликт не маскируется."""
+    import vocab
+    return vocab.transcript_binding(data)
+
+
+def group_of(data, _cache=None):
+    """Группа расшифровки: встроенное поле или прямая ссылка quality.vocab."""
+    binding = group_binding(data)
+    if binding["conflict"]:
+        raise ValueError("Группа расшифровки противоречит группе словаря quality.vocab")
+    return binding["group"]
 
 
 def _word_human(word):

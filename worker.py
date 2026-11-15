@@ -80,23 +80,100 @@ def wait_slot(st, cfg, status_path):
            queued_sec=round(time.time() - t, 1) if time.time() - t > 3 else None)
 
 
-def resolve_vocab(src, a, cfg):
-    """(путь словаря, словарь, группа). Порядок: --vocab → явная --group (её словарь) → словарь рядом с записью
-    (и двумя папками выше) → группа по умолчанию (default_group в config.json или единственная в DATA_DIR)."""
+def resolve_vocab_details(src, a, cfg, transcript_path=None):
+    """Разрешает словарь только по ограниченным путям и возвращает отчёт без содержимого словарей."""
     import vocab as vocab_mod
-    if a.vocab:
-        vp, vocab = vocab_mod.find(src, a.vocab, None)
-    elif a.group:
-        vp, vocab = vocab_mod.find(None, None, paths.vocab_path(a.group))
-    else:
-        vp, vocab = vocab_mod.find(src, None, None)
-    group = vocab.get("group") or a.group
-    if not vp:
-        group = group or paths.pick_group(None, cfg.get("default_group"))
+
+    transcript_data = None
+    binding = None
+    if transcript_path:
+        try:
+            transcript_data = json.loads(Path(transcript_path).read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as ex:
+            raise RuntimeError("Не удалось прочитать исходную расшифровку для проверки группы") from ex
+        binding = vocab_mod.transcript_binding(transcript_data)
+        if binding["conflict"]:
+            raise vocab_mod.ResolutionError(
+                "Группа в расшифровке противоречит группе словаря quality.vocab",
+                {"binding": binding, "candidates": []})
+
+    explicit_group = getattr(a, "group", "") or ""
+    explicit_vocab = getattr(a, "vocab", "") or ""
+    expected = explicit_group or (binding or {}).get("group")
+    if explicit_group and (binding or {}).get("group") and \
+            paths.safe_group(explicit_group) != paths.safe_group(binding["group"]):
+        raise vocab_mod.ResolutionError(
+            "Явная группа противоречит группе исходной расшифровки",
+            {"binding": binding, "candidates": []})
+
+    if explicit_vocab:
+        candidates = [(Path(explicit_vocab).expanduser(), "explicit_vocab")]
+        vp, data, group, report = vocab_mod.resolve_candidates(
+            candidates, expected_group=expected, allow_ungrouped=True)
+        if report["candidates"][0]["status"] == "missing":
+            raise vocab_mod.ResolutionError("Явно указанный словарь не найден", report)
+        if explicit_group:
+            group = explicit_group
+        report["binding"] = binding
+        return {"path": vp, "vocab": data, "group": group, "report": report}
+
+    if explicit_group:
+        candidates = [(paths.vocab_path(explicit_group), "explicit_group_vocab")]
+        vp, data, group, report = vocab_mod.resolve_candidates(
+            candidates, expected_group=explicit_group, allow_ungrouped=True)
+        report["binding"] = binding
+        return {"path": vp, "vocab": data, "group": explicit_group, "report": report}
+
+    candidates = []
+    if binding and binding.get("vocab_path"):
+        candidates.append((binding["vocab_path"], "quality.vocab"))
+    if src:
+        directory = Path(src).expanduser().resolve().parent
+        candidates.extend((parent / vocab_mod.FILE_NAME, "audio_sidecar")
+                          for parent in [directory, *list(directory.parents)[:2]])
+        candidates.append((directory / (Path(src).stem + ".rus-transcriber") /
+                           vocab_mod.FILE_NAME, "known_output_sidecar"))
+    if transcript_path:
+        # Точная папка известной расшифровки; не обходим произвольные вложенные каталоги.
+        candidates.append((Path(transcript_path).resolve().parent / vocab_mod.FILE_NAME,
+                           "transcript_sidecar"))
+
+    # Уникальная/настроенная группа — fallback только для новой расшифровки.
+    # При обучении старой записи текущий default_group не доказывает её принадлежность.
+    if transcript_path:
+        expected = (binding or {}).get("group")
+        has_existing = any(Path(path).expanduser().is_file() for path, _ in candidates)
+        if not expected and has_existing:
+            _, _, expected, _ = vocab_mod.resolve_candidates(candidates)
+        if expected:
+            candidates.append((paths.vocab_path(expected), "group_fallback"))
+        vp, data, group, report = vocab_mod.resolve_candidates(
+            candidates, expected_group=expected)
+        report["binding"] = binding
+        return {"path": vp, "vocab": data, "group": group, "report": report}
+
+    # Sidecar может установить группу, но не выбирается автоматически вместо второго
+    # словаря той же группы: оба точечных источника попадут в отчёт и дадут неоднозначность.
+    existing = any(Path(path).expanduser().is_file() for path, _ in candidates)
+    if existing:
+        _, _, group, _ = vocab_mod.resolve_candidates(candidates)
         if group:
-            vp, vocab = vocab_mod.find(None, None, paths.vocab_path(group))
-            group = vocab.get("group") or group
-    return vp, vocab, a.group or group
+            candidates.append((paths.vocab_path(group), "group_fallback"))
+        vp, data, group, report = vocab_mod.resolve_candidates(candidates, expected_group=group)
+        return {"path": vp, "vocab": data, "group": group, "report": report}
+
+    group = paths.pick_group(None, cfg.get("default_group"))
+    if group:
+        candidates.append((paths.vocab_path(group), "group_fallback"))
+    vp, data, group, report = vocab_mod.resolve_candidates(
+        candidates, expected_group=group)
+    return {"path": vp, "vocab": data, "group": group, "report": report}
+
+
+def resolve_vocab(src, a, cfg, transcript_path=None):
+    """Совместимый краткий интерфейс: (путь словаря, словарь, группа)."""
+    result = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path)
+    return result["path"], result["vocab"], result["group"]
 
 
 def _hf_downloads():
@@ -816,13 +893,14 @@ def learn_only(a, st, cfg, src):
         except TypeError:
             pipe = Pipeline.from_pretrained(name, use_auth_token=token)
         emb = voices.Embedder(pipe)
-        _, vocab, vgroup = resolve_vocab(src, a, cfg)
+        resolution = resolve_vocab_details(src, a, cfg, transcript_path=a.learn_only)
+        vocab, vgroup = resolution["vocab"], resolution["group"]
         allowed = [p["name"] for p in vocab.get("participants", []) if p.get("name")]
         # профиль — той группы, с которой сделана расшифровка, а не текущего словаря по умолчанию
         tg = voices.group_of(json.loads(Path(a.learn_only).read_text(encoding="utf-8")))
-        group = tg or vgroup or "default"
-        if tg and vgroup and tg != vgroup:
-            allowed = []                           # участники словаря — другой группы: не ограничиваем
+        group = tg or vgroup
+        if not group:
+            raise RuntimeError("Группа исходной расшифровки неизвестна; требуется явный выбор")
         ppath = voices.profile_path(group)
         with settings.group_voice_lock(group):
             authorized = bool(a.voice_source_hash and a.voice_profile_hash and a.voice_audio_hash and a.voice_group)
@@ -856,6 +934,7 @@ def learn_only(a, st, cfg, src):
                revision=prof.get("revision"), last=last, selection_report=selection_report,
                selection_explanation=voices.explain_selection_report(selection_report), backup=backup,
                provenance_updated=provenance_updated, audio_quality=quality_report,
+               vocab_resolution=resolution["report"],
                quarantine={n: q for qa in (prof.get("quarantine") or {}).values() for n, q in qa.items()
                            if last and q.get("from") == last.get("from")},
                warnings=[w for w in prof.get("warnings", []) if last and w.get("from") == last.get("from")])
@@ -914,7 +993,8 @@ def main():
         json_path = out_dir / (stem + ".transcript.json")
         transcript.ensure_new_result(json_path, md_path)
 
-        vocab_path, vocab, vgroup = resolve_vocab(src, a, cfg)
+        resolution = resolve_vocab_details(src, a, cfg)
+        vocab_path, vocab, vgroup = resolution["path"], resolution["vocab"], resolution["group"]
         # общий словарь без "group" (и группа не задана явно): словарь применяется, профили голосов групп — нет
         no_profile = bool(vocab_path) and not vgroup
         genders_by_name = vocab_mod.genders(vocab)
@@ -943,7 +1023,8 @@ def main():
         t_diar = time.time() - t0
 
         # ---- голоса: профиль, разрезание реплик, короткие реплики, имена ----
-        quality = {"vocab": str(vocab_path) if vocab_path else None, "speaker_fixes": [], "vocab_fixes": [],
+        quality = {"vocab": str(vocab_path) if vocab_path else None,
+                   "vocab_resolution": resolution["report"], "speaker_fixes": [], "vocab_fixes": [],
                    "review": []}
         label_name, label_of, refs, emb, t_voice = {}, {}, {}, None, 0.0
         voice_ctx = {}

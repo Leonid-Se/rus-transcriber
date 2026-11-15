@@ -228,13 +228,42 @@ class VocabTests(unittest.TestCase):
             grp.write_text(json.dumps({"group": "grp"}), encoding="utf-8")
             audio = d / "rec" / "a.mp3"
             self.assertEqual(vocab.find(audio, expl, grp)[1]["group"], "explicit")
-            self.assertEqual(vocab.find(audio, None, grp)[1]["group"], "near")
+            self.assertEqual(vocab.find(audio)[1]["group"], "near")
             self.assertEqual(vocab.find(d / "other" / "a.mp3", None, grp)[1]["group"], "grp")
             self.assertEqual(vocab.find(d / "other" / "a.mp3", None, None), (None, {}))
             bad = d / "bad.json"
             bad.write_text("{oops", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 vocab.find(None, bad, None)
+
+    def test_find_refuses_multiple_distinct_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recording = root / "recording"
+            recording.mkdir()
+            (recording / vocab.FILE_NAME).write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            fallback = root / "group.json"
+            fallback.write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            with self.assertRaises(vocab.ResolutionError) as error:
+                vocab.find(recording / "audio.wav", default_file=fallback)
+            self.assertIn("несколько", str(error.exception))
+            self.assertEqual(sum(item["status"] == "valid"
+                                 for item in error.exception.report["candidates"]), 2)
+            self.assertTrue(all("participants" not in str(item)
+                                for item in error.exception.report["candidates"]))
+
+    def test_transcript_binding_reports_stale_reference_and_group_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = root / "missing-vocab.json"
+            binding = vocab.transcript_binding({"group": "alpha", "quality": {"vocab": str(stale)}})
+            self.assertEqual(binding["group"], "alpha")
+            self.assertEqual(binding["vocab_status"], "missing")
+            self.assertFalse(binding["conflict"])
+            foreign = root / "foreign.json"
+            foreign.write_text(json.dumps({"group": "beta"}), encoding="utf-8")
+            binding = vocab.transcript_binding({"group": "alpha", "quality": {"vocab": str(foreign)}})
+            self.assertTrue(binding["conflict"])
 
 
 class Gender(unittest.TestCase):

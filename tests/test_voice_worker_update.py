@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import core
 import paths
+import vocab
 import voices
 import worker
 
@@ -22,6 +23,138 @@ class Status:
 
 
 class VoiceWorkerUpdate(unittest.TestCase):
+    @staticmethod
+    def _vocab_args(**values):
+        return types.SimpleNamespace(vocab=values.get("vocab", ""), group=values.get("group", ""))
+
+    def test_vocab_resolution_checks_audio_directory_and_two_parents(self):
+        for level in range(3):
+            with self.subTest(level=level), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                recording_dir = root / "one" / "two" / "three"
+                recording_dir.mkdir(parents=True)
+                audio = recording_dir / "demo.wav"
+                audio.touch()
+                sidecar_dir = [recording_dir, recording_dir.parent, recording_dir.parent.parent][level]
+                (sidecar_dir / vocab.FILE_NAME).write_text(json.dumps({"group": "demo-group"}),
+                                                          encoding="utf-8")
+                fallback = root / "groups" / "demo-group" / "vocab.json"
+                with patch.object(paths, "vocab_path", return_value=fallback), \
+                     patch.object(paths, "pick_group", return_value=None):
+                    result = worker.resolve_vocab_details(audio, self._vocab_args(), {})
+                self.assertEqual(result["group"], "demo-group")
+                self.assertEqual(result["path"], sidecar_dir / vocab.FILE_NAME)
+
+    def test_vocab_resolution_does_not_search_beyond_two_audio_parents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recording_dir = root / "one" / "two" / "three"
+            recording_dir.mkdir(parents=True)
+            audio = recording_dir / "demo.wav"
+            audio.touch()
+            (root / vocab.FILE_NAME).write_text(json.dumps({"group": "outside"}), encoding="utf-8")
+            with patch.object(paths, "pick_group", return_value=None):
+                result = worker.resolve_vocab_details(audio, self._vocab_args(), {})
+            self.assertIsNone(result["path"])
+            self.assertNotIn(str((root / vocab.FILE_NAME).resolve()),
+                             [item["path"] for item in result["report"]["candidates"]])
+
+    def test_vocab_resolution_checks_known_output_sidecar_and_group_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_dir = root / "audio"
+            audio_dir.mkdir()
+            audio = audio_dir / "demo.wav"
+            audio.touch()
+            output = audio_dir / "demo.rus-transcriber"
+            output.mkdir()
+            sidecar = output / vocab.FILE_NAME
+            sidecar.write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            fallback = root / "groups" / "alpha" / "vocab.json"
+            with patch.object(paths, "vocab_path", return_value=fallback), \
+                 patch.object(paths, "pick_group", return_value=None):
+                result = worker.resolve_vocab_details(audio, self._vocab_args(), {})
+            self.assertEqual(result["path"], sidecar)
+            self.assertIn("known_output_sidecar",
+                          [item["source"] for item in result["report"]["candidates"]])
+
+    def test_vocab_resolution_uses_unambiguous_configured_group_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            group_vocab = root / "groups" / "alpha" / "vocab.json"
+            group_vocab.parent.mkdir(parents=True)
+            group_vocab.write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            audio = root / "audio" / "demo.wav"
+            audio.parent.mkdir()
+            audio.touch()
+            with patch.object(paths, "vocab_path", return_value=group_vocab), \
+                 patch.object(paths, "pick_group", return_value="alpha"):
+                result = worker.resolve_vocab_details(audio, self._vocab_args(), {})
+            self.assertEqual(result["path"], group_vocab)
+            self.assertEqual(result["group"], "alpha")
+            self.assertEqual(result["report"]["selected"], str(group_vocab.resolve()))
+
+    def test_learning_resolution_uses_transcript_binding_and_reports_stale_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "demo.wav"
+            audio.touch()
+            transcript_file = root / "demo.transcript.json"
+            transcript_file.write_text(json.dumps({
+                "file": str(audio), "group": "alpha",
+                "quality": {"vocab": str(root / "removed-vocab.json")}}), encoding="utf-8")
+            group_vocab = root / "groups" / "alpha" / "vocab.json"
+            group_vocab.parent.mkdir(parents=True)
+            group_vocab.write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            with patch.object(paths, "vocab_path", return_value=group_vocab):
+                result = worker.resolve_vocab_details(
+                    audio, self._vocab_args(), {"default_group": "beta"},
+                    transcript_path=transcript_file)
+            self.assertEqual(result["path"], group_vocab)
+            self.assertEqual(result["group"], "alpha")
+            stale = next(item for item in result["report"]["candidates"]
+                         if item["source"] == "quality.vocab")
+            self.assertEqual(stale["status"], "missing")
+
+    def test_vocab_resolution_rejects_foreign_and_ambiguous_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio" / "demo.wav"
+            audio.parent.mkdir()
+            audio.touch()
+            sidecar = audio.parent / vocab.FILE_NAME
+            sidecar.write_text(json.dumps({"group": "beta"}), encoding="utf-8")
+            with patch.object(paths, "vocab_path", return_value=root / "groups" / "alpha" / "vocab.json"):
+                result = worker.resolve_vocab_details(audio, self._vocab_args(group="alpha"), {})
+            self.assertEqual(result["group"], "alpha")
+            self.assertIsNone(result["path"])
+            self.assertNotEqual(result["path"], sidecar)
+            with patch.object(paths, "vocab_path", return_value=sidecar):
+                with self.assertRaises(vocab.ResolutionError):
+                    worker.resolve_vocab_details(audio, self._vocab_args(group="alpha"), {})
+            sidecar.write_text(json.dumps({"group": "alpha"}), encoding="utf-8")
+            fallback = root / "groups" / "alpha" / "vocab.json"
+            fallback.parent.mkdir(parents=True)
+            fallback.write_text(json.dumps({"group": "alpha", "terms": ["different"]}), encoding="utf-8")
+            with patch.object(paths, "vocab_path", return_value=fallback):
+                with self.assertRaises(vocab.ResolutionError) as error:
+                    worker.resolve_vocab_details(audio, self._vocab_args(), {})
+            self.assertIn("несколько", str(error.exception))
+
+    def test_transcript_group_quality_vocab_conflict_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "demo.wav"
+            audio.touch()
+            foreign = root / "foreign.json"
+            foreign.write_text(json.dumps({"group": "beta"}), encoding="utf-8")
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps({"file": str(audio), "group": "alpha",
+                                          "quality": {"vocab": str(foreign)}}), encoding="utf-8")
+            with self.assertRaises(vocab.ResolutionError) as error:
+                worker.resolve_vocab_details(audio, self._vocab_args(), {}, transcript_path=source)
+            self.assertIn("противоречит", str(error.exception))
+
     def test_bad_profile_fails_closed_without_blocking_diarization(self):
         fixtures = [json.dumps({"version": voices.PROFILE_VERSION - 1, "speakers": {}, "sources": {}}),
                     "{bad json", json.dumps({"version": voices.PROFILE_VERSION, "speakers": {}, "sources": []}),

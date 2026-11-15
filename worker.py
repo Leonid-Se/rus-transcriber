@@ -33,6 +33,7 @@ for _s in (sys.stdout, sys.stderr):  # Windows: лог в файл иначе п
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tmpfiles  # noqa: E402
 import paths  # noqa: E402  (кэши моделей — в папке программы)
+import download_hint  # noqa: E402
 import transcript  # noqa: E402
 from transcript import hms  # noqa: E402
 
@@ -821,7 +822,8 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                     seg["emotion"] = {"label": EMO_RU.get(top, top), "score": round(float(p[top]), 2)}
         except Exception as ex:
             print(f"Эмоции отключены: {ex}", file=sys.stderr, flush=True)
-            quality["emotions_error"] = f"{type(ex).__name__}: {ex}"[:300]
+            err = f"{type(ex).__name__}: {ex}"[:300]
+            quality["emotions_error"] = (err + download_hint.certificate_hint(ex))[:600]
 
     labels = list(dict.fromkeys(s["label"] for s in segments))
     names = {l: label_name[l] for l in labels if l in label_name}
@@ -1209,6 +1211,10 @@ def main():
                 emo = gigaam.load_model("emo", download_root=str(paths.GIGAAM_DIR))
             except Exception as ex:
                 print(f"Эмоции отключены: {ex}", file=sys.stderr, flush=True)
+                quality["emotions_error"] = (
+                    f"{type(ex).__name__}: {ex}"[:300]
+                    + download_hint.certificate_hint(ex)
+                )[:600]
         st.set(stage="распознавание", progress=38, asr_backend=asr.name,
                asr_fallbacks=asr_errors or None)
 

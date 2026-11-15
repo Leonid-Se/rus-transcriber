@@ -126,10 +126,10 @@ for _var, _sub in (("HF_HOME", "huggingface"), ("TORCH_HOME", "torch"), ("PIP_CA
     os.environ.setdefault(_var, str(CACHE / _sub))
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-# Проверка HTTPS-сертификатов средствами Windows, а не встроенным OpenSSL Python.
-# Windows сама достраивает актуальную цепочку сертификатов; OpenSSL иногда выбирает
-# цепочку с просроченным промежуточным сертификатом и падает с CERTIFICATE_VERIFY_FAILED
-# (так было при скачивании моделей GigaAM с сервера Сбера).
+# Проверка HTTPS-сертификатов средствами Windows, а не только bundle OpenSSL Python.
+# Windows достраивает цепочку и учитывает системные корни, которых может не быть в certifi.
+# Это не обходит ошибки самого сервера: просроченный листовой сертификат будет отклонён
+# и здесь (например, при скачивании моделей GigaAM; см. docs/model-download-certificate.md).
 try:
     import truststore
     truststore.inject_into_ssl()

@@ -34,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import paths  # noqa: E402,F401
 import tmpfiles  # noqa: E402
+import download_hint  # noqa: E402
 SR = 16000
 
 RNNT, CTC, WHISPER, TORCH = "rnnt", "ctc", "whisper", "torch"
@@ -420,7 +421,10 @@ def main():
                     r.update(json.loads(line[len("@@RESULT@@"):]))
                     r["rtfx"] = round(dur / max(r["asr_sec"], 1e-6), 1)
                 else:
-                    r["error"] = (p.stderr or p.stdout).strip().splitlines()[-1:] or ["нет вывода"]
+                    tail = (p.stderr or p.stdout).strip()
+                    r["error"] = tail.splitlines()[-1:] or ["нет вывода"]
+                    if download_hint.is_certificate_error(tail):
+                        r["cert_error"] = True
             except subprocess.TimeoutExpired:
                 r["error"] = [f"дольше {a.timeout} с (скорее всего, долгая компиляция модели)"]
             results.append(r)
@@ -485,6 +489,11 @@ def main():
                 mark = f"ниже порога {threshold * 100:.0f}%"
             lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
                          f"{sim} | {words} | {mark} |")
+
+        if any(r.get("cert_error") for r in results):
+            lines += ["", "**Ошибки сертификата:** сервер моделей не прошёл проверку TLS. "
+                          f"Проверка и разовая ручная загрузка: {download_hint.DOC}; "
+                          "команды: `.venv\\Scripts\\python.exe download_hint.py`."]
 
         best_main_v = merge_variant(best_main, variants)
         best_ctc_v = merge_variant(best_ctc, variants)

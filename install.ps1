@@ -35,6 +35,12 @@ $Name = "rus-transcriber"
 
 function Fail($msg) { Write-Host $msg -ForegroundColor Red; exit 1 }
 function Check($what) { if ($LASTEXITCODE -ne 0) { Fail "Ошибка на шаге: $what (код $LASTEXITCODE)" } }
+function Check-Pip($what) {
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Если выше есть CERTIFICATE_VERIFY_FAILED / certificate has expired, см. инструкцию: $(Join-Path $Target 'docs\model-download-certificate.md')" -ForegroundColor Yellow
+        Fail "Ошибка установки пакета: $what (код $LASTEXITCODE)"
+    }
+}
 function Step($n, $msg) { Write-Host "`n[$n] $msg" -ForegroundColor Cyan }
 function HasNonAscii($s) { return $s -match '[^\x00-\x7F]' }
 function WriteUtf8NoBom($path, $text) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false)) }
@@ -261,11 +267,14 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 
 Step "4/9" "Копирование файлов программы"
 if ($Source -ne $Target) {
-    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "transcript.py",
+    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "quotes.py", "conspect.py",
                      "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "cards.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
     }
+    $docsTarget = Join-Path $Target "docs"
+    New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
+    Copy-Item (Join-Path $Source "docs\model-download-certificate.md") (Join-Path $docsTarget "model-download-certificate.md") -Force
     # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
     # examples — вымышленный пример группы. Это копии комплекта программы, а личные данные
     # лежат в папке данных, поэтому при обновлении папки заменяются целиком: иначе старые
@@ -327,36 +336,36 @@ if (Test-Path $py) {
 } else {
     & $basePyExe -m venv (Join-Path $Target ".venv"); Check "venv"
 }
-& $py -m pip install --upgrade pip wheel; Check "pip"
+& $py -m pip install --upgrade pip wheel; Check-Pip "pip"
 
 Step "6/9" "PyTorch (процессор), pyannote, GigaAM, MCP"
-& $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu; Check "PyTorch"
-& $py -m pip install "pyannote.audio>=4.0" "pytorch-metric-learning==2.9.0" soundfile truststore "mcp[cli]" "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip"; Check "pyannote/GigaAM"
+& $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu; Check-Pip "PyTorch"
+& $py -m pip install "pyannote.audio>=4.0" "pytorch-metric-learning==2.9.0" soundfile truststore "mcp[cli]" "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/main.zip"; Check-Pip "pyannote/GigaAM"
 # pytorch-metric-learning 3.x требует numpy>=2.5.3, а OpenVINO 2025.4.1 — numpy<2.4.0: держим совместимую 2.9.0
 
 Step "7/9" "OpenVINO для видеокарты Arc"
-& $py -m pip install "onnx-asr[hub]" "openvino==2025.4.1"; Check "onnx-asr/OpenVINO"
+& $py -m pip install "onnx-asr[hub]" "openvino==2025.4.1"; Check-Pip "onnx-asr/OpenVINO"
 # onnxruntime, onnxruntime-directml и onnxruntime-openvino дают один и тот же модуль:
 # убираем обычные сборки и ставим сборку с OpenVINO последней
 & $py -m pip uninstall -y onnxruntime onnxruntime-directml onnxruntime-gpu
-& $py -m pip install --force-reinstall --no-deps "onnxruntime-openvino==1.24.1"; Check "onnxruntime-openvino"
+& $py -m pip install --force-reinstall --no-deps "onnxruntime-openvino==1.24.1"; Check-Pip "onnxruntime-openvino"
 # под Windows модуль OpenVINO в onnxruntime берёт библиотеки из пакета openvino — версии должны совпадать
 # (onnxruntime-openvino 1.24.x собран с OpenVINO 2025.4.1; с 2026.x — «ошибка 127» при загрузке)
 # проверяем именно версию: одной проверки «import openvino» мало, потому что любая версия импортируется
 $ov = & $py -c "import openvino; print(openvino.__version__.split('-')[0])" 2>$null
 if ($ov -ne "2025.4.1") {
     Write-Host "  OpenVINO $ov не подходит — ставлю 2025.4.1"
-    & $py -m pip install "openvino==2025.4.1"; Check "OpenVINO 2025.4.1"
+    & $py -m pip install "openvino==2025.4.1"; Check-Pip "OpenVINO 2025.4.1"
 } else { Write-Host "  OpenVINO 2025.4.1 — версия подходит" }
 # faster-whisper (CTranslate2) — альтернативный движок Whisper, выбирается тестом скорости (bench).
 # Ставим с --no-deps: он тянет обычный onnxruntime, взаимно исключаемый с onnxruntime-openvino;
 # onnxruntime нужен faster-whisper только для встроенного VAD, который не используется.
 # huggingface_hub уже поставлен с pyannote.audio.
-& $py -m pip install --no-deps "faster-whisper==1.2.1"; Check "faster-whisper"
-& $py -m pip install "ctranslate2==4.9.0" "tokenizers" "av"; Check "CT2/tokenizers/av"
+& $py -m pip install --no-deps "faster-whisper==1.2.1"; Check-Pip "faster-whisper"
+& $py -m pip install "ctranslate2==4.9.0" "tokenizers" "av"; Check-Pip "CT2/tokenizers/av"
 # после смены версии OpenVINO сохранённые модели Whisper пересоберутся при первом запуске (это нормально)
 # словарь русского языка: свободные ответы в карточках — отличать опечатку от настоящего слова
-& $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check "pymorphy3"
+& $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check-Pip "pymorphy3"
 & $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
 Write-Host "  нужны CPU, OpenVINOExecutionProvider и желательно GPU; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
 

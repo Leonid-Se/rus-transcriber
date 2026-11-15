@@ -77,6 +77,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 - спросит токен Hugging Face (ввод скрыт) и проверит, что он рабочий и что условия pyannote приняты;
 - пропишет сервер в настройки приложения ИИ-агента (например, Claude Desktop), предварительно сделав резервную копию файла настроек. Claude Desktop из Microsoft Store хранит их в `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`, обычная установка — в `%APPDATA%\Claude\claude_desktop_config.json`; установщик пишет во все найденные места.
 
+Если `pip` останавливается на `CERTIFICATE_VERIFY_FAILED` или `certificate has expired`, установщик выведет ссылку на [`docs/model-download-certificate.md`](docs/model-download-certificate.md), раздел 6. Ручные команды из `download_hint.py` предназначены только для весов GigaAM; они не устанавливают PyTorch или пакеты из PyPI.
+
 После этого полностью закройте приложение ИИ-агента (например, Claude Desktop: значок в трее → Quit) и откройте снова.
 
 **Если в имени пользователя Windows есть кириллица** (например, `C:\Users\Иван`), установщик остановится и предложит латинский путь:
@@ -105,6 +107,8 @@ $env:HF_TOKEN = "hf_ваш_токен"
 .\.venv\Scripts\python.exe bench.py "C:\путь\к\записи.mp3" --seconds 180
 ```
 Тест занимает 5–30 минут: модели скачиваются, а под видеокарту первый раз компилируются. Отчёт — `<папка данных>\bench\bench_report.md`, лучший вариант — в `config.json` папки данных. Варианты, которые не запустились, просто помечаются как «не работает».
+
+**Если при первом скачивании моделей появляется `CERTIFICATE_VERIFY_FAILED`**, в том числе «certificate has expired», это может быть проблема сертификата сервера, а не вашего компьютера. Проверка и разовая ручная загрузка с контролем md5: [`docs/model-download-certificate.md`](docs/model-download-certificate.md). Краткие команды для вашей установки печатает `.\.venv\Scripts\python.exe download_hint.py`.
 
 Порог качества задаётся переменной `bench_min_similarity` в `config.json` (по умолчанию `0.97`) или ключом `--min-similarity`. Если важнее точность, а не скорость, поднимите порог:
 ```powershell

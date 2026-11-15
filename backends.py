@@ -17,6 +17,7 @@ import numpy as np
 
 import tmpfiles  # noqa: E402
 import paths  # noqa: F401  (задаёт HF_HOME и др. до загрузки моделей)
+import download_hint  # noqa: E402
 from paths import GIGAAM_DIR, OPENVINO_DIR
 
 SR = 16000
@@ -619,4 +620,6 @@ def make_asr(cfg):
         except Exception as ex:
             errors.append(f"{b}{':' + d if d else ''}: {type(ex).__name__}: {ex}")
             print(f"[asr] {errors[-1]} → пробую следующий вариант", file=sys.stderr, flush=True)
-    raise RuntimeError("Ни один бэкенд распознавания не запустился:\n" + "\n".join(errors))
+    message = "Ни один бэкенд распознавания не запустился:\n" + "\n".join(errors)
+    hint = download_hint.certificate_hint("\n".join(errors))
+    raise RuntimeError(message + ("\n" + hint if hint else ""))

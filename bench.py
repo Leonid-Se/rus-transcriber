@@ -10,6 +10,8 @@ FP32). NPU Meteor Lake (Core Ultra Series 1) пропускается: он не
 Каждый вариант запускается в отдельном процессе с таймаутом: если, например, NPU
 компилирует модель слишком долго или падает, тест просто идёт дальше.
 Точность каждого варианта сравнивается с эталоном (оригинальный GigaAM на CPU).
+Whisper — другой движок: он сравнивается с текстом основного прохода, а порог точности
+к нему не применяется, иначе зацикленный вариант выигрывал бы по скорости.
 """
 import argparse
 import difflib
@@ -274,6 +276,18 @@ def best_of(results, family, min_similarity=0.97):
     return max(ok, key=lambda r: r["rtfx"]) if ok else None
 
 
+def most_accurate(results, family):
+    """Самый близкий к эталону вариант семейства; скорость важна только при равенстве.
+
+    Для Whisper порог точности GigaAM не применяется: движок другой, поэтому даже исправный
+    текст редко совпадает с RNN-T на 97%. Выбирается наибольшее совпадение, а зацикленный
+    или потерявший речь вариант проигрывает по этому же совпадению.
+    """
+    usable = [r for r in results
+              if r.get("family") == family and "rtfx" in r and r.get("text", "").strip()]
+    return max(usable, key=lambda r: (r.get("similarity", 0), r["rtfx"])) if usable else None
+
+
 def merge_variant(result, variants):
     """Результат замера + параметры варианта: saved_settings должен видеть batch, pad и backend."""
     if not result:
@@ -283,11 +297,17 @@ def merge_variant(result, variants):
 
 
 def family_refs(results):
-    """Эталон для каждого семейства — его же вариант на процессоре.
+    """Эталон для каждого семейства.
 
-    CTC и Whisper — другие модели, их текст и так отличается от RNN-T; сверять их с RNN-T
-    значит забраковать любой исправный вариант. Сверяем устройство с тем же семейством на CPU:
-    так видно именно искажение от GPU/NPU, а не разницу моделей.
+    CTC — та же модель GigaAM, поэтому сверяется со своим вариантом на процессоре:
+    так видно искажение от GPU/NPU, а не разницу моделей.
+
+    Whisper — другой движок и другая модель, его текст и так отличается от GigaAM. Сверять
+    Whisper с другим Whisper нельзя: зацикленный текст одного варианта (повторы раздувают
+    его длину) становится «эталоном» и занижает оценку исправного движка. Поэтому Whisper
+    сверяется с основным проходом RNN-T (а если он измерялся — с PyTorch-эталоном).
+    Если основного прохода нет (прогон только Whisper-вариантов), остаётся прежнее правило:
+    первый вариант этого семейства на процессоре.
     """
     refs = {}
     for fam in (RNNT, CTC, WHISPER):
@@ -297,6 +317,8 @@ def family_refs(results):
     torch = [r for r in results if r.get("family") == TORCH and r.get("text", "").strip()]
     if torch:                      # PyTorch — исходная модель: лучший эталон точности для RNN-T
         refs[RNNT] = torch[0]
+    if refs.get(RNNT):
+        refs[WHISPER] = refs[RNNT]
     return refs
 
 
@@ -404,6 +426,8 @@ def main():
             results.append(r)
 
         refs = family_refs(results)
+        whisper_only = (any(r.get("family") == WHISPER for r in results)
+                        and not any(r.get("family") == RNNT for r in results))
         for r in results:
             if "text" not in r:
                 continue
@@ -420,7 +444,15 @@ def main():
         if best_main is None and main_family == RNNT:
             best_main = best_of(results, CTC, threshold)   # запасной путь: RNN-T не прошёл порог
         best_ctc = best_of(results, CTC, threshold) if main_family == RNNT else None
-        best_whisper = best_of(results, WHISPER, threshold)
+        # Whisper — другой движок: порог точности GigaAM к нему не применяется,
+        # иначе ни один исправный вариант не прошёл бы, а зацикленный выигрывал бы по скорости
+        best_whisper = most_accurate(results, WHISPER)
+        whisper_note = ("Whisper сверяется с текстом основного прохода, а не с другим Whisper: иначе "
+                        "раздутый повторами текст одного движка завышает его оценку и занижает оценку второго.")
+        if whisper_only:
+            whisper_note = ("Основной проход не тестировался: Whisper сравнивается с другим Whisper, "
+                            "поэтому оценка может быть искажена. Для честного сравнения запустите тест "
+                            "с вариантами RNN-T.")
 
         lines = [f"# Тест распознавания: {Path(a.audio).name}, {int(dur)} с, фрагменты до {a.chunk_max:g} с",
                  "",
@@ -428,6 +460,7 @@ def main():
                  npu_note(npu),
                  f"Порог качества при выборе: **{threshold * 100:.0f}%** (`bench_min_similarity`; "
                  f"выше — строже к точности). Время «на 10 мин» включает загрузку модели.",
+                 whisper_note,
                  "",
                  "| Вариант | Скорость | 10 мин записи | Совпадение | "
                  "Слова (−потеряно/+лишних/~заменено) | Итог |",
@@ -447,7 +480,8 @@ def main():
                 mark = "**выбран для CTC**"
             elif best_whisper is r:
                 mark = "**выбран для Whisper**"
-            if r.get("similarity", 1) < threshold:
+            if r.get("family") != WHISPER and r.get("similarity", 1) < threshold:
+                # порог — про точность GigaAM; у Whisper шкала другая, к нему он не применяется
                 mark = f"ниже порога {threshold * 100:.0f}%"
             lines.append(f"| {r['label']} | {r['rtfx']}× | {fmt_seconds(r.get('total_10min'))} | "
                          f"{sim} | {words} | {mark} |")
@@ -490,7 +524,8 @@ def main():
             families.append((CTC, "Второй проход CTC"))
         families.append((WHISPER, "Whisper"))
         for fam, title in families:
-            ch = choice_summary(results, fam, threshold)
+            # у Whisper своя шкала: сравниваем с основным проходом и не режем по порогу GigaAM
+            ch = choice_summary(results, fam, 0.0 if fam == WHISPER else threshold)
             if not ch["accurate"]:
                 continue
             lines.append(f"- {title}, точность важнее: {describe(ch['accurate'])}")

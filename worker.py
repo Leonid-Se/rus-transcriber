@@ -503,7 +503,10 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                     for attempt in rec["attempts"]:
                         attempt.setdefault("backend", backend + ":" + device)
                 failed_indices = [i for i, rec in enumerate(whisper_diag) if rec["state"] == "error"]
-                if device == "GPU" and failed_indices:
+                # Ошибочные фрагменты повторяем на onnx-cpu: для Arc (GPU) это повтор на CPU,
+                # для faster-whisper (whisper-ct2) — возврат к прежнему движку. Для самого
+                # onnx-cpu повтор тем же движком бессмыслен. Пустой текст ошибкой не считается.
+                if failed_indices and backend != "onnx-cpu":
                     try:
                         st.set(stage="третья модель: повтор ошибочных фрагментов на CPU", progress=74)
                         cpu, _ = make_asr({**cfg, "asr_model": third, "asr_backend": "onnx-cpu",

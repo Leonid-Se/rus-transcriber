@@ -25,7 +25,8 @@ class ReviewHTTP(unittest.TestCase):
         (cls.pack / "manifest.json").write_text(json.dumps({
             "version": "v1", "audio": "demo.wav", "items": [{"id": "r1", "t": "00:00:01",
                 "clip": "clips/r1.mp3", "text": "да", "speaker": "Участник", "t1": 0.0, "t2": 0.0,
-                "question": "Как правильно?", "options": [{"label": "да", "decision": {}}]}]
+                "question": "Как правильно?", "diagnostic_id": "missed-0001",
+                "options": [{"label": "да", "decision": {}}]}]
         }), encoding="utf-8")
         (cls.pack / "answers.old.json").write_text('{"archive": true}', encoding="utf-8")
         (cls.pack / "cloud.json").write_text('{"debug": true}', encoding="utf-8")
@@ -120,7 +121,29 @@ class ReviewHTTP(unittest.TestCase):
         self.assertEqual(self.post("api/answer", answer, **{"Content-Type": "application/json"})[0], 200)
         store = json.loads(self.request("api/answers")[1])
         self.assertEqual(store["answers"]["r1"]["kind"], "option")
+        self.assertEqual(store["answers"]["r1"]["diagnostic_id"], "missed-0001")
         self.assertEqual(len(list((self.pack / "voice").glob("page-*.wav"))), 1)
+
+    def test_interaction_events_are_versioned_and_linked_to_diagnostic(self):
+        def send(event_type, version="v1"):
+            payload = json.dumps({"id": "r1", "version": version, "type": event_type,
+                                  "session": "session-1234"}).encode()
+            return self.post("api/event", payload, **{"Content-Type": "application/json"})
+
+        status, body, _ = send("card_visible")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["stored"])
+        status, body, _ = send("card_visible")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["duplicate"])
+        self.assertEqual(send("audio_play")[0], 200)
+        self.assertEqual(send("audio_ended")[0], 200)
+        self.assertEqual(send("audio_play", "old")[0], 400)
+        self.assertEqual(send("unexpected")[0], 400)
+        store = json.loads(self.request("api/answers")[1])
+        events = store["interaction_events"]
+        self.assertEqual([e["type"] for e in events], ["card_visible", "audio_play", "audio_ended"])
+        self.assertTrue(all(e["diagnostic_id"] == "missed-0001" for e in events))
 
     def test_limits(self):
         from review_page import MAX_ANSWER_BYTES, MAX_VOICE_BYTES
@@ -140,7 +163,7 @@ class ReviewHTTP(unittest.TestCase):
 
     def test_new_routes_enforce_origin_and_version(self):
         payload = json.dumps({"id": "r1", "version": "old", "text": "пример"}).encode()
-        for route in ("api/preview", "api/apply"):
+        for route in ("api/preview", "api/apply", "api/event"):
             with self.subTest(route=route):
                 self.assertEqual(self.request(route, "POST", payload,
                                  {"Origin": "https://evil.example", "Content-Type": "application/json"})[0], 403)

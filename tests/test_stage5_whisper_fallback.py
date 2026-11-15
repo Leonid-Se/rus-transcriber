@@ -26,6 +26,15 @@ class Main:
 
 
 class WhisperFallbackTests(unittest.TestCase):
+    def test_missed_warning_links_to_its_diagnostic_candidate(self):
+        items = [{"id": "r1", "t": 0.2, "t1": 0.2, "t2": 1.2, "reasons": ["missed"]},
+                 {"id": "r2", "t": 1.2, "t1": 1.2, "t2": 2.0, "reasons": ["asr"]}]
+        trace = {"candidates": [
+            {"id": "missed-0001", "start": 0.2, "end": 1.2, "decision": "warning"}]}
+        self.assertIs(worker.link_missed_diagnostics(items, trace), items)
+        self.assertEqual(items[0]["diagnostic_id"], "missed-0001")
+        self.assertNotIn("diagnostic_id", items[1])
+
     def run_worker(self, cpu_fails=False, load_fails=False, mode="all", disagreement=None,
                    primary_fails=False, second_load_fails=False):
         calls = []
@@ -118,9 +127,12 @@ class WhisperFallbackTests(unittest.TestCase):
         self.assertEqual(len(data["review"]), 2)
 
     def test_off_does_not_load_whisper(self):
-        _, quality, _ = self.run_worker(load_fails=True, mode="off")
+        _, quality, data = self.run_worker(load_fails=True, mode="off")
         self.assertNotIn("whisper", quality["asr_diagnostics"])
         self.assertNotIn("asr_incomplete_chunks", quality)
+        self.assertFalse(quality["missed_speech_diagnostics"]["enabled"])
+        self.assertEqual(quality["missed_speech_diagnostics"]["candidates"], [])
+        self.assertEqual(data["quality"]["missed_speech"], [])
 
     def test_doubt_keeps_original_chunk_index(self):
         calls, quality, _ = self.run_worker(mode="doubt", disagreement=[1.5])

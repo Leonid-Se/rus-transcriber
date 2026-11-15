@@ -528,24 +528,77 @@ def doubt_flags(words, overlaps):
     return thr
 
 
-def missed_speech(words, turns, min_gap=MISSED_MIN):
-    """Где pyannote слышит речь, а ни одна модель не дала слов: [(начало, конец, метка)]."""
+def missed_speech_diagnostics(words, turns, min_gap=MISSED_MIN, enabled=True):
+    """Предупреждения о незакрытых словами речевых интервалах и трасса решения автоматики.
+
+    Трасса не содержит текста, аудио или голосовых признаков; индексы интервалов локальны
+    для этого результата распознавания.
+    """
+    threshold = float(min_gap)
+    trace_floor = max(0.0, min(threshold, max(0.02, threshold * 0.5)))
+    trace = {"schema_version": 1, "algorithm": "diarization-turn-uncovered-gaps",
+             "enabled": bool(enabled), "threshold_seconds": threshold,
+             "candidate_floor_seconds": trace_floor, "short_gaps_omitted": 0,
+             "interval_source": "diarization_turns", "speech_intervals": [],
+             "candidates": [], "warning_ids": []}
+    if not enabled:
+        trace["disabled_reason"] = "review_missed_disabled"
+        for index, turn in enumerate(turns, 1):
+            trace["speech_intervals"].append({
+                "id": f"turn-{index:04d}", "start": round(float(turn["s"]), 3),
+                "end": round(float(turn["e"]), 3), "evaluated": False,
+                "decision": "disabled"})
+        return [], trace
+
     starts = sorted((w["s"], w["e"]) for w in words)
-    out = []
-    for t in turns:
+    out, candidate_index = [], 0
+
+    def candidate(turn_id, start, end, left, right, label):
+        nonlocal candidate_index
+        if end <= start:
+            return
+        duration = end - start
+        eligible = duration >= threshold
+        if not eligible and duration < trace_floor:
+            trace["short_gaps_omitted"] += 1
+            return
+        candidate_index += 1
+        candidate_id = f"missed-{candidate_index:04d}"
+        decision = "warning" if eligible else "below_threshold"
+        trace["candidates"].append({
+            "id": candidate_id, "turn_id": turn_id,
+            "start": round(float(start), 3), "end": round(float(end), 3),
+            "duration_seconds": round(float(duration), 3),
+            "threshold_seconds": threshold, "meets_threshold": eligible,
+            "left_boundary": left, "right_boundary": right, "decision": decision})
+        if eligible:
+            out.append((round(start, 2), round(end, 2), label))
+            trace["warning_ids"].append(candidate_id)
+
+    for index, t in enumerate(turns, 1):
         s, e = t["s"], t["e"]
-        if e - s < min_gap:
+        turn_id = f"turn-{index:04d}"
+        interval = {"id": turn_id, "start": round(float(s), 3),
+                    "end": round(float(e), 3), "evaluated": True}
+        trace["speech_intervals"].append(interval)
+        if e - s < threshold:
+            interval.update(evaluated=False, decision="turn_below_threshold")
             continue
         cur = s
+        left_boundary = "turn_start"
         for ws, we in starts:
             if we < s or ws > e:
                 continue
-            if ws - cur >= min_gap:
-                out.append((round(cur, 2), round(ws, 2), t.get("label")))
+            candidate(turn_id, cur, ws, left_boundary, "word_start", t.get("label"))
             cur = max(cur, we)
-        if e - cur >= min_gap:
-            out.append((round(cur, 2), round(e, 2), t.get("label")))
-    return out
+            left_boundary = "word_end"
+        candidate(turn_id, cur, e, left_boundary, "turn_end", t.get("label"))
+    return out, trace
+
+
+def missed_speech(words, turns, min_gap=MISSED_MIN):
+    """Где диаризация слышит речь, а в словах нет покрытия: [(начало, конец, метка)]."""
+    return missed_speech_diagnostics(words, turns, min_gap)[0]
 
 
 def review_items(segments, min_gap_words=1, missed=None, name_of=None):

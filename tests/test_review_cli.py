@@ -22,7 +22,8 @@ class ReviewCLI(unittest.TestCase):
                 patch("review_pack.free_answers", return_value={}), \
                 patch("review_pack.mark_applied") as mark:
             core.apply_answers("demo")
-        mark.assert_called_once_with("demo.json", {"r1"}, snapshots={"r1": {"snapshot": True}})
+        mark.assert_called_once_with("demo.json", {"r1"}, snapshots={"r1": {"snapshot": True}},
+                                     outcomes={"r1": "applied", "r2": "not_found"})
 
     def test_neutral_questions(self):
         data = {"review": [{"id": "r1", "status": "open"},

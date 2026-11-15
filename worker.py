@@ -423,6 +423,23 @@ class _SkipSegmentSteps(Exception):
     """Пословной обработке шаги разрезания и перепроверки сегментов не нужны."""
 
 
+def link_missed_diagnostics(items, trace):
+    """Связать review-предупреждения с точными кандидатами трассы по округлённым границам."""
+    warning_ids = {}
+    for candidate in trace.get("candidates") or []:
+        if candidate.get("decision") == "warning":
+            key = (round(candidate["start"], 2), round(candidate["end"], 2))
+            warning_ids.setdefault(key, []).append(candidate["id"])
+    for item in items:
+        if "missed" not in (item.get("reasons") or []):
+            continue
+        key = (round(item.get("t1", item["t"]), 2), round(item.get("t2", item["t"]), 2))
+        candidates = warning_ids.get(key) or []
+        if candidates:
+            item["diagnostic_id"] = candidates.pop(0)
+    return items
+
+
 def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name, label_of, voice_ctx,
               allowed, genders_by_name, vocab, quality, make_asr, a):
     """Пословная обработка (words.py). -> данные расшифровки (без file/duration/timing)."""
@@ -779,8 +796,11 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
                 wd["flags"] = src_w["flags"]
             if not wd.get("flags"):
                 wd.pop("sims", None)
-    missed = W.missed_speech(words, turns) if cfg.get("review_missed", True) else []
+    missed_enabled = bool(cfg.get("review_missed", True))
+    missed, missed_diagnostics = W.missed_speech_diagnostics(
+        words, turns, enabled=missed_enabled)
     items = W.review_items(segments, missed=missed, name_of=label_name)
+    link_missed_diagnostics(items, missed_diagnostics)
     for item in items:
         if item.get("alt_whisper"):
             start, end = item.get("t1", item["t"]), item.get("t2", item["t"])
@@ -802,6 +822,7 @@ def run_words(audio, src, cfg, st, raw, order, turns, full_ann, emb, label_name,
     for index, item in enumerate(items, 1):
         item["id"] = f"r{index}"
     quality["missed_speech"] = [{"t1": s, "t2": e} for s, e, _ in missed]
+    quality["missed_speech_diagnostics"] = missed_diagnostics
     for seg in segments:
         for wd in seg["words"]:
             wd.pop("sims", None)

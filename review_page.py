@@ -100,7 +100,7 @@ def main():
             u = self._path(post=True)
             if u is None:
                 return
-            if u not in ("api/answer", "api/voice", "api/apply", "api/preview"):
+            if u not in ("api/answer", "api/voice", "api/apply", "api/preview", "api/event"):
                 return self._send(404, {"error": "не найдено"})
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             types = {"audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/wav": "wav"}
@@ -155,6 +155,15 @@ def main():
                     ans.pop("audio", None)
                     with lock:
                         rep = P.add_answers(a.json_path, [ans], "local")
+                    return self._send(200, rep)
+                if u == "api/event":
+                    event = json.loads(body.decode("utf-8"))
+                    if not isinstance(event, dict):
+                        return self._send(400, {"error": "ожидается объект события"})
+                    with lock:
+                        rep = P.add_interaction_event(
+                            a.json_path, event.get("id"), event.get("version"),
+                            event.get("type"), event.get("session"))
                     return self._send(200, rep)
                 if u == "api/voice":
                     q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}

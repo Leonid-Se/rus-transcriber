@@ -672,6 +672,7 @@ class AnswerIntegrity(unittest.TestCase):
         pd = P.pack_dir(c.json)
         pd.mkdir(parents=True, exist_ok=True)
         items = [dict(r, word_ids=[words[0 if n < 2 else 1]["word_id"]],
+                      diagnostic_id=f"diag-{r['id']}",
                       options=[{"label": "изменить", "decision": {"text": "другое"}}])
                  for n, r in enumerate(before["review"])]
         P._write(pd / "manifest.json", {"version": "v1", "recording_id": before["recording_id"], "items": items})
@@ -684,7 +685,12 @@ class AnswerIntegrity(unittest.TestCase):
         self.assertEqual(result["preflight_conflicts"][0]["cards"], ["r1", "r2"])
         self.assertEqual(result["free_text"]["successful_ids"], ["r3"])
         self.assertEqual(T.load(c.json)["segments"][0]["text"], "альфа третье")
-        self.assertEqual(set(P._read(pd / "answers.json", {})["applied_answers"]), {"r3"})
+        store = P._read(pd / "answers.json", {})
+        self.assertEqual(set(store["applied_answers"]), {"r3"})
+        audit = {event["id"]: event for event in store["application_events"]}
+        self.assertEqual({aid: audit[aid]["outcome"] for aid in ("r1", "r2", "r3")},
+                         {"r1": "blocked_preflight", "r2": "blocked_preflight", "r3": "applied"})
+        self.assertEqual(audit["r1"]["diagnostic_id"], "diag-r1")
 
     def test_conflict_preflight_is_read_only(self):
         import review_pack as P

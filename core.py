@@ -538,6 +538,7 @@ def _apply_answers_files_locked(jp, md):
     import transcript
     decisions, rep = P.decisions(jp)
     free = P.free_answers(jp)
+    requested_ids = {d.get("id") for d in decisions if d.get("id")} | set(free)
     preflight = P.preflight_answers(jp, md, decisions, free)
     blocked = {aid for conflict in preflight for aid in conflict["cards"]}
     blocked_free = {aid: answer for aid, answer in free.items() if aid in blocked}
@@ -618,11 +619,28 @@ def _apply_answers_files_locked(jp, md):
     rep["applied_from_answers"] = sum(1 for d in decisions if d.get("id") in successful)
     snapshots = {aid: snapshot for aid, snapshot in snapshots.items() if aid in successful}
     successful.update(undone)
-    if successful:
-        if snapshots:
-            P.mark_applied(jp, successful, snapshots=snapshots)
+    apply_conflicts = {row.get("id") for row in report.get("conflicts") or [] if row.get("id")}
+    free_report = rep.get("free_text") or {}
+    free_conflicts = {aid for row in free_report.get("conflicts") or [] for aid in row.get("cards") or []}
+    free_not_found = set(free_report.get("not_found") or [])
+    outcomes = {}
+    for aid in requested_ids:
+        if aid in successful:
+            outcomes[aid] = "reverted" if aid in undone else "applied"
+        elif aid in blocked:
+            outcomes[aid] = "blocked_preflight"
+        elif aid in undo_failed:
+            outcomes[aid] = "undo_conflict"
+        elif aid in rep.get("human", []):
+            outcomes[aid] = "left_for_human"
+        elif aid in apply_conflicts or aid in free_conflicts:
+            outcomes[aid] = "apply_conflict"
+        elif aid in free_not_found or aid in (report.get("not_found") or []):
+            outcomes[aid] = "not_found"
         else:
-            P.mark_applied(jp, successful)
+            outcomes[aid] = "not_applied"
+    if successful or outcomes:
+        P.mark_applied(jp, successful, snapshots=snapshots, outcomes=outcomes)
     if undone:
         rep["voice_profile_warning"] = {
             "answer_ids": undone,

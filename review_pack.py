@@ -36,6 +36,7 @@ PAD_BEFORE = 3.5     # клип начинается за 3,5 с до места
 PAD_AFTER = 1.5
 SR = 16000
 HERE = Path(__file__).resolve().parent
+MAX_INTERACTION_EVENTS = 2000
 
 
 def pack_dir(json_path):
@@ -130,7 +131,7 @@ def build(json_path, items, base_url_note=None):
             question = (str(model) + ": " + str(problem.get("state")) +
                         ("; слова других проходов: " + ", ".join(names) if names else "") +
                         ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
-        out.append({
+        manifest_item = {
             "id": it["id"], "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
             **target,
             "clip": f"clips/{clip.name}", "clip_t1": round(t1 - s0, 2), "clip_t2": round(t2 - s0, 2),
@@ -139,7 +140,12 @@ def build(json_path, items, base_url_note=None):
             "reasons": it.get("reasons"), "voices": it.get("voices"),
             "question": question,
             "options": [{"label": str(o.get("label", "")), "decision": o.get("decision") or {}} for o in opts],
-            "recommended": None if it.get("asr_problem") else q.get("recommended"), "note": q.get("note")})
+            "recommended": None if it.get("asr_problem") else q.get("recommended"), "note": q.get("note")}
+        automation_diagnostic = _automation_diagnostic(data, it)
+        if automation_diagnostic:
+            manifest_item["diagnostic_id"] = automation_diagnostic["id"]
+            manifest_item["automation_diagnostic"] = automation_diagnostic
+        out.append(manifest_item)
     keep = {f"{r['id']}.mp3" for r in out}
     for f in (pd / "clips").glob("*.mp3"):
         if f.name not in keep:
@@ -152,7 +158,7 @@ def build(json_path, items, base_url_note=None):
     _write(pd / "manifest.json", man)
     ans = _read(pd / "answers.json", {})
     if ans.get("version") != version:          # прежние ответы — к прежним вопросам; храним для истории
-        if ans.get("answers"):
+        if ans.get("answers") or ans.get("interaction_events") or ans.get("application_events"):
             _write(pd / f"answers.{ans.get('version', 'old')}.json", ans)
         _write(pd / "answers.json", {"version": version, "answers": {}, "conflicts": [], "rejected": []})
     shutil.copyfile(HERE / "cards.html", pd / "cards.html")
@@ -215,8 +221,59 @@ def _context(T, data, it):
     return row
 
 
+def _automation_diagnostic(data, item):
+    """Снимок основания автоматики, связанный с конкретным местом разбора."""
+    diagnostic_id = item.get("diagnostic_id")
+    if not diagnostic_id:
+        return None
+    quality = data.get("quality") or {}
+    trace = quality.get("missed_speech_diagnostics") or {}
+    candidate = next((row for row in trace.get("candidates") or []
+                      if row.get("id") == diagnostic_id), None)
+    if not candidate:
+        return None
+    turn = next((row for row in trace.get("speech_intervals") or []
+                 if row.get("id") == candidate.get("turn_id")), None)
+    return {"id": diagnostic_id, "kind": "missed_speech_gap",
+            "algorithm": trace.get("algorithm"),
+            "threshold_seconds": trace.get("threshold_seconds"),
+            "candidate": dict(candidate),
+            "speech_interval": dict(turn) if turn else None}
+
+
 def manifest(json_path):
     return _read(pack_dir(json_path) / "manifest.json", None)
+
+
+def add_interaction_event(json_path, aid, version, event_type, session):
+    """Сохраняет локальный факт показа карточки или действия с её клипом."""
+    allowed = {"card_visible", "card_rendered", "audio_play", "audio_ended"}
+    if event_type not in allowed:
+        raise ValueError("неизвестное событие карточки")
+    if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", session):
+        raise ValueError("неверный идентификатор сессии страницы")
+    pd = pack_dir(json_path)
+    man = manifest(json_path)
+    if not man or version != man.get("version"):
+        raise ValueError("версия пакета изменилась")
+    item = next((it for it in man.get("items") or [] if it.get("id") == aid), None)
+    if not item:
+        raise ValueError("карточка не найдена")
+    store = _read(pd / "answers.json", {"version": man["version"], "answers": {}})
+    events = store.setdefault("interaction_events", [])
+    if event_type == "card_visible" and any(
+            row.get("id") == aid and row.get("version") == version and
+            row.get("type") == event_type and row.get("session") == session for row in events):
+        return {"stored": False, "duplicate": True}
+    event = {"id": aid, "version": version, "diagnostic_id": item.get("diagnostic_id"),
+             "type": event_type, "session": session, "source": "local", "ts": _now()}
+    events.append(event)
+    if len(events) > MAX_INTERACTION_EVENTS:
+        removed = len(events) - MAX_INTERACTION_EVENTS
+        del events[:removed]
+        store["interaction_events_dropped"] = store.get("interaction_events_dropped", 0) + removed
+    _write(pd / "answers.json", store)
+    return {"stored": True, "event": event}
 
 
 # ---------- сопоставление голосового/текстового ответа с вариантами ----------
@@ -302,6 +359,8 @@ def add_answers(json_path, answers, source):
             store.setdefault("rejected", []).append({**rej, "source": source, "ts": a.get("ts") or _now()})
             continue
         ans = {"id": aid, "version": a["version"], "source": source, "ts": a.get("ts") or _now()}
+        if it.get("diagnostic_id"):
+            ans["diagnostic_id"] = it["diagnostic_id"]
         if isinstance(a.get("text"), str):          # пометки сомнения ⟦…⟧ из скопированной стенограммы
             a["text"] = a["text"].replace("⟦", "").replace("⟧", "")
         for k in ("text", "audio", "heard", "by"):
@@ -640,11 +699,14 @@ def cloud_bundle(json_path, artifact_url=None):
             "applied": out["applied"], "answered": len(out["answers"]), "items": len(man["items"])}
 
 
-def mark_applied(json_path, ids=None, snapshots=None):
-    """Запоминает, какие ответы применены (подпись ответа на каждое место) и когда."""
+def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
+    """Запоминает успешное применение и итоги неуспешных попыток без копии текста ответа."""
     pd = pack_dir(json_path)
     store = _read(pd / "answers.json", {"answers": {}})
+    man = manifest(json_path) or {}
+    manifest_items = {it.get("id"): it for it in man.get("items") or []}
     m = _applied_map(store)
+    applied_ids = []
     for aid, a in store.get("answers", {}).items():
         if ids is None or aid in ids:
             if a.get("kind") == "revert":
@@ -654,8 +716,34 @@ def mark_applied(json_path, ids=None, snapshots=None):
                 m[aid] = _sig(a)
                 if snapshots and aid in snapshots:
                     store.setdefault("undo_snapshots", {})[aid] = snapshots[aid]
+            if a.get("kind") != "skip":
+                applied_ids.append(aid)
     store["applied_answers"] = m
-    store["applied_at"] = _now()
+    if applied_ids:
+        store["applied_at"] = _now()
+    events = store.setdefault("application_events", [])
+    for aid, outcome in (outcomes or {}).items():
+        if outcome in ("applied", "reverted"):
+            continue
+        answer = (store.get("answers") or {}).get(aid) or {}
+        item = manifest_items.get(aid) or {}
+        events.append({"id": aid, "version": answer.get("version") or man.get("version"),
+                       "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
+                       "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
+                       "action": "apply_attempt", "outcome": outcome, "at": _now()})
+    for aid in applied_ids:
+        answer = (store.get("answers") or {}).get(aid) or {}
+        item = manifest_items.get(aid) or {}
+        events.append({"id": aid, "version": answer.get("version") or man.get("version"),
+                       "diagnostic_id": answer.get("diagnostic_id") or item.get("diagnostic_id"),
+                       "answer_source": answer.get("source"), "answer_ts": answer.get("ts"),
+                       "action": "reverted" if answer.get("kind") == "revert" else "applied",
+                       "outcome": "reverted" if answer.get("kind") == "revert" else "applied",
+                       "at": _now()})
+    if len(events) > MAX_INTERACTION_EVENTS:
+        removed = len(events) - MAX_INTERACTION_EVENTS
+        del events[:removed]
+        store["application_events_dropped"] = store.get("application_events_dropped", 0) + removed
     _write(pd / "answers.json", store)
 
 

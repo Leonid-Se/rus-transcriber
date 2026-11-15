@@ -17,10 +17,19 @@ class ListeningTests(unittest.TestCase):
         self.jp, self.md, audio = root / "test.transcript.json", root / "test.transcript.md", root / "test.wav"
         audio.write_bytes(b"synthetic")
         self.data = {"file": str(audio), "duration": "00:00:02", "speakers": [],
-                     "segments": [], "quality": {},
+                     "segments": [], "quality": {"missed_speech_diagnostics": {
+                         "schema_version": 1, "algorithm": "diarization-turn-uncovered-gaps",
+                         "threshold_seconds": 1.0,
+                         "speech_intervals": [{"id": "turn-0001", "start": 0.0, "end": 1.2}],
+                         "candidates": [{"id": "missed-0001", "turn_id": "turn-0001",
+                                         "start": 0.0, "end": 1.0, "duration_seconds": 1.0,
+                                         "threshold_seconds": 1.0, "meets_threshold": True,
+                                         "left_boundary": "turn_start", "right_boundary": "word_start",
+                                         "decision": "warning"}]}},
                      "review": [{"id": "r1", "t": 0.0, "t1": 0.0, "t2": 1.0,
-                                 "gap": [0.0, 1.0], "speaker": None, "text": "", "reasons": ["asr"],
-                                 "asr_problem": {"model": "whisper", "state": "empty_unknown", "words_from": []}}]}
+                                  "gap": [0.0, 1.0], "speaker": None, "text": "", "reasons": ["asr"],
+                                  "diagnostic_id": "missed-0001",
+                                  "asr_problem": {"model": "whisper", "state": "empty_unknown", "words_from": []}}]}
         transcript.save_new(self.data, self.jp, self.md)
 
     def test_only_explicit_human_silence_confirmation(self):
@@ -66,7 +75,11 @@ class ListeningTests(unittest.TestCase):
             review_pack.build(self.jp, [{"id": "r1", "options": [{"label": "OK", "decision": {}}]}])
         man = review_pack.manifest(self.jp)
         self.assertEqual(man["items"][0]["options"][1]["decision"], {"listened": "silence"})
+        self.assertEqual(man["items"][0]["diagnostic_id"], "missed-0001")
+        self.assertEqual(man["items"][0]["automation_diagnostic"]["candidate"]["decision"], "warning")
         review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "option": 1}], "local")
+        stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
+        self.assertEqual(stored["answers"]["r1"]["diagnostic_id"], "missed-0001")
         transcript.save(transcript.load(self.jp), self.jp, self.md)
         decisions, report = review_pack.decisions(self.jp)
         self.assertEqual(decisions, [])
@@ -80,11 +93,17 @@ class ListeningTests(unittest.TestCase):
         with patch.object(transcript, "_refresh_conspects", return_value=None):
             core.apply_answers_files(self.jp, self.md)
             self.assertEqual(transcript.load(self.jp)["review"][0]["listening"]["result"], "silence")
+            stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
+            self.assertEqual(stored["application_events"][-1]["diagnostic_id"], "missed-0001")
+            self.assertEqual(stored["application_events"][-1]["action"], "applied")
             review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "kind": "revert"}], "local")
             core.apply_answers_files(self.jp, self.md)
         item = transcript.load(self.jp)["review"][0]
         self.assertEqual(item["status"], "open")
         self.assertNotIn("listening", item)
+        stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
+        self.assertEqual(stored["application_events"][-1]["action"], "reverted")
+        self.assertEqual(stored["application_events"][-1]["diagnostic_id"], "missed-0001")
 
 
 if __name__ == "__main__":

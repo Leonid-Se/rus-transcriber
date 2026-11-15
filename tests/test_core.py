@@ -176,6 +176,25 @@ class Doubts(unittest.TestCase):
         got = W.missed_speech(ws("слово", 0.0), turns)
         self.assertTrue(got and got[0][0] >= 0.4 and got[0][1] == 6.0)
 
+    def test_missed_speech_trace_records_threshold_decisions(self):
+        words = [{"s": 0.1, "e": 0.2}, {"s": 1.2, "e": 1.3},
+                 {"s": 2.299, "e": 2.4}]
+        warnings, trace = W.missed_speech_diagnostics(words, [{"s": 0.0, "e": 3.0}], min_gap=1.0)
+        self.assertEqual(warnings, [(0.2, 1.2, None)])
+        self.assertEqual(trace["warning_ids"], ["missed-0001"])
+        self.assertEqual(trace["candidates"][0]["duration_seconds"], 1.0)
+        self.assertEqual(trace["candidates"][0]["decision"], "warning")
+        self.assertEqual(trace["candidates"][1]["decision"], "below_threshold")
+        self.assertEqual(trace["short_gaps_omitted"], 1)
+
+    def test_disabled_missed_speech_records_intervals_without_claiming_silence(self):
+        warnings, trace = W.missed_speech_diagnostics(
+            [], [{"s": 2.0, "e": 4.0}], enabled=False)
+        self.assertEqual(warnings, [])
+        self.assertEqual(trace["disabled_reason"], "review_missed_disabled")
+        self.assertEqual(trace["speech_intervals"][0]["decision"], "disabled")
+        self.assertEqual(trace["candidates"], [])
+
 
 VOCAB = {"group": "example",
          "participants": [{"name": "Анна", "gender": "ж"}, {"name": "Борис", "gender": "м"}],

@@ -196,6 +196,67 @@ class FamilyRefTests(unittest.TestCase):
         ]
         self.assertEqual(bench.family_refs(results)["rnnt"]["id"], "torch-cpu")
 
+    def test_whisper_is_compared_to_main_pass(self):
+        # регрессия 15.11.2026: Whisper сверялся с другим Whisper, и зацикленный текст
+        # (повторы раздувают его длину) получал 100% и выигрывал у исправного варианта
+        results = [
+            {"id": "onnx-cpu", "family": "rnnt", "device": "CPU", "text": "раз два три"},
+            {"id": "whisper-cpu", "family": "whisper", "device": "CPU", "text": "раз два три три три"},
+            {"id": "whisper-ct2", "family": "whisper", "device": "CPU", "text": "раз два три"},
+        ]
+        refs = bench.family_refs(results)
+        self.assertEqual(refs["whisper"]["id"], "onnx-cpu")
+        self.assertEqual(refs["ctc"], None)
+
+    def test_whisper_uses_torch_reference_when_available(self):
+        results = [
+            {"id": "torch-cpu", "family": "torch", "device": "CPU", "text": "эталон"},
+            {"id": "onnx-cpu", "family": "rnnt", "device": "CPU", "text": "почти эталон"},
+            {"id": "whisper-ct2", "family": "whisper", "device": "CPU", "text": "виспер"},
+        ]
+        self.assertEqual(bench.family_refs(results)["whisper"]["id"], "torch-cpu")
+
+    def test_whisper_only_run_keeps_old_reference(self):
+        # без основного прохода независимого эталона нет: сравнивать не с чем, кроме Whisper
+        results = [
+            {"id": "whisper-cpu", "family": "whisper", "device": "CPU", "text": "раз два"},
+            {"id": "whisper-gpu", "family": "whisper", "device": "GPU", "text": "раз два"},
+        ]
+        self.assertEqual(bench.family_refs(results)["whisper"]["id"], "whisper-cpu")
+
+
+class WhisperChoiceTests(unittest.TestCase):
+    def test_looping_text_loses_despite_speed(self):
+        # повторы делают текст длиннее: совпадение с основным проходом падает,
+        # поэтому быстрый, но зацикленный вариант не должен выбираться
+        results = [
+            {"id": "whisper-cpu", "family": "whisper", "device": "CPU", "rtfx": 2.6,
+             "similarity": 0.45, "text": "раз два три три три три"},
+            {"id": "whisper-ct2", "family": "whisper", "device": "CPU", "rtfx": 4.5,
+             "similarity": 0.83, "text": "раз два три"},
+        ]
+        self.assertEqual(bench.most_accurate(results, "whisper")["id"], "whisper-ct2")
+
+    def test_similarity_beats_speed_on_equal_accuracy(self):
+        results = [
+            {"id": "slow", "family": "whisper", "device": "CPU", "rtfx": 2.0,
+             "similarity": 0.80, "text": "раз два"},
+            {"id": "fast", "family": "whisper", "device": "CPU", "rtfx": 5.0,
+             "similarity": 0.80, "text": "раз два"},
+        ]
+        self.assertEqual(bench.most_accurate(results, "whisper")["id"], "fast")
+
+    def test_failed_variant_is_skipped(self):
+        results = [
+            {"id": "broken", "family": "whisper", "device": "CPU", "error": ["нет пакета"]},
+            {"id": "ok", "family": "whisper", "device": "CPU", "rtfx": 3.0,
+             "similarity": 0.70, "text": "раз два"},
+        ]
+        self.assertEqual(bench.most_accurate(results, "whisper")["id"], "ok")
+
+    def test_without_candidates_none(self):
+        self.assertIsNone(bench.most_accurate([], "whisper"))
+
 
 class HumanChoiceTests(unittest.TestCase):
     def test_word_stats(self):

@@ -80,7 +80,7 @@ def wait_slot(st, cfg, status_path):
            queued_sec=round(time.time() - t, 1) if time.time() - t > 3 else None)
 
 
-def resolve_vocab_details(src, a, cfg, transcript_path=None):
+def resolve_vocab_details(src, a, cfg, transcript_path=None, group_override=None):
     """Разрешает словарь только по ограниченным путям и возвращает отчёт без содержимого словарей."""
     import vocab as vocab_mod
 
@@ -106,6 +106,19 @@ def resolve_vocab_details(src, a, cfg, transcript_path=None):
             "Явная группа противоречит группе исходной расшифровки",
             {"binding": binding, "candidates": []})
 
+    if group_override:
+        if not transcript_path or transcript_data is None:
+            raise vocab_mod.ResolutionError(
+                "Ручной выбор группы возможен только для конкретной расшифровки",
+                {"candidates": []})
+        if paths.safe_group(group_override) != group_override:
+            raise vocab_mod.ResolutionError("Недопустимое имя выбранной группы", {"candidates": []})
+        if explicit_group and paths.safe_group(explicit_group) != group_override:
+            raise vocab_mod.ResolutionError("Параметры группы противоречат друг другу", {"candidates": []})
+        vp, data, group, report, _ = vocab_mod.resolve_group_vocab(
+            src, transcript_path, transcript_data, group_override, paths.vocab_path(group_override))
+        return {"path": vp, "vocab": data, "group": group, "report": report}
+
     if explicit_vocab:
         candidates = [(Path(explicit_vocab).expanduser(), "explicit_vocab")]
         vp, data, group, report = vocab_mod.resolve_candidates(
@@ -124,19 +137,8 @@ def resolve_vocab_details(src, a, cfg, transcript_path=None):
         report["binding"] = binding
         return {"path": vp, "vocab": data, "group": explicit_group, "report": report}
 
-    candidates = []
-    if binding and binding.get("vocab_path"):
-        candidates.append((binding["vocab_path"], "quality.vocab"))
-    if src:
-        directory = Path(src).expanduser().resolve().parent
-        candidates.extend((parent / vocab_mod.FILE_NAME, "audio_sidecar")
-                          for parent in [directory, *list(directory.parents)[:2]])
-        candidates.append((directory / (Path(src).stem + ".rus-transcriber") /
-                           vocab_mod.FILE_NAME, "known_output_sidecar"))
-    if transcript_path:
-        # Точная папка известной расшифровки; не обходим произвольные вложенные каталоги.
-        candidates.append((Path(transcript_path).resolve().parent / vocab_mod.FILE_NAME,
-                           "transcript_sidecar"))
+    candidates = vocab_mod.related_candidates(
+        src, transcript_path, (binding or {}).get("vocab_path"))
 
     # Уникальная/настроенная группа — fallback только для новой расшифровки.
     # При обучении старой записи текущий default_group не доказывает её принадлежность.
@@ -871,44 +873,92 @@ def prepare_group_voice_profile(group, src, embedder, names, quality):
     return ppath, prof, learned
 
 
+def _check_confirmed_voice_inputs(a, src, group, profile_path, resolution, core):
+    source_hash = getattr(a, "voice_source_hash", "")
+    profile_hash = getattr(a, "voice_profile_hash", "")
+    audio_hash = getattr(a, "voice_audio_hash", "")
+    expected_group = getattr(a, "voice_group", "")
+    authorized = bool(source_hash and profile_hash and audio_hash and expected_group)
+    if not authorized:
+        return False
+    if (group != expected_group or core._voice_hash(a.learn_only) != source_hash or
+            core._voice_hash(profile_path) != profile_hash or core._voice_hash(src) != audio_hash):
+        raise RuntimeError("стенограмма, аудио или профиль изменились после подтверждения; нужен новый просмотр")
+
+    expected_path = getattr(a, "voice_vocab_path", None)
+    expected_hash = getattr(a, "voice_vocab_hash", None)
+    if expected_path is not None:
+        expected_path = str(Path(expected_path).resolve()) if expected_path else None
+        actual_path = str(Path(resolution["path"]).resolve()) if resolution["path"] else None
+        if expected_path != actual_path:
+            raise RuntimeError("выбранный словарь изменился после подтверждения; нужен новый просмотр")
+    if expected_hash:
+        actual_hash = core._voice_hash(resolution["path"]) if resolution["path"] else "absent"
+        if actual_hash != expected_hash:
+            raise RuntimeError("словарь изменился после подтверждения; нужен новый просмотр")
+    return True
+
+
 def learn_only(a, st, cfg, src):
-    """Обучение по одной расшифровке; существующий вклад пока защищён от замены."""
+    """Подтверждаемое обновление только указанной расшифровки."""
     try:
-        if json.loads(Path(a.learn_only).read_text(encoding="utf-8")).get("no_profile"):
+        transcript_path = Path(a.learn_only)
+        transcript_data = json.loads(transcript_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(transcript_data, dict):
+            raise RuntimeError("исходная расшифровка должна быть JSON-объектом")
+        override = getattr(a, "voice_group_override", "") or ""
+        if transcript_data.get("no_profile"):
+            if override:
+                raise RuntimeError("для этой расшифровки профили групп отключены; выбор группы это не меняет")
             st.set(state="done", stage="готово", progress=100, kind="learn", learned=0,
-                   note="расшифровка сделана с общим словарём без group — профили групп не пополняются; "
-                        "чтобы пополнять профиль, укажите group и расшифруйте запись заново")
+                   note="расшифровка сделана без профилей групп — группа не может включить обучение")
             return
-    except (OSError, ValueError):
-        pass
-    try:
+
         import voices
-        import vocab as vocab_mod
-        from pyannote.audio import Pipeline
-        token = os.environ.get("HF_TOKEN", "").strip()
-        st.set(stage="профили: загрузка модели голосов", progress=10)
-        name = "pyannote/speaker-diarization-community-1"
-        try:
-            pipe = Pipeline.from_pretrained(name, token=token)
-        except TypeError:
-            pipe = Pipeline.from_pretrained(name, use_auth_token=token)
-        emb = voices.Embedder(pipe)
-        resolution = resolve_vocab_details(src, a, cfg, transcript_path=a.learn_only)
-        vocab, vgroup = resolution["vocab"], resolution["group"]
-        allowed = [p["name"] for p in vocab.get("participants", []) if p.get("name")]
-        # профиль — той группы, с которой сделана расшифровка, а не текущего словаря по умолчанию
-        tg = voices.group_of(json.loads(Path(a.learn_only).read_text(encoding="utf-8")))
-        group = tg or vgroup
+        resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                           group_override=override or None)
+        binding = voices.group_binding(transcript_data)
+        group = override or binding["group"] or resolution["group"]
         if not group:
             raise RuntimeError("Группа исходной расшифровки неизвестна; требуется явный выбор")
-        ppath = voices.profile_path(group)
+        if paths.safe_group(group) != group:
+            raise RuntimeError("Недопустимое имя группы")
+        profile_path = voices.profile_path(group)
+        authorized = bool(getattr(a, "voice_source_hash", "") and
+                          getattr(a, "voice_profile_hash", "") and
+                          getattr(a, "voice_audio_hash", "") and getattr(a, "voice_group", ""))
+        if override and not authorized:
+            raise RuntimeError("ручной выбор группы разрешён только по подтверждённому hash-bound preview")
+        if override and (getattr(a, "voice_group", "") != group or
+                         not getattr(a, "voice_vocab_hash", "") or
+                         not getattr(a, "voice_vocab_path", "")):
+            raise RuntimeError("снимок ручного выбора группы неполон")
+
+        import core
         with settings.group_voice_lock(group):
-            authorized = bool(a.voice_source_hash and a.voice_profile_hash and a.voice_audio_hash and a.voice_group)
-            if authorized:
-                import core
-                if group != a.voice_group or core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
-                    raise RuntimeError("стенограмма или профиль изменились после подтверждения; нужен новый просмотр")
-            prof = voices.load_profile(ppath)
+            # Повторно обнаруживаем sidecar/reference уже под блокировкой до загрузки модели.
+            resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                               group_override=override or None)
+            binding = voices.group_binding(transcript_data)
+            if (override or binding["group"] or resolution["group"]) != group:
+                raise RuntimeError("группа изменилась после подтверждения; нужен новый просмотр")
+            _check_confirmed_voice_inputs(a, src, group, profile_path, resolution, core)
+            if override and resolution["report"].get("selection_reason") != "selected_group_vocab":
+                raise RuntimeError("не подтверждён словарь выбранной группы")
+
+            vocab_data = resolution["vocab"]
+            allowed = [p["name"] for p in vocab_data.get("participants", []) if p.get("name")]
+            st.set(stage="профили: загрузка модели голосов", progress=10)
+            from pyannote.audio import Pipeline
+            token = os.environ.get("HF_TOKEN", "").strip()
+            name = "pyannote/speaker-diarization-community-1"
+            try:
+                pipe = Pipeline.from_pretrained(name, token=token)
+            except TypeError:
+                pipe = Pipeline.from_pretrained(name, use_auth_token=token)
+            emb = voices.Embedder(pipe)
+
+            prof = voices.load_profile(profile_path)
             st.set(stage="профили: пересчёт по ответам человека", progress=40)
             selection_report = {}
             quality_report = {}
@@ -917,21 +967,30 @@ def learn_only(a, st, cfg, src):
             except (ValueError, OSError):
                 quality_policy = "warn"
             before_provenance = prof.get("provenance_revision", 0)
-            learned = voices.learn(prof, Path(a.learn_only).parent, emb, load_audio, names=allowed or None,
-                                   only=[a.learn_only], group=group, selection_report=selection_report,
+            learned = voices.learn(prof, transcript_path.parent, emb, load_audio, names=allowed or None,
+                                   only=[transcript_path], group=group, selection_report=selection_report,
                                    allow_replace=authorized, quality_policy=quality_policy,
                                    quality_report=quality_report)
             provenance_updated = prof.get("provenance_revision", 0) != before_provenance
+
+            # Входы и разрешение словаря могут устареть даже во время вычисления.
+            after_resolution = resolve_vocab_details(src, a, cfg, transcript_path=transcript_path,
+                                                     group_override=override or None)
+            _check_confirmed_voice_inputs(a, src, group, profile_path, after_resolution, core)
+            after_path = str(after_resolution["path"]) if after_resolution["path"] else None
+            before_path = str(resolution["path"]) if resolution["path"] else None
+            if after_resolution["group"] != group or after_path != before_path:
+                raise RuntimeError("привязка или словарь изменились во время пересчёта; запись отменена")
+
             backup = None
             if learned or provenance_updated:
                 if authorized:
-                    if core._voice_hash(a.learn_only) != a.voice_source_hash or core._voice_hash(ppath) != a.voice_profile_hash or core._voice_hash(src) != a.voice_audio_hash:
-                        raise RuntimeError("стенограмма или профиль изменились во время пересчёта; запись отменена")
-                    backup = core.backup_voice_profile(ppath)
-                voices.save_profile(ppath, prof)
+                    backup = core.backup_voice_profile(profile_path)
+                voices.save_profile(profile_path, prof)
         last = prof.get("history", [])[-1] if learned else None
-        st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned, profile=ppath.name,
-               revision=prof.get("revision"), last=last, selection_report=selection_report,
+        st.set(state="done", stage="готово", progress=100, kind="learn", learned=learned,
+               profile=profile_path.name, revision=prof.get("revision"), last=last,
+               selection_report=selection_report,
                selection_explanation=voices.explain_selection_report(selection_report), backup=backup,
                provenance_updated=provenance_updated, audio_quality=quality_report,
                vocab_resolution=resolution["report"],
@@ -959,6 +1018,9 @@ def main():
     ap.add_argument("--voice-source-hash", default=""); ap.add_argument("--voice-profile-hash", default="")
     ap.add_argument("--voice-audio-hash", default="")
     ap.add_argument("--voice-group", default="")
+    ap.add_argument("--voice-group-override", default="")
+    ap.add_argument("--voice-vocab-path", default="")
+    ap.add_argument("--voice-vocab-hash", default="")
     ap.add_argument("--whisper", default="", choices=["", "all", "doubt", "off"],
                     help="третья модель Whisper: all — вся запись, doubt — только куски, где GigaAM RNN-T и CTC "
                          "расходятся, off — без неё")

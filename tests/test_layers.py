@@ -164,6 +164,26 @@ class CliTests(unittest.TestCase):
             self.assertEqual(run_rt(["conspect-confirm", "demo"])[0], 2)
             write.assert_not_called()
 
+    def test_voice_override_cli_requires_confirmation_and_preserves_choice(self):
+        preview = {"group": "demo-group", "group_selection": {"method": "manual_override"}}
+        snapshot = {"job_id": "demo", "json": "demo.json", "group": "demo-group",
+                    "group_override": "demo-group", "manual_group_override": True,
+                    "vocab_path": "groups/demo-group/vocab.json", "vocab_hash": "abc",
+                    "source_hash": "src", "profile_hash": "prof", "audio_hash": "audio",
+                    "report": {"candidates": {}, "existing_contributions": [],
+                               "group_selection": {"method": "manual_override"}}}
+        with mock.patch.object(core, "preview_voice_learning", return_value=preview) as show, \
+             mock.patch.object(core, "prepare_voice_action", return_value=snapshot) as prepare, \
+             mock.patch.object(core, "start_voice_update") as update:
+            rc, out, _ = run_rt(["voice-preview", "demo", "--group", "demo-group"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out), preview)
+            show.assert_called_once_with("demo", "demo-group")
+            rc, _, _ = run_rt(["voice-update", "demo", "--group", "demo-group"])
+            self.assertEqual(rc, 2)
+            prepare.assert_called_once_with("demo", "demo-group")
+            update.assert_not_called()
+
 
 class ServerGateTests(unittest.TestCase):
     @classmethod
@@ -214,6 +234,23 @@ class ServerGateTests(unittest.TestCase):
             revoke.assert_not_called()
             self.assertTrue(any("Анна" in line for line in ask.call_args.args[2]))
             self.assertTrue(any("наложение: 2" in line for line in ask.call_args.args[2]))
+
+    def test_server_voice_override_is_in_snapshot_and_confirmation(self):
+        snapshot = {"job_id": "demo", "json": "demo.json", "group": "demo-group",
+                    "group_override": "demo-group", "manual_group_override": True,
+                    "vocab_path": "groups/demo-group/vocab.json", "vocab_hash": "abcdef0123456789",
+                    "source_hash": "src", "profile_hash": "prof", "audio_hash": "audio",
+                    "report": {"existing_contributions": [], "candidates": {},
+                               "group_selection": {"method": "manual_override"},
+                               "selection_explanation": []}}
+        with mock.patch.object(core, "prepare_voice_action", return_value=snapshot) as prepare, \
+             mock.patch.object(core, "start_voice_update") as update, \
+             mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("нет")) as ask:
+            self.assertEqual(self.call(self.server.update_voice_profiles, "demo", "demo-group"), "нет")
+            prepare.assert_called_once_with("demo", "demo-group")
+            update.assert_not_called()
+            self.assertTrue(any("выбрана вручную" in line for line in ask.call_args.args[2]))
+            self.assertTrue(any("Словарь группы" in line for line in ask.call_args.args[2]))
 
     def test_resolve_voice_reports_remaining_contribution_and_scope(self):
         gd = put_group("lay-gate")

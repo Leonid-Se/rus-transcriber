@@ -222,6 +222,56 @@ def transcript_binding(data):
     return result
 
 
+def related_candidates(audio_path=None, transcript_path=None, quality_path=None):
+    """Точечные известные словари без обхода произвольных вложенных каталогов."""
+    candidates = []
+    if quality_path:
+        candidates.append((Path(quality_path), "quality.vocab"))
+    if audio_path:
+        audio = Path(audio_path).expanduser()
+        directory = audio.resolve().parent
+        candidates.extend((parent / FILE_NAME, "audio_sidecar")
+                          for parent in [directory, *list(directory.parents)[:2]])
+        candidates.append((directory / (audio.stem + ".rus-transcriber") / FILE_NAME,
+                           "known_output_sidecar"))
+    if transcript_path:
+        candidates.append((Path(transcript_path).expanduser().resolve().parent / FILE_NAME,
+                           "transcript_sidecar"))
+    return candidates
+
+
+def resolve_group_vocab(audio_path, transcript_path, transcript_data, group, group_vocab_path):
+    """Строго разрешает канонический vocab выбранной группы с проверкой всех известных ссылок."""
+    binding = transcript_binding(transcript_data)
+    if binding["conflict"]:
+        raise ResolutionError("Группа расшифровки противоречит quality.vocab",
+                              {"binding": binding, "candidates": []})
+    if binding["vocab_status"] == "invalid":
+        raise ResolutionError("Ссылка quality.vocab повреждена или невалидна",
+                              {"binding": binding, "candidates": []})
+    if binding["group"] and _group_key(binding["group"]) != _group_key(group):
+        raise ResolutionError("Выбранная группа противоречит привязке расшифровки",
+                              {"binding": binding, "candidates": []})
+
+    candidates = related_candidates(audio_path, transcript_path, binding["vocab_path"])
+    candidates.append((group_vocab_path, "selected_group_vocab"))
+    path, data, resolved_group, report = resolve_candidates(candidates, expected_group=group)
+    report["binding"] = binding
+    canonical_key = _path_key(group_vocab_path)
+    if path is None:
+        report["selection_reason"] = "selected_group_vocab_missing"
+        raise ResolutionError("Словарь выбранной группы отсутствует или не найден", report)
+    if _path_key(path) != canonical_key:
+        report["selection_reason"] = "selected_group_vocab_not_canonical"
+        raise ResolutionError("Для ручного выбора требуется канонический словарь группы", report)
+    if not data.get("group") or _group_key(data["group"]) != _group_key(group):
+        report["selection_reason"] = "selected_group_vocab_mismatch"
+        raise ResolutionError("Канонический словарь не подтверждает выбранную группу", report)
+    report["group"] = resolved_group
+    report["selection_reason"] = "selected_group_vocab"
+    return path, data, resolved_group, report, binding
+
+
 def find(audio_path=None, explicit=None, default_file=None):
     """Возвращает (путь, данные) или (None, {}); неоднозначность не разрешается порядком обхода."""
     if explicit:

@@ -53,8 +53,9 @@ rus-transcriber: расшифровка русской речи (в том чи�
    прямые решения — apply_review. Приоритет: слово человека > голосовой профиль > распознавание > эвристики.
    Не выбирайте за человека, кто говорит в спорном месте. Остатки после разбора (слово вне места, неверное
    число) — edit_span(job_id, t1, t2, text, speaker) по словам человека; повторно решить место — reopen_review.
-5. Голоса: rename_speakers подтверждает имена в расшифровке; update_voice_profiles — отдельный пересчёт
-   после подтверждения человеком; resolve_voice — только по решению человека о тёзке из карантина.
+5. Голоса: rename_speakers подтверждает имена в расшифровке; preview_voice_profiles и
+   update_voice_profiles пересчитывают план. Параметр group_override допустим только при неизвестной
+   привязке и будет показан человеку до штатного подтверждения; resolve_voice — решение о тёзке.
    Автопополнение зависит от настройки группы и отключается при достаточности; новые голоса по-прежнему обнаруживаются.
    voice_refresh_plan показывает изменённые источники без записи; voice_quality и set_voice_quality_policy —
    диагностика и политика warn/reject_clipping; backup_voice_profiles делает открытый резерв биометрии.
@@ -69,7 +70,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.14.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.15.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -613,16 +614,17 @@ def review_pack_cloud(job_id: str, artifact_url: str = "") -> str:
 
 
 @mcp.tool()
-def preview_voice_profiles(job_id: str) -> str:
-    """Показать имеющиеся вклады и кандидатов по разметке, без модели и записи профиля."""
+def preview_voice_profiles(job_id: str, group_override: str = "") -> str:
+    """Показать кандидатов по разметке. group_override — только если группа расшифровки неизвестна."""
     try:
-        return json.dumps(core.preview_voice_learning(job_id), ensure_ascii=False, indent=1)
+        return json.dumps(core.preview_voice_learning(job_id, group_override or None),
+                          ensure_ascii=False, indent=1)
     except core.CoreError as ex:
         return f"Ошибка: {ex}"
 
 
 @mcp.tool()
-async def update_voice_profiles(job_id: str) -> str:
+async def update_voice_profiles(job_id: str, group_override: str = "") -> str:
     """Пересчитывает голосовые профили по этой расшифровке после ответов человека (ответ человека главнее
     отпечатка): отрезки, подписанные человеком, идут в профиль с весом ×3 (кроме наложений и отрезков
     короче 0,8 с), из подтверждённых расшифровок — только слова без пометок сомнения. Замена существующих
@@ -630,9 +632,10 @@ async def update_voice_profiles(job_id: str) -> str:
     спутанные пары: на них сервер чаще ставит метку сомнения и склоняется к подтверждённому. Если профиль
     участника сильно изменился (сходство со старым < 0,8) — предупреждение. Защита от тёзок: профиль —
     той группы, с которой сделана расшифровка; вклад, непохожий на собранный голос имени, идёт в карантин
-    (в ответе quarantine) до решения человека — resolve_voice. Возвращает job_id."""
+    (в ответе quarantine) до решения человека — resolve_voice. group_override допустим только при неизвестной
+    группе; явный выбор и словарь будут показаны до штатного подтверждения. Возвращает job_id."""
     try:
-        snapshot = await asyncio.to_thread(core.prepare_voice_action, job_id)
+        snapshot = await asyncio.to_thread(core.prepare_voice_action, job_id, group_override or None)
     except core.CoreError as ex:
         return f"Ошибка: {ex}"
     return await _gated("Обновление голосового профиля", snapshot,

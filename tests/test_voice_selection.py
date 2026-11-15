@@ -18,6 +18,113 @@ def recording(word=None, **segment_fields):
 
 
 class VoiceOverlapSelection(unittest.TestCase):
+    def test_unknown_group_manual_preview_uses_vocab_read_only(self):
+        import core
+        import paths
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            audio = root / "demo.wav"
+            audio.write_bytes(b"synthetic audio")
+            stale_vocab = root / "removed-vocab.json"
+            source = root / "demo.transcript.json"
+            data = {"file": str(audio), "names_confirmed": True,
+                    "quality": {"vocab": str(stale_vocab)},
+                    "segments": [
+                        {"speaker": "Анна", "words": [{"s": 0.0, "e": 3.0, "w": "привет"}]},
+                        {"speaker": "Чужое имя", "words": [{"s": 4.0, "e": 7.0, "w": "слово"}]}]}
+            source.write_text(json.dumps(data), encoding="utf-8")
+            source_before = source.read_bytes()
+            group_vocab = group / "vocab.json"
+            vocab_data = {"group": "demo-group", "participants": [{"name": "Анна", "gender": "ж"}]}
+            group_vocab.write_text(json.dumps(vocab_data), encoding="utf-8")
+            vocab_before = group_vocab.read_bytes()
+            with patch.object(core, "job_json", return_value=(str(source), None)), \
+                 patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs):
+                result = core.preview_voice_learning("demo", group_override="demo-group")
+            self.assertEqual(result["group"], "demo-group")
+            self.assertEqual(result["group_selection"]["method"], "manual_override")
+            self.assertEqual(result["candidates"], {"Анна": {"windows": 1, "seconds": 3.0, "human_windows": 0}})
+            self.assertEqual(result["names_outside_vocab"], ["Чужое имя"])
+            self.assertEqual(result["vocab"]["path"], str(group_vocab.resolve()))
+            stale = next(item for item in result["vocab_resolution"]["candidates"]
+                         if item["source"] == "quality.vocab")
+            self.assertEqual(stale["status"], "missing")
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertEqual(group_vocab.read_bytes(), vocab_before)
+            self.assertFalse((group / "voices.json").exists())
+
+    def test_manual_group_preview_requires_matching_vocab_and_no_conflicting_binding(self):
+        import core
+        import paths
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups = root / "groups"
+            (groups / "alpha").mkdir(parents=True)
+            (groups / "beta").mkdir()
+            audio = root / "demo.wav"
+            audio.touch()
+            source = root / "demo.transcript.json"
+            data = {"file": str(audio), "segments": []}
+            source.write_text(json.dumps(data), encoding="utf-8")
+            with patch.object(core, "job_json", return_value=(str(source), None)), \
+                 patch.object(paths, "GROUPS", groups):
+                with self.assertRaises(core.CoreError):
+                    core.preview_voice_learning("demo", group_override="alpha")
+                (groups / "alpha" / "vocab.json").write_text(
+                    json.dumps({"group": "alpha", "participants": []}), encoding="utf-8")
+                source.write_text(json.dumps({**data, "group": "beta"}), encoding="utf-8")
+                with self.assertRaises(core.CoreError):
+                    core.preview_voice_learning("demo", group_override="alpha")
+                source.write_text(json.dumps(data), encoding="utf-8")
+                foreign = root / "foreign.json"
+                foreign.write_text(json.dumps({"group": "beta"}), encoding="utf-8")
+                source.write_text(json.dumps({**data, "quality": {"vocab": str(foreign)}}), encoding="utf-8")
+                with self.assertRaises(core.CoreError):
+                    core.preview_voice_learning("demo", group_override="alpha")
+                source.write_text(json.dumps(data), encoding="utf-8")
+                sidecar = root / "rus-transcriber.vocab.json"
+                sidecar.write_text(json.dumps({"group": "beta"}), encoding="utf-8")
+                with self.assertRaises(core.CoreError):
+                    core.preview_voice_learning("demo", group_override="alpha")
+
+    def test_manual_group_snapshot_binds_vocab_hash_and_changed_vocab_blocks_launch(self):
+        import core
+        import paths
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            audio = root / "demo.wav"
+            audio.write_bytes(b"synthetic audio")
+            source = root / "demo.transcript.json"
+            data = {"file": str(audio), "segments": []}
+            source.write_text(json.dumps(data), encoding="utf-8")
+            group_vocab = group / "vocab.json"
+            group_vocab.write_text(json.dumps({"group": "demo-group", "participants": []}), encoding="utf-8")
+            with patch.object(core, "job_json", return_value=(str(source), None)), \
+                 patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), \
+                 patch.object(core, "launch") as launch:
+                snapshot = core.prepare_voice_action("demo", group_override="demo-group")
+                self.assertTrue(snapshot["manual_group_override"])
+                self.assertEqual(snapshot["vocab_hash"], core._voice_hash(group_vocab))
+                self.assertIn("выбрана вручную", "\n".join(core.voice_action_lines(snapshot)))
+                core.start_voice_update(snapshot)
+                args = launch.call_args.args[1]
+                self.assertIn("--voice-group-override", args)
+                self.assertIn("demo-group", args)
+                self.assertIn("--voice-vocab-hash", args)
+                self.assertIn(snapshot["vocab_hash"], args)
+                launch.reset_mock()
+                group_vocab.write_text(json.dumps({"group": "demo-group", "participants": [{"name": "changed"}]}),
+                                       encoding="utf-8")
+                with self.assertRaises(core.CoreError):
+                    core.start_voice_update(snapshot)
+            launch.assert_not_called()
+
     def test_overlap_formats_are_excluded_for_human_and_automatic_words(self):
         for human in (False, True):
             for marker in ({"overlap": True}, {"flags": ["overlap"]}):
@@ -342,6 +449,31 @@ class VoiceOverlapSelection(unittest.TestCase):
                 with self.assertRaises(core.CoreError):
                     core.start_voice_update(snapshot)
                 launch.assert_not_called()
+
+    def test_changed_profile_blocks_confirmed_update(self):
+        import core
+        import paths
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            audio = root / "demo.wav"
+            audio.write_bytes(b"synthetic audio")
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps({"file": str(audio), "group": "demo-group",
+                                          "names_confirmed": True, "segments": []}), encoding="utf-8")
+            target = group / "voices.json"
+            profile = {"version": voices.PROFILE_VERSION, "speakers": {}, "sources": {}}
+            target.write_text(json.dumps(profile), encoding="utf-8")
+            with patch.object(core, "job_json", return_value=(str(source), None)), \
+                 patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), \
+                 patch.object(core, "launch") as launch:
+                snapshot = core.prepare_voice_action("demo")
+                target.write_text(json.dumps({**profile, "revision": 2}), encoding="utf-8")
+                with self.assertRaises(core.CoreError):
+                    core.start_voice_update(snapshot)
+            launch.assert_not_called()
 
     def test_changed_profile_blocks_revocation_and_preserves_newer_profile(self):
         import core

@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import core
@@ -26,6 +26,16 @@ class VoiceWorkerUpdate(unittest.TestCase):
     @staticmethod
     def _vocab_args(**values):
         return types.SimpleNamespace(vocab=values.get("vocab", ""), group=values.get("group", ""))
+
+    @staticmethod
+    def _manual_update_args(source, audio, group_vocab, group="demo-group", profile_path=None):
+        return types.SimpleNamespace(
+            learn_only=str(source), vocab="", group="",
+            voice_source_hash=core._voice_hash(source),
+            voice_profile_hash=core._voice_hash(profile_path) if profile_path else "absent",
+            voice_audio_hash=core._voice_hash(audio),
+            voice_group=group, voice_group_override=group,
+            voice_vocab_path=str(group_vocab), voice_vocab_hash=core._voice_hash(group_vocab))
 
     def test_vocab_resolution_checks_audio_directory_and_two_parents(self):
         for level in range(3):
@@ -154,6 +164,122 @@ class VoiceWorkerUpdate(unittest.TestCase):
             with self.assertRaises(vocab.ResolutionError) as error:
                 worker.resolve_vocab_details(audio, self._vocab_args(), {}, transcript_path=source)
             self.assertIn("противоречит", str(error.exception))
+
+    def test_manual_group_worker_uses_only_confirmed_source_and_keeps_transcript_unchanged(self):
+        class FakeEmbedder:
+            def __init__(self, pipe):
+                pass
+
+            def spans(self, audio_data, spans, cap):
+                return [np.array([1.0, 0.0])] * len(spans)
+
+        for confirmed in (True, False):
+            with self.subTest(confirmed=confirmed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                groups, jobs = root / "groups", root / "jobs"
+                group = groups / "demo-group"
+                group.mkdir(parents=True)
+                group_vocab = group / "vocab.json"
+                group_vocab.write_text(json.dumps(
+                    {"group": "demo-group", "participants": [{"name": "Анна", "gender": "ж"}]}),
+                    encoding="utf-8")
+                audio = root / "demo.wav"
+                audio.write_bytes(b"synthetic audio")
+                profile_path = group / "voices.json"
+                voices.save_profile(profile_path, voices.empty_profile())
+                profile_before = profile_path.read_bytes()
+                source = root / "demo.transcript.json"
+                data = {"file": str(audio), "names_confirmed": confirmed,
+                        "quality": {"vocab": str(root / "removed-vocab.json")},
+                        "segments": [{"speaker": "Анна", "words": [{"s": 0.0, "e": 3.0, "w": "привет"}]}]}
+                source.write_text(json.dumps(data), encoding="utf-8")
+                source_before = source.read_bytes()
+                args = self._manual_update_args(source, audio, group_vocab, profile_path=profile_path)
+                fake_audio = types.ModuleType("pyannote.audio")
+                fake_audio.Pipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
+                status = Status()
+                with patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), \
+                     patch.dict("sys.modules", {"pyannote.audio": fake_audio}), \
+                     patch.object(worker, "load_audio", return_value=np.zeros(48000)), \
+                     patch.object(voices, "Embedder", FakeEmbedder):
+                    worker.learn_only(args, status, {}, audio)
+                self.assertEqual(status.data["state"], "done")
+                self.assertEqual(source.read_bytes(), source_before)
+                target = profile_path
+                if confirmed:
+                    self.assertEqual(status.data["learned"], [source.name])
+                    self.assertTrue(target.is_file())
+                    self.assertEqual(Path(status.data["backup"]).read_bytes(), profile_before)
+                else:
+                    self.assertEqual(status.data["learned"], [])
+                    self.assertEqual(target.read_bytes(), profile_before)
+                    self.assertIsNone(status.data["backup"])
+                    self.assertEqual(status.data["selection_report"], {"unconfirmed_source": 1})
+
+    def test_manual_group_worker_blocks_vocab_change_before_backup(self):
+        class ChangingEmbedder:
+            def __init__(self, vocab_path):
+                self.vocab_path = vocab_path
+
+            def spans(self, audio_data, spans, cap):
+                self.vocab_path.write_text(json.dumps(
+                    {"group": "demo-group", "participants": [{"name": "changed"}]}), encoding="utf-8")
+                return [np.array([1.0, 0.0])] * len(spans)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            group_vocab = group / "vocab.json"
+            group_vocab.write_text(json.dumps(
+                {"group": "demo-group", "participants": [{"name": "Анна"}]}), encoding="utf-8")
+            audio = root / "demo.wav"
+            audio.write_bytes(b"synthetic audio")
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps({"file": str(audio), "names_confirmed": True,
+                                          "segments": [{"speaker": "Анна", "words": [
+                                              {"s": 0.0, "e": 3.0, "w": "привет"}]}]}), encoding="utf-8")
+            source_before = source.read_bytes()
+            args = self._manual_update_args(source, audio, group_vocab)
+            fake_audio = types.ModuleType("pyannote.audio")
+            fake_audio.Pipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
+            status = Status()
+            with patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), \
+                 patch.dict("sys.modules", {"pyannote.audio": fake_audio}), \
+                 patch.object(worker, "load_audio", return_value=np.zeros(48000)), \
+                 patch.object(voices, "Embedder", return_value=ChangingEmbedder(group_vocab)):
+                with self.assertRaises(RuntimeError):
+                    worker.learn_only(args, status, {}, audio)
+            self.assertEqual(status.data["state"], "error")
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertFalse((group / "voices.json").exists())
+            self.assertFalse((group / "voice-backups").exists())
+
+    def test_manual_group_worker_requires_hash_bound_update_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            groups, jobs = root / "groups", root / "jobs"
+            group = groups / "demo-group"
+            group.mkdir(parents=True)
+            group_vocab = group / "vocab.json"
+            group_vocab.write_text(json.dumps({"group": "demo-group", "participants": []}), encoding="utf-8")
+            audio = root / "demo.wav"
+            audio.write_bytes(b"synthetic audio")
+            source = root / "demo.transcript.json"
+            source.write_text(json.dumps({"file": str(audio), "segments": []}), encoding="utf-8")
+            args = types.SimpleNamespace(learn_only=str(source), vocab="", group="",
+                                         voice_group_override="demo-group")
+            fake_audio = types.ModuleType("pyannote.audio")
+            mock_pipeline = types.SimpleNamespace(from_pretrained=Mock())
+            status = Status()
+            with patch.object(paths, "GROUPS", groups), patch.object(paths, "JOBS", jobs), \
+                 patch.dict("sys.modules", {"pyannote.audio": fake_audio}):
+                with self.assertRaisesRegex(RuntimeError, "hash-bound"):
+                    worker.learn_only(args, status, {}, audio)
+            mock_pipeline.from_pretrained.assert_not_called()
+            self.assertEqual(status.data["state"], "error")
+            self.assertFalse((group / "voices.json").exists())
 
     def test_bad_profile_fails_closed_without_blocking_diarization(self):
         fixtures = [json.dumps({"version": voices.PROFILE_VERSION - 1, "speakers": {}, "sources": {}}),

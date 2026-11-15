@@ -664,9 +664,56 @@ def settings_info():
             "groups": paths.list_groups()}
 
 
-def preview_voice_learning(job_id):
+def _voice_vocab_context(data, json_path, group_override=None):
+    """Разрешает группу и только точечные словари, сверяя их с привязкой стенограммы."""
+    import vocab
+    import voices
+
+    try:
+        binding = voices.group_binding(data)
+        if binding["conflict"]:
+            raise vocab.ResolutionError("Группа расшифровки противоречит quality.vocab",
+                                        {"binding": binding, "candidates": []})
+        if binding["vocab_status"] == "invalid":
+            raise vocab.ResolutionError("Ссылка quality.vocab повреждена или невалидна",
+                                        {"binding": binding, "candidates": []})
+        if group_override:
+            if not isinstance(group_override, str) or paths.safe_group(group_override) != group_override:
+                raise CoreError("недопустимое имя выбранной группы")
+            if binding["group"] and paths.safe_group(binding["group"]) != group_override:
+                raise vocab.ResolutionError("Выбранная группа противоречит привязке расшифровки",
+                                            {"binding": binding, "candidates": []})
+            canonical = paths.vocab_path(group_override)
+            path, data_vocab, group, resolution, binding = vocab.resolve_group_vocab(
+                data.get("file"), json_path, data, group_override, canonical)
+            if not paths.group_dir(group_override).is_dir():
+                raise CoreError("выбранная группа не существует")
+        else:
+            candidates = vocab.related_candidates(
+                data.get("file"), json_path, binding.get("vocab_path"))
+            group = binding.get("group")
+            has_existing = any(Path(path).expanduser().is_file() for path, _ in candidates)
+            if not group and has_existing:
+                _, _, group, _ = vocab.resolve_candidates(candidates)
+            if group:
+                candidates.append((paths.vocab_path(group), "group_fallback"))
+            path, data_vocab, group, resolution = vocab.resolve_candidates(
+                candidates, expected_group=group)
+            resolution["binding"] = binding
+        if not group:
+            raise CoreError("группа расшифровки неизвестна; укажите явную группу для предпросмотра")
+        return {"group": group, "path": path, "vocab": data_vocab, "binding": binding,
+                "resolution": resolution,
+                "manual_override": bool(group_override and not binding.get("group")),
+                "override_requested": bool(group_override)}
+    except vocab.ResolutionError as ex:
+        raise CoreError(f"не удалось безопасно разрешить группу и словарь: {ex}") from ex
+
+
+def preview_voice_learning(job_id, group_override=None):
     """Предварительная оценка по разметке, без моделей, биометрических векторов и изменения файлов."""
     import voices
+    import vocab
     jp, _ = job_json(job_id)
     if not jp:
         raise CoreError("готовая расшифровка не найдена")
@@ -674,9 +721,9 @@ def preview_voice_learning(job_id):
         data = json.loads(Path(jp).read_text(encoding="utf-8"))
         if data.get("no_profile"):
             raise CoreError("для этой расшифровки профили групп отключены")
-        group = voices.group_of(data)
-        if not group:
-            raise CoreError("группа расшифровки неизвестна; предварительный просмотр невозможен")
+        context = _voice_vocab_context(data, jp, group_override)
+        group = context["group"]
+        group_vocab = context["vocab"]
         path = paths.voices_path(group)
         try:
             profile = voices.load_profile(path, convert=False)
@@ -694,6 +741,11 @@ def preview_voice_learning(job_id):
         spans = voices._spans(data, voices._confirmed(data), report) if eligible else []
         if not eligible:
             report["unconfirmed_source"] = 1
+        participants = (group_vocab or {}).get("participants") or []
+        allowed_names = {p["name"] for p in participants if p.get("name")}
+        outside_vocab = sorted({name for name, _, _, _ in spans if allowed_names and name not in allowed_names})
+        if allowed_names:
+            spans = [item for item in spans if item[0] in allowed_names]
         candidates = {}
         for name, start, end, human in spans:
             item = candidates.setdefault(name, {"windows": 0, "seconds": 0.0, "human_windows": 0})
@@ -705,10 +757,19 @@ def preview_voice_learning(job_id):
         return {"group": group, "existing_contributions": existing, "candidates": candidates,
                 "selection_report": report, "selection_explanation": voices.explain_selection_report(report),
                 "audio_available": Path(audio).is_file(),
+                "group_selection": {"group": group,
+                                    "method": ("manual_override" if context["manual_override"] else
+                                               "explicit_match" if context["override_requested"] else "transcript_or_vocab"),
+                                    "binding_group": context["binding"].get("group")},
+                "vocab": {"path": str(context["path"]) if context["path"] else None,
+                          "group": group_vocab.get("group") if context["path"] else None,
+                          "sha256": _voice_hash(context["path"]) if context["path"] else "absent"},
+                "vocab_resolution": context["resolution"],
+                "names_outside_vocab": outside_vocab,
                 "replacement_available": True,
                 "note": "Только разметка; модель, качество голоса и карантин не проверялись. "
                         "Окончательный результат обновления зависит от модели и карантина."}
-    except (OSError, ValueError, KeyError, TypeError) as ex:
+    except (OSError, ValueError, KeyError, TypeError, vocab.ResolutionError) as ex:
         raise CoreError(f"не удалось построить предварительный просмотр: {ex}") from ex
 
 
@@ -723,14 +784,14 @@ def _voice_hash(path):
     return digest.hexdigest()
 
 
-def prepare_voice_action(job_id):
+def prepare_voice_action(job_id, group_override=None):
     """Снимок предварительного плана для привязки подтверждения к конкретным файлам."""
     jp, _ = job_json(job_id)
     if not jp:
         raise CoreError("готовая расшифровка не найдена")
     try:
         before = _voice_hash(jp)
-        report = preview_voice_learning(job_id)
+        report = preview_voice_learning(job_id, group_override)
         group = report["group"]
         if paths.safe_group(group) != group:
             raise CoreError("недопустимое имя группы")
@@ -740,11 +801,20 @@ def prepare_voice_action(job_id):
             source_data = json.loads(Path(jp).read_text(encoding="utf-8"))
             audio = source_data.get("file")
             audio_hash = _voice_hash(audio) if audio else "absent"
-            report = preview_voice_learning(job_id)
-            if before != _voice_hash(jp) or report["group"] != group or profile_hash != _voice_hash(profile):
+            report = preview_voice_learning(job_id, group_override)
+            vocab_path = report["vocab"]["path"]
+            vocab_hash = report["vocab"]["sha256"]
+            if (before != _voice_hash(jp) or report["group"] != group or
+                    profile_hash != _voice_hash(profile) or
+                    (vocab_path and _voice_hash(vocab_path) != vocab_hash) or
+                    (audio and audio_hash != _voice_hash(audio))):
                 raise CoreError("исходные файлы изменились; повторите предварительный просмотр")
         snapshot = {"job_id": job_id, "json": str(Path(jp).resolve()), "group": group,
-                    "source_hash": before, "profile_hash": profile_hash, "audio_hash": audio_hash, "report": report}
+                    "group_override": group_override or None,
+                    "manual_group_override": report["group_selection"]["method"] == "manual_override",
+                    "vocab_path": vocab_path, "vocab_hash": vocab_hash,
+                    "source_hash": before, "profile_hash": profile_hash, "audio_hash": audio_hash,
+                    "report": report}
         if any(len(line) > 200 for line in voice_action_lines(snapshot)) or len("\n".join(voice_action_lines(snapshot))) > 1100:
             raise CoreError("список участников слишком длинный для безопасного подтверждения; действие не запущено")
         return snapshot
@@ -758,6 +828,18 @@ def voice_action_lines(snapshot, revoke=False):
     lines = [f"Группа: {snapshot['group']}", f"Расшифровка: {Path(snapshot['json']).name}",
              "Существующие вклады: " + (", ".join(report["existing_contributions"]) or "нет"),
              "Кандидаты по разметке: " + (", ".join(f"{n}: {v['seconds']} с" for n, v in candidates.items()) or "нет")]
+    selection = report.get("group_selection") or {}
+    if selection.get("method") == "manual_override":
+        lines.append(f"Группа выбрана вручную: {snapshot['group']} (в расшифровке привязка отсутствует).")
+    elif selection.get("method") == "explicit_match":
+        lines.append(f"Группа выбрана явно и совпадает с привязкой: {snapshot['group']}.")
+    if snapshot.get("vocab_path"):
+        lines.append(f"Словарь группы: {Path(snapshot['vocab_path']).name} "
+                     f"(SHA-256 {snapshot.get('vocab_hash', '')[:12]}…).")
+    elif snapshot.get("group_override"):
+        lines.append("Словарь выбранной группы отсутствует; обновление не запущено.")
+    else:
+        lines.append("Словарь группы не найден; ограничение участников словарём недоступно.")
     if report.get("selection_explanation"):
         lines.append("Предварительный отбор (результат модели может отличаться):")
         lines.extend(f"{item['description']}: {item['count']}" for item in report["selection_explanation"])
@@ -1032,9 +1114,18 @@ def start_voice_update(snapshot):
             raise CoreError("аудиофайл недоступен")
         if _voice_hash(audio) != snapshot["audio_hash"]:
             raise CoreError("аудиофайл изменился; повторите просмотр и подтверждение")
+        current = _voice_vocab_context(data, jp, snapshot.get("group_override"))
+        current_path = str(current["path"]) if current["path"] else None
+        current_vocab_hash = _voice_hash(current["path"]) if current["path"] else "absent"
+        if (current["group"] != group or current_path != snapshot.get("vocab_path") or
+                current_vocab_hash != snapshot.get("vocab_hash")):
+            raise CoreError("словарь или привязка группы изменились; повторите просмотр и подтверждение")
         args = ["--learn-only", str(jp), "--voice-source-hash", snapshot["source_hash"],
                 "--voice-profile-hash", snapshot["profile_hash"], "--voice-audio-hash", snapshot["audio_hash"],
-                "--voice-group", group]
+                "--voice-group", group, "--voice-vocab-path", snapshot.get("vocab_path") or "",
+                "--voice-vocab-hash", snapshot.get("vocab_hash") or "absent"]
+        if snapshot.get("group_override"):
+            args.extend(["--voice-group-override", snapshot["group_override"]])
         return {"job_id": launch("worker.py", args, audio, "learn"),
                 "hint": "Ход — transcription_status(job_id)"}
 

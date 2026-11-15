@@ -13,6 +13,8 @@
     python rt.py voice-refresh-plan [--group ИМЯ]  # изменённые источники, только чтение
     python rt.py voice-quality-policy warn|reject_clipping [--group ИМЯ]
     python rt.py voice-backup [--group ИМЯ]    # открытый резерв профилей в voice-backups
+    python rt.py voice-preview ЗАДАЧА [--group ИМЯ]  # --group только при неизвестной группе
+    python rt.py voice-update ЗАДАЧА [--group ИМЯ]   # перед запуском спрашивает подтверждение
     python rt.py self-check [--no-tests]        # тесты, проверка файлов на личные данные, морфология
 
     Данные (опасные действия: спрашивают согласие на клавиатуре, только в настоящем терминале):
@@ -123,7 +125,9 @@ def build():
     sub.add_parser("settings"); sub.add_parser("profiles"); sub.add_parser("approve"); sub.add_parser("audit")
     vl = sub.add_parser("voice-auto-learn"); vl.add_argument("state", choices=["on", "off"]); vl.add_argument("--group", default="")
     vp = sub.add_parser("voice-preview"); vp.add_argument("job")
+    vp.add_argument("--group", default="", help="явный выбор только для расшифровки без привязки")
     vu = sub.add_parser("voice-update"); vu.add_argument("job")
+    vu.add_argument("--group", default="", help="явный выбор только для расшифровки без привязки")
     vr = sub.add_parser("voice-revoke"); vr.add_argument("job")
     vq = sub.add_parser("voice-quality"); vq.add_argument("--group", default="")
     vqp = sub.add_parser("voice-quality-policy"); vqp.add_argument("policy", choices=["warn", "reject_clipping"])
@@ -189,9 +193,10 @@ def run(a):
     elif c == "profiles":
         out(core.voice_profiles())
     elif c == "voice-preview":
-        out(core.preview_voice_learning(a.job))
+        out(core.preview_voice_learning(a.job, a.group or None))
     elif c in ("voice-update", "voice-revoke"):
-        snapshot = core.prepare_voice_action(a.job)
+        snapshot = core.prepare_voice_action(a.job, a.group or None) if c == "voice-update" \
+            else core.prepare_voice_action(a.job)
         if c == "voice-revoke" and not snapshot["report"]["existing_contributions"]:
             raise core.CoreError("вкладов этой записи в профиле нет")
         return gated("Отзыв голосового вклада" if c == "voice-revoke" else "Обновление голосового профиля",

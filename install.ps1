@@ -367,7 +367,17 @@ if ($ov -ne "2025.4.1") {
 # словарь русского языка: свободные ответы в карточках — отличать опечатку от настоящего слова
 & $py -m pip install pymorphy3 pymorphy3-dicts-ru; Check-Pip "pymorphy3"
 & $py -c "import paths, backends as b; print('  OpenVINO видит:', b.openvino_devices()); print('  ONNX Runtime:', b.available_providers())"
-Write-Host "  нужны CPU, OpenVINOExecutionProvider и желательно GPU; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
+Write-Host "  нужны CPU и OpenVINOExecutionProvider; GPU желателен на Intel Arc; NPU не обязателен (на Meteor Lake он для GigaAM не используется)" -ForegroundColor DarkGray
+# OpenVINO GPU/NPU — плагины Intel: на графике AMD/NVIDIA их не будет, и это не ошибка.
+$nonIntel = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -and $_.Name -notmatch 'Intel' }
+if ($nonIntel) {
+    $names = ($nonIntel | ForEach-Object { $_.Name }) -join ', '
+    Write-Host "  Видео: $names." -ForegroundColor DarkGray
+    Write-Host "  OpenVINO GPU/NPU работают только на Intel — отсутствие GPU в списке выше для этой видеокарты не ошибка и не требует драйверов:" -ForegroundColor DarkGray
+    Write-Host "  тест скорости сам выберет процессор. Для Whisper обычно быстрее whisper-ct2 (faster-whisper): bench.py --only whisper-ct2,whisper-cpu." -ForegroundColor DarkGray
+    Write-Host "  Задействовать видеокарту можно через DirectML (пакет onnxruntime-directml) — замена пакета по согласованию: bench.py --only dml-gpu,whisper-dml" -ForegroundColor DarkGray
+}
 
 Step "8/9" "Токен Hugging Face"
 # при обновлении приложение ИИ-агента уже хранит рабочий токен — второй раз вводить не нужно

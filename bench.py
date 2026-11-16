@@ -94,7 +94,7 @@ VARIANTS = [
 DEFAULT_SET = ("torch-cpu,onnx-cpu,onnx-cpu-b8,onnx-cpu-b16,"
                "ov-gpu,ov-gpu-pad5,ov-gpu-pad22,"
                "ctc-cpu,ctc-cpu-b8,ctc-gpu,ctc-gpu-b8")
-DEFAULT_WHISPER = "whisper-gpu,whisper-cpu"
+DEFAULT_WHISPER = "whisper-gpu,whisper-cpu,whisper-ct2,whisper-dml"
 DEFAULT_NPU = "ov-npu-pad22,ctc-npu-pad22"
 
 CONFIG_KEYS = ("asr_backend", "asr_device", "pad_to_seconds", "asr_model", "asr_batch",
@@ -114,12 +114,24 @@ def device_of(variant):
     return "GPU" if backend == "dml" else "CPU"
 
 
-def select_variants(only="", npu=None, with_whisper=True):
-    """Варианты в порядке CPU → GPU → NPU; NPU без FP32 (Meteor Lake) не добавляется."""
+def select_variants(only="", npu=None, with_whisper=True, providers=None):
+    """Варианты в порядке CPU → GPU → NPU; NPU без FP32 (Meteor Lake) не добавляется.
+
+    Провайдер DirectML есть только у пакета onnxruntime-directml, который установщик
+    сносит (взаимно исключаем с onnxruntime-openvino). Поэтому в дефолтном наборе dml-
+    варианты пропускаются без запуска, если провайдера нет: попытка заведомо падает и
+    только тратит время. При явном `--only dml…` вариант сохраняется и падает с честной
+    ошибкой в отчёте — так человек видит, что именно не работает и почему.
+    """
     if npu is None:
         from backends import npu_info
         npu = npu_info()
     npu_ok = bool(npu and npu.get("available") and npu.get("fp32"))
+    explicit_only = bool(only)
+    if providers is None and not explicit_only:
+        from backends import available_providers as _ap
+        providers = _ap()
+    dml_ok = providers is None or "DmlExecutionProvider" in providers
     ids = [x.strip() for x in (only or DEFAULT_SET).split(",") if x.strip()]
     if not only:
         if with_whisper:
@@ -133,6 +145,8 @@ def select_variants(only="", npu=None, with_whisper=True):
         if not v or v["id"] in seen:
             continue
         if v["device"] == "NPU" and not npu_ok:
+            continue
+        if (not explicit_only and v.get("asr_backend") == "dml" and not dml_ok):
             continue
         out.append(v)
         seen.add(v["id"])
@@ -392,18 +406,26 @@ def main():
     wait_slot(st, cfg, a.status)
     threshold = threshold_from(cfg, a.min_similarity)
     try:
+        providers = available_providers()
         npu = npu_info()
         if a.no_npu:
             npu = {**npu, "fp32": False, "reason": "проверка NPU отключена ключом --no-npu"}
         st.set(stage="подготовка теста", progress=1, openvino_devices=openvino_devices(),
-               onnx_providers=available_providers(), npu=npu)
+               onnx_providers=providers, npu=npu)
         audio = load_audio(Path(a.audio).expanduser())[: a.seconds * SR]
         dur = len(audio) / SR
         tmp = tmpfiles.scratch("bench_")
         npy = tmp / "audio.npy"
         np.save(npy, audio)
 
-        variants = select_variants(a.only, npu=npu, with_whisper=not a.no_whisper)
+        variants = select_variants(a.only, npu=npu, with_whisper=not a.no_whisper,
+                                   providers=providers)
+        dml_note = None
+        if not a.only and "DmlExecutionProvider" not in providers:
+            dml_note = ("DirectML: провайдер onnxruntime-directml не установлен (установщик ставит "
+                        "onnxruntime-openvino, пакеты взаимно исключают друг друга) — dml-варианты "
+                        "пропущены без запуска. Чтобы их проверить, замените пакет onnxruntime "
+                        "и вызовите bench с --only dml-gpu,whisper-dml.")
         if not variants:
             raise RuntimeError("не выбрано ни одного варианта: проверьте --only и доступные устройства")
         results = []
@@ -462,6 +484,7 @@ def main():
                  "",
                  f"Устройства OpenVINO: {', '.join(openvino_devices()) or 'не найдены'}",
                  npu_note(npu),
+                 *([dml_note] if dml_note else []),
                  f"Порог качества при выборе: **{threshold * 100:.0f}%** (`bench_min_similarity`; "
                  f"выше — строже к точности). Время «на 10 мин» включает загрузку модели.",
                  whisper_note,

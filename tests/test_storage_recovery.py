@@ -66,6 +66,34 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / (self.rid + ".manifest.json")).read_bytes())
                          ["passport"]["document_revision"], 1)
 
+    def test_materialized_documents_are_readable_without_database(self):
+        self.create()
+        documents.materialize_pending(self.store, self.root_id, self.root)
+        document = self.store.get_document(self.rid, 1)
+        current = documents.current_paths(self.rid)
+        archived = documents.archive_paths(self.rid, 1)
+        expected = {"md": document["md"], "json": document["json"]}
+
+        self.store.close()
+        unavailable = self.path.with_suffix(".unavailable")
+        self.path.rename(unavailable)
+        try:
+            with self.assertRaises(storage.StorageError):
+                storage.open_store(self.path)
+            for kind in ("md", "json"):
+                self.assertEqual((self.root / current[kind]).read_bytes(), expected[kind])
+            for kind, relative in archived.items():
+                expected_archive = document["archive_manifest"] if kind == "manifest" else document[kind]
+                self.assertEqual((self.root / relative).read_bytes(), expected_archive)
+            manifest = json.loads((self.root / current["manifest"]).read_bytes())
+            for filename, entry in manifest["files"].items():
+                content = (self.root / filename).read_bytes()
+                self.assertEqual(hashlib.sha256(content).hexdigest(), entry["sha256"])
+            self.assertEqual(manifest["passport"]["recording_id"], self.rid)
+        finally:
+            unavailable.rename(self.path)
+            self.store = storage.open_store(self.path)
+
     def test_two_recordings_have_independent_files_and_manifests(self):
         self.create()
         second = uid()
@@ -237,6 +265,27 @@ class RecoveryTests(unittest.TestCase):
             self.store.bind_installation(uid(), uid())
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM installations").fetchone()[0],
                          installations)
+
+    def test_registered_roots_cannot_overlap_in_either_registration_order(self):
+        parent = self.base / "root-parent"
+        child = parent / "nested"
+        sibling = self.base / "root-sibling"
+        child.mkdir(parents=True)
+        sibling.mkdir()
+
+        self.store.register_root(parent)
+        with self.assertRaises(storage.Conflict):
+            self.store.register_root(child)
+        self.store.register_root(sibling)
+
+        other_path = self.base / "other-store.sqlite3"
+        other = storage.initialize(other_path)
+        try:
+            other.register_root(child)
+            with self.assertRaises(storage.Conflict):
+                other.register_root(parent)
+        finally:
+            other.close()
 
     def test_local_path_checks_the_resolved_target(self):
         if os.name != "nt":

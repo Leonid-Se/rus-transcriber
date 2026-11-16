@@ -711,8 +711,17 @@ class Store:
         with self._transaction():
             if self.db.execute("SELECT locked FROM restore_guard WHERE id=1").fetchone()[0]:
                 raise Conflict("restore copy requires explicit rebind")
-            if self.db.execute("SELECT 1 FROM allowed_roots WHERE path=?", (normalized,)).fetchone():
-                raise Conflict("root already registered")
+            existing = self.db.execute("SELECT path FROM allowed_roots").fetchall()
+            for row in existing:
+                registered = os.path.normcase(row["path"])
+                if registered == normalized:
+                    raise Conflict("root already registered")
+                try:
+                    shared = os.path.commonpath((normalized, registered))
+                except ValueError:
+                    continue
+                if shared in (normalized, registered):
+                    raise Conflict("root overlaps an existing root")
             self.db.execute("INSERT INTO allowed_roots(root_id, path) VALUES (?, ?)",
                             (root_id, normalized))
         return root_id

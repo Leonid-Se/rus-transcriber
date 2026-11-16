@@ -600,6 +600,11 @@ def _source_needs_review(prof, audio_key):
                for source, items in (prof.get("quarantine") or {}).items())
 
 
+def _is_sqlite_export(data):
+    passport = data.get("passport") if isinstance(data, dict) else None
+    return isinstance(passport, dict) and passport.get("storage_backend") == "sqlite"
+
+
 def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, group=None, selection_report=None,
           stop_when=None, allow_replace=False, quality_policy="warn", quality_report=None):
     """Пополняет профиль из расшифровок в папке. -> список учтённых файлов.
@@ -632,6 +637,9 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
         except Exception:
             note("unreadable_transcript")
             continue
+        if _is_sqlite_export(data):
+            note("sqlite_source_not_supported")
+            continue
         g = group_of(data)
         if group and g and g != group:       # расшифровка другой группы: её «Анна» — не наша
             note("other_group")
@@ -658,6 +666,8 @@ def learn(prof, folder, embedder, load_audio, names=None, limit=6, only=None, gr
                          set(Path(files[0]).parent.parent.glob("*.transcript.json"))) if files else []:
             try:
                 data = json.loads(jp.read_text(encoding="utf-8"))
+                if _is_sqlite_export(data):
+                    continue
                 akey = str(Path(data.get("file", "")).resolve())
                 if akey in best and _confirmed(data):
                     mt = jp.stat().st_mtime

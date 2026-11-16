@@ -19,6 +19,8 @@ import tempfile
 import time
 import traceback
 import ast
+import uuid
+from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 
@@ -929,6 +931,11 @@ def learn_only(a, st, cfg, src):
         transcript_data = json.loads(transcript_path.read_text(encoding="utf-8-sig"))
         if not isinstance(transcript_data, dict):
             raise RuntimeError("исходная расшифровка должна быть JSON-объектом")
+        import recordings
+        store, binding = recordings.open_for_document(transcript_path)
+        if store is not None:
+            store.close()
+            raise RuntimeError("обновление голосового профиля по SQLite-записи пока не поддерживается")
         override = getattr(a, "voice_group_override", "") or ""
         if transcript_data.get("no_profile"):
             if override:
@@ -1035,6 +1042,8 @@ def main():
     ap.add_argument("--vocab", default="", help="путь к словарю группы (rus-transcriber.vocab.json)")
     ap.add_argument("--group", default="", help="группа (папка DATA_DIR\\groups\\<группа>): её словарь и голосовой профиль")
     ap.add_argument("--tag", default="", help="метка в имени результата: <имя>.<метка>.transcript.md")
+    ap.add_argument("--storage-backend", choices=("legacy_files", "sqlite"), default="legacy_files",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--no-voices", action="store_true", help="без голосовых профилей и проверки голосов")
     ap.add_argument("--names", default="", help="имена участников записи через запятую: голоса только среди них")
     ap.add_argument("--learn-only", default="", help="только пересчитать профили голосов по этой расшифровке")
@@ -1050,6 +1059,10 @@ def main():
     ap.add_argument("--whisper-max-repeat", type=int, default=-1,
                     help="сколько раз подряд Whisper может повторить одну фразу (зацикливание); 0 — без ограничения")
     a = ap.parse_args()
+    if a.storage_backend == "sqlite":
+        import recordings
+        if not recordings.SQLITE_RUNTIME_READY:
+            raise RuntimeError("SQLite backend unavailable until all recording writers are routed")
 
     st = Status(a.status)
     src = Path(a.audio).expanduser().resolve()
@@ -1076,7 +1089,25 @@ def main():
         out_dir.mkdir(exist_ok=True)
         md_path = out_dir / (stem + ".transcript.md")
         json_path = out_dir / (stem + ".transcript.json")
-        transcript.ensure_new_result(json_path, md_path)
+        sqlite_target = None
+        if a.storage_backend == "sqlite":
+            import recordings
+            out_dir = recordings.document_layout(src, tag)["root"]
+            out_dir.mkdir(exist_ok=True)
+            layout = recordings.document_layout(src, tag)
+            store = recordings.open_store()
+            try:
+                root_id, document_paths = recordings.prepare_new_layout(store, out_dir, layout["paths"])
+            finally:
+                store.close()
+            json_path = out_dir / document_paths["json"]
+            md_path = out_dir / document_paths["md"]
+            context = st.data.get("recording_context")
+            if not isinstance(context, dict) or context.get("actor_kind") != "model":
+                raise RuntimeError("SQLite job is missing its captured initiator context")
+            sqlite_target = {"root_id": root_id, "paths": document_paths, "context": context}
+        else:
+            transcript.ensure_new_result(json_path, md_path)
 
         resolution = resolve_vocab_details(src, a, cfg)
         vocab_path, vocab, vgroup = resolution["path"], resolution["vocab"], resolution["group"]
@@ -1207,8 +1238,9 @@ def main():
                 data["no_profile"] = True
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
-            transcript.save_new(data, json_path, md_path)
+            saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
             st.set(state="done", stage="готово", progress=100, markdown=str(md_path), json=str(json_path),
+                   **saved,
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
                                             "review_items": len(data.get("review", [])),
@@ -1330,10 +1362,10 @@ def main():
         if label_name:
             data.update(speaker_names={l: label_name[l] for l in labels if l in label_name},
                         names_source="voices", names_confirmed=False)
-        transcript.save_new(data, json_path, md_path)
+        saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
 
         st.set(state="done", stage="готово", progress=100, markdown=str(md_path),
-               json=str(json_path), timing=timing,
+               json=str(json_path), **saved, timing=timing,
                quality={"vocab": quality["vocab"], "names": label_name or None,
                         "speaker_fixes": len(quality["speaker_fixes"]),
                         "vocab_fixes": sum(len(v["fixes"]) for v in quality["vocab_fixes"]),
@@ -1343,6 +1375,33 @@ def main():
         st.set(state="error", stage="ошибка", error=f"{type(ex).__name__}: {ex}",
                trace=traceback.format_exc()[-3000:])
         sys.exit(1)
+
+
+def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
+    if sqlite_target is None:
+        transcript.save_new(data, json_path, md_path)
+        return {}
+    import recordings
+    store = recordings.open_store()
+    try:
+        recording_id, operation_id = str(uuid.uuid4()), str(uuid.uuid4())
+        context = sqlite_target["context"]
+        result = recordings.commit_worker_result(
+            store, data, src, sqlite_target["root_id"], context,
+            recording_id=recording_id, operation_id=operation_id,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            document_paths=sqlite_target["paths"])
+        status.set(recording_id=recording_id, source_revision=result["source_revision"],
+                   review_revision=result["review_revision"], document_revision=result["document_revision"],
+                   document_sync=result["document_sync"])
+        completed = recordings.materialize_recording(store, recording_id)
+        if (recording_id, result["document_revision"]) not in completed:
+            raise RuntimeError("SQLite commit succeeded but document materialization is pending")
+        return {"recording_id": recording_id, "source_revision": result["source_revision"],
+                "review_revision": result["review_revision"], "document_revision": result["document_revision"],
+                "document_sync": "synced"}
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

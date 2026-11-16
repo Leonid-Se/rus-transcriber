@@ -54,7 +54,7 @@ def main():
         if not man:
             raise RuntimeError("пакет разбора не собран")
         pd = P.pack_dir(a.json_path)
-        store = P._read(pd / "answers.json", {"answers": {}})
+        store = P.answers_state(a.json_path, {"answers": {}})
         only = {x.strip() for x in a.ids.split(",") if x.strip()}
         todo = [it for it in man["items"] if (it["id"] in only if only else it["id"] not in store["answers"])]
         st.set(stage="загрузка распознавания", total=len(todo))
@@ -92,7 +92,7 @@ def main():
             if ans is None:
                 V.speak("Пропускаю.")
                 continue
-            rep = P.add_answers(a.json_path, [ans], "local")
+            rep = P.add_answers(a.json_path, [ans], "local", trusted_actor="human")
             acc = rep["accepted"][0] if rep["accepted"] else None
             if acc and acc.get("kind") in ("option", "recommended"):
                 V.speak(f"Принято: {acc['answer']}.")
@@ -105,7 +105,7 @@ def main():
             results.append({"id": it["id"], "heard": text, **(acc or {})})
         V.speak("Разбор закончен.")
         st.set(state="done", stage="готово", progress=100, done=f"{len(todo)}/{len(todo)}", results=results,
-               answers=str(pd / "answers.json"))
+               answers=("SQLite review history" if "_expected_versions" in store else str(pd / "answers.json")))
     except Exception as ex:
         import traceback
         st.set(state="error", stage="ошибка", error=f"{type(ex).__name__}: {ex}", trace=traceback.format_exc()[-1500:])

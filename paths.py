@@ -52,6 +52,7 @@ GROUPS = DATA_DIR / "groups"
 JOBS = DATA_DIR / "jobs"
 BENCH = DATA_DIR / "bench"
 CONFIG_FILE = DATA_DIR / "config.json"
+STATE_DB = DATA_DIR / "state.sqlite3"  # создаётся только явной операцией initialize_store
 for _d in (GROUPS, JOBS, BENCH):
     try:
         _d.mkdir(parents=True, exist_ok=True)

@@ -267,7 +267,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 
 Step "4/9" "Копирование файлов программы"
 if ($Source -ne $Target) {
-    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "download_hint.py", "transcript.py",
+    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "quotes.py", "conspect.py",
                      "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "cards.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force

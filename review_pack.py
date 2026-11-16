@@ -21,6 +21,7 @@
 Запуск отдельно (распознавание голосовых ответов, нужно отдельным процессом, чтобы сервер MCP не держал модель):
     python review_pack.py recognize <файл> [<файл> ...]   → JSON {файл: текст}
 """
+import copy
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 PAD_BEFORE = 3.5     # клип начинается за 3,5 с до места (было 1,5)
@@ -91,13 +93,18 @@ def build(json_path, items, base_url_note=None):
     -> отчёт. Пересборка меняет version: ответы на прежние вопросы не применятся."""
     import transcript as T
     data = T.load(json_path)
+    import recordings
+    sqlite_mode = recordings.read_review_pack_state(json_path) is not None
     src = Path(data.get("file") or "")
     if not src.exists():
         raise RuntimeError(f"исходная запись не найдена: {src}")
     review = {it["id"]: it for it in data.get("review") or []}
     rows = {it["id"]: _context(T, data, it) for it in data.get("review") or []}
     pd = pack_dir(json_path)
-    (pd / "clips").mkdir(parents=True, exist_ok=True)
+    clips_dir = pd / "clips"
+    if sqlite_mode:
+        clips_dir = clips_dir / uuid.uuid4().hex
+    clips_dir.mkdir(parents=True, exist_ok=True)
     out, skipped = [], []
     for q in items:
         it = review.get(q.get("id"))
@@ -115,7 +122,7 @@ def build(json_path, items, base_url_note=None):
             skipped.append({"id": it["id"], "why": "нужно 1–4 варианта"})
             continue
         t1, t2 = float(it.get("t1", it["t"])), float(it.get("t2", it["t"]))
-        clip = pd / "clips" / f"{it['id']}.mp3"
+        clip = clips_dir / (f"{len(out)}.mp3" if sqlite_mode else f"{it['id']}.mp3")
         s0 = cut_clip(src, t1, t2, clip)
         row = rows.get(it["id"], {})
         loc = T._find_span(data, it)
@@ -134,7 +141,7 @@ def build(json_path, items, base_url_note=None):
         manifest_item = {
             "id": it["id"], "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
             **target,
-            "clip": f"clips/{clip.name}", "clip_t1": round(t1 - s0, 2), "clip_t2": round(t2 - s0, 2),
+            "clip": clip.relative_to(pd).as_posix(), "clip_t1": round(t1 - s0, 2), "clip_t2": round(t2 - s0, 2),
             "speaker": it.get("speaker"), "text": it.get("text"),
             "reply": row.get("reply"), "before": row.get("before"), "after": row.get("after"),
             "reasons": it.get("reasons"), "voices": it.get("voices"),
@@ -147,23 +154,37 @@ def build(json_path, items, base_url_note=None):
             manifest_item["automation_diagnostic"] = automation_diagnostic
         out.append(manifest_item)
     keep = {f"{r['id']}.mp3" for r in out}
-    for f in (pd / "clips").glob("*.mp3"):
-        if f.name not in keep:
-            f.unlink()
+    if not sqlite_mode:
+        for f in clips_dir.glob("*.mp3"):
+            if f.name not in keep:
+                f.unlink()
     body = json.dumps(out, ensure_ascii=False, sort_keys=True)
     version = time.strftime("%Y%m%d%H%M%S-") + hashlib.sha1(body.encode()).hexdigest()[:6]
     man = {"version": version, "job_json": str(json_path), "audio": src.name,
            "recording_id": data.get("recording_id"), "source_revision": data.get("source_revision"),
            "speakers": data.get("speakers"), "created": _now(), "items": out}
-    _write(pd / "manifest.json", man)
-    ans = _read(pd / "answers.json", {})
+    ans = _read_answers(json_path, {})
+    if sqlite_mode and ans.get("_expected_versions") != {
+            "source_revision": data.get("source_revision"),
+            "review_revision": data.get("review_revision")}:
+        import storage
+        raise storage.Conflict("recording changed while building review pack")
     if ans.get("version") != version:          # прежние ответы — к прежним вопросам; храним для истории
-        if ans.get("answers") or ans.get("interaction_events") or ans.get("application_events"):
+        if (not sqlite_mode and
+                (ans.get("answers") or ans.get("interaction_events") or ans.get("application_events"))):
             _write(pd / f"answers.{ans.get('version', 'old')}.json", ans)
-        _write(pd / "answers.json", {"version": version, "answers": {}, "conflicts": [], "rejected": []})
+        expected_versions = ans.get("_expected_versions")
+        ans = {"version": version, "answers": {}, "conflicts": [], "rejected": []}
+        if expected_versions is not None:
+            ans["_expected_versions"] = expected_versions
+    ans["version"] = version
+    ans["manifest"] = man
+    _write_answers(json_path, ans)
+    if not sqlite_mode:
+        _write(pd / "manifest.json", man)
     shutil.copyfile(HERE / "cards.html", pd / "cards.html")
     return {"pack": str(pd), "version": version, "items": len(out), "skipped": skipped,
-            "clips_bytes": sum(f.stat().st_size for f in (pd / "clips").glob("*.mp3"))}
+            "clips_bytes": sum(f.stat().st_size for f in clips_dir.glob("*.mp3"))}
 
 
 CTX_BEFORE = 400      # символов соседних реплик до места
@@ -242,7 +263,33 @@ def _automation_diagnostic(data, item):
 
 
 def manifest(json_path):
+    import recordings
+    state = recordings.read_review_pack_state(json_path)
+    if state is not None:
+        return state.get("manifest")
     return _read(pack_dir(json_path) / "manifest.json", None)
+
+
+def _read_answers(json_path, default):
+    import recordings
+    state = recordings.read_review_pack_state(json_path)
+    if state is not None:
+        if state.get("version") is None:
+            return {**default, "_expected_versions": state["_expected_versions"]}
+        return state
+    return _read(pack_dir(json_path) / "answers.json", default)
+
+
+def answers_state(json_path, default=None):
+    return _read_answers(json_path, {"answers": {}} if default is None else default)
+
+
+def _write_answers(json_path, state):
+    import recordings
+    result = recordings.write_review_pack_state(json_path, state)
+    if result is not None:
+        return result
+    return _write(pack_dir(json_path) / "answers.json", state)
 
 
 def add_interaction_event(json_path, aid, version, event_type, session):
@@ -259,7 +306,7 @@ def add_interaction_event(json_path, aid, version, event_type, session):
     item = next((it for it in man.get("items") or [] if it.get("id") == aid), None)
     if not item:
         raise ValueError("карточка не найдена")
-    store = _read(pd / "answers.json", {"version": man["version"], "answers": {}})
+    store = _read_answers(json_path, {"version": man["version"], "answers": {}})
     events = store.setdefault("interaction_events", [])
     if event_type == "card_visible" and any(
             row.get("id") == aid and row.get("version") == version and
@@ -272,7 +319,7 @@ def add_interaction_event(json_path, aid, version, event_type, session):
         removed = len(events) - MAX_INTERACTION_EVENTS
         del events[:removed]
         store["interaction_events_dropped"] = store.get("interaction_events_dropped", 0) + removed
-    _write(pd / "answers.json", store)
+    _write_answers(json_path, store)
     return {"stored": True, "event": event}
 
 
@@ -331,15 +378,25 @@ def _same(a, b):
            (b.get("kind"), b.get("option"), (b.get("text") or "").strip() if b.get("kind") == "free" else None)
 
 
-def add_answers(json_path, answers, source):
+def add_answers(json_path, answers, source, *, trusted_actor="unknown"):
+    import recordings
+    if trusted_actor not in ("human", "unknown"):
+        raise ValueError("invalid answer actor")
+    with recordings.operation_for_document(json_path, trusted_actor):
+        return _add_answers(json_path, answers, source)
+
+
+def _add_answers(json_path, answers, source):
     """Сводит ответы в answers.json. answers: [{id, version, kind|option|text|audio, ts?}].
     Голосовые ответы без текста распознаются GigaAM (отдельный процесс) и сопоставляются с вариантами."""
+    import recordings
+    context = recordings.context_for_document(json_path)
     pd = pack_dir(json_path)
     man = manifest(json_path)
     if not man:
         raise RuntimeError("пакет разбора не собран: сначала build_review_pack")
     by_id = {it["id"]: it for it in man["items"]}
-    store = _read(pd / "answers.json", {"version": man["version"], "answers": {}, "conflicts": [], "rejected": []})
+    store = _read_answers(json_path, {"version": man["version"], "answers": {}, "conflicts": [], "rejected": []})
     need_asr = [a for a in answers if a.get("audio") and not a.get("text")]
     if need_asr:
         heard = recognize_files([a["audio"] for a in need_asr])
@@ -359,6 +416,9 @@ def add_answers(json_path, answers, source):
             store.setdefault("rejected", []).append({**rej, "source": source, "ts": a.get("ts") or _now()})
             continue
         ans = {"id": aid, "version": a["version"], "source": source, "ts": a.get("ts") or _now()}
+        if context is not None:
+            ans.update(actor_kind=context["actor_kind"], author_ref=context["author_ref"],
+                       initiated_by=context["initiated_by"])
         if it.get("diagnostic_id"):
             ans["diagnostic_id"] = it["diagnostic_id"]
         if isinstance(a.get("text"), str):          # пометки сомнения ⟦…⟧ из скопированной стенограммы
@@ -395,7 +455,7 @@ def add_answers(json_path, answers, source):
         rep["accepted"].append({"id": aid, "kind": ans["kind"], "answer": _desc(ans, it)})
         if ans["kind"] == "free":
             rep["free"].append({"id": aid, "text": ans.get("text")})
-    _write(pd / "answers.json", store)
+    _write_answers(json_path, store)
     rep["answered"] = len(store["answers"])
     rep["total"] = len(man["items"])
     return rep
@@ -432,7 +492,7 @@ def decisions(json_path):
     import transcript as T
     pd = pack_dir(json_path)
     man = manifest(json_path)
-    store = _read(pd / "answers.json", {"answers": {}})
+    store = _read_answers(json_path, {"answers": {}})
     data = T.load(json_path)
     applied = _applied_map(store)
     by_id = {it["id"]: it for it in man["items"]}
@@ -509,7 +569,7 @@ def decisions(json_path):
 def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}."""
     pd = pack_dir(json_path)
-    store = _read(pd / "answers.json", {"answers": {}})
+    store = _read_answers(json_path, {"answers": {}})
     applied = _applied_map(store)
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and aid not in applied}
 
@@ -670,7 +730,7 @@ def cloud_bundle(json_path, artifact_url=None):
     man = manifest(json_path)
     if not man:
         raise RuntimeError("пакет разбора не собран")
-    store = _read(pd / "answers.json", {"answers": {}})
+    store = _read_answers(json_path, {"answers": {}})
     meta = _read(pd / "cloud.json", {})
     if artifact_url:
         meta["artifact_url"] = artifact_url
@@ -702,7 +762,7 @@ def cloud_bundle(json_path, artifact_url=None):
 def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
     """Запоминает успешное применение и итоги неуспешных попыток без копии текста ответа."""
     pd = pack_dir(json_path)
-    store = _read(pd / "answers.json", {"answers": {}})
+    store = _read_answers(json_path, {"answers": {}})
     man = manifest(json_path) or {}
     manifest_items = {it.get("id"): it for it in man.get("items") or []}
     m = _applied_map(store)
@@ -722,6 +782,7 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
     if applied_ids:
         store["applied_at"] = _now()
     events = store.setdefault("application_events", [])
+    first_new_event = len(events)
     for aid, outcome in (outcomes or {}).items():
         if outcome in ("applied", "reverted"):
             continue
@@ -740,11 +801,16 @@ def mark_applied(json_path, ids=None, snapshots=None, outcomes=None):
                        "action": "reverted" if answer.get("kind") == "revert" else "applied",
                        "outcome": "reverted" if answer.get("kind") == "revert" else "applied",
                        "at": _now()})
+    import recordings
+    draft = recordings.answer_draft_for(json_path)
+    if draft is not None:
+        for event in events[first_new_event:]:
+            event["context"] = copy.deepcopy(draft["context"])
     if len(events) > MAX_INTERACTION_EVENTS:
         removed = len(events) - MAX_INTERACTION_EVENTS
         del events[:removed]
         store["application_events_dropped"] = store.get("application_events_dropped", 0) + removed
-    _write(pd / "answers.json", store)
+    _write_answers(json_path, store)
 
 
 def drop_audio(json_path):

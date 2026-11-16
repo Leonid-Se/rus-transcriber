@@ -97,11 +97,11 @@ def _need(job_id):
     return s
 
 
-def launch(script, args, src, kind):
+def launch(script, args, src, kind, *, initial_state=None):
     """Запускает фоновый процесс-задачу (worker.py и др.), возвращает job_id."""
     job_id = time.strftime("%Y%m%d-%H%M%S-") + kind[0] + uuid.uuid4().hex[:5]
     status = JOBS / f"{job_id}.json"
-    status.write_text(json.dumps({"state": "queued", "kind": kind, "file": str(src)}, ensure_ascii=False),
+    status.write_text(json.dumps({**(initial_state or {}), "state": "queued", "kind": kind, "file": str(src)}, ensure_ascii=False),
                       encoding="utf-8")
     cmd = [sys.executable, str(HERE / script), str(src), "--status", str(status), *args]
     log = open(JOBS / f"{job_id}.log", "w", encoding="utf-8")
@@ -144,6 +144,22 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     if not src.exists():
         raise CoreError(f"Файл не найден: {src}")
     args = (["--speakers", str(num_speakers)] if num_speakers else []) + ([] if emotions else ["--no-emotions"])
+    backend = settings.recording_backend()
+    initial_state = None
+    if backend == "sqlite":
+        import recordings
+        import storage
+        if not recordings.SQLITE_RUNTIME_READY:
+            raise CoreError("SQLite backend ещё не доступен: не все операции записи переведены")
+        try:
+            store = recordings.open_store()
+            try:
+                initial_state = {"recording_context": recordings.operation_context(store, "model")}
+            finally:
+                store.close()
+        except (OSError, storage.StorageError) as ex:
+            raise CoreError("SQLite-хранилище не инициализировано или недоступно") from ex
+        args += ["--storage-backend", "sqlite"]
     if vocab_path:
         args += ["--vocab", vocab_path]
     if group:
@@ -161,7 +177,11 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     names_list = [n.strip() for n in names.replace(";", ",").split(",") if n.strip()]
     if names_list:
         args += ["--names", ",".join(names_list)]
-    return {"job_id": launch("worker.py", args, src, "transcribe"), "file": str(src)}
+    if initial_state is not None:
+        job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state)
+    else:
+        job_id = launch("worker.py", args, src, "transcribe")
+    return {"job_id": job_id, "file": str(src)}
 
 
 def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_similarity=None):
@@ -223,10 +243,230 @@ def list_jobs(limit=10):
 
 def job_json(job_id):
     """(путь к json, путь к md) готовой расшифровки или (None, None)."""
+    if isinstance(job_id, str) and job_id.startswith("recording:"):
+        s = _recording_reference(job_id)
+        return s["json"], s["markdown"]
     s = job_status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
         return None, None
     return s["json"], s.get("markdown")
+
+
+def find_recording_results(source_path):
+    """Найти SQLite-записи исходника независимо от файлов истории задач."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        return recordings.find_recordings(store, source_path)
+    finally:
+        store.close()
+
+
+def read_recording_result(recording_id):
+    """Прочитать текущую SQLite-запись по устойчивому ID без job."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        result = recordings.load_recording(store, recording_id)
+        result["recording_ref"] = "recording:" + recording_id
+        return result
+    finally:
+        store.close()
+
+
+def _recording_reference(reference):
+    import storage
+    try:
+        result = read_recording_result(reference[len("recording:"):])
+        return {"state": "done", "json": result["json"], "markdown": result["markdown"],
+                "recording_id": result["recording_id"], "document_sync": result["document_sync"]}
+    except (OSError, ValueError, KeyError, storage.StorageError) as ex:
+        raise CoreError(f"SQLite-запись недоступна: {ex}") from ex
+
+
+def sync_recording_documents(recording_id):
+    """Повторить безопасную материализацию после commit или перезапуска."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        recordings.materialize_recording(store, recording_id)
+        binding = recordings.document_binding(store, recording_id)
+        path = binding["root"] / binding["paths"]["json"]
+        conspects = recordings.refresh_conspects(store, recording_id, path)
+        row = store.db.execute(
+            "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
+            (recording_id, binding["document_revision"])).fetchone()
+        return {"recording_id": recording_id, "document_revision": binding["document_revision"],
+                "document_sync": row["state"], "conspects": conspects}
+    finally:
+        store.close()
+
+
+def prepare_answer_confirmation(recording_id, answer_ids):
+    """Снимок и точное содержимое ответов для явного подтверждения человеком."""
+    import recordings
+    import review_pack
+    import unicodedata
+    if (not isinstance(answer_ids, list) or not 1 <= len(answer_ids) <= 8 or
+            any(not isinstance(ident, str) or not ident or len(ident) > 80 for ident in answer_ids) or
+            len(set(answer_ids)) != len(answer_ids)):
+        raise CoreError("выберите от 1 до 8 разных ответов")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        binding = recordings.document_binding(store, recording_id)
+        path = binding["root"] / binding["paths"]["json"]
+        state = recordings.read_review_pack_state(path)
+        manifest = state.get("manifest") or {}
+        items = {item["id"]: item for item in manifest.get("items") or []}
+        applied = review_pack._applied_map(state)
+        conflicted = {item.get("id") for item in state.get("conflicts") or []}
+        lines = []
+        for ident in answer_ids:
+            answer = state["answers"].get(ident)
+            item = items.get(ident)
+            if not answer or not item or answer.get("actor_kind") == "human":
+                raise CoreError("ответ отсутствует или уже имеет человеческое происхождение")
+            if ident in conflicted or ident in applied:
+                raise CoreError("конфликтующий или ранее применённый ответ нужно проверить в локальной карточке")
+            kind = answer.get("kind")
+            question = item.get("question") or "Как правильно?"
+            source_text = item.get("text") or ""
+            if kind in ("option", "recommended"):
+                option = answer.get("option")
+                options = item.get("options") or []
+                if type(option) is not int or not 0 <= option < len(options):
+                    raise CoreError("вариант ответа недействителен")
+                text = options[option].get("label", "")
+                decision = json.dumps(options[option].get("decision") or {}, ensure_ascii=False, sort_keys=True)
+            elif kind == "free":
+                raise CoreError("свободный ответ неизвестного происхождения нужно ввести заново в карточке")
+            elif kind in ("revert", "human"):
+                text = "отменить ответ" if kind == "revert" else "оставить человеку"
+                decision = kind
+            else:
+                raise CoreError("этот тип ответа нельзя подтвердить")
+            values = (ident, question, source_text, text, decision)
+            if (any(not isinstance(value, str) for value in values) or not text or
+                    any(unicodedata.category(ch).startswith("C") for value in values for ch in value)):
+                raise CoreError("ответ нельзя полностью и однозначно показать для подтверждения")
+            detail = [f"{ident}: {question}; место: {source_text}",
+                      f"Ответ: {text}; действие: {decision}"]
+            if any(len(line) > 200 for line in detail):
+                raise CoreError("ответ слишком длинный для полного подтверждения; используйте карточку")
+            lines.extend(detail)
+        if sum(len(line) + 1 for line in lines) > 900:
+            raise CoreError("ответы не помещаются в окно подтверждения; выберите меньше")
+        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {"recording_id": recording_id, "answer_ids": list(answer_ids),
+                "state_hash": hashlib.sha256(encoded).hexdigest(), "lines": lines}
+    except (OSError, ValueError, KeyError) as ex:
+        raise CoreError(f"не удалось подготовить подтверждение ответов: {ex}") from ex
+    finally:
+        store.close()
+
+
+def confirm_review_answers(snapshot):
+    """Зафиксировать отдельного подтверждающего, не меняя автора исходного ответа."""
+    import recordings
+    import review_pack
+    current = prepare_answer_confirmation(snapshot["recording_id"], snapshot["answer_ids"])
+    if current != snapshot:
+        raise CoreError("ответы изменились после запроса подтверждения")
+    store = recordings.open_store()
+    try:
+        binding = recordings.document_binding(store, snapshot["recording_id"])
+        path = binding["root"] / binding["paths"]["json"]
+    finally:
+        store.close()
+    with recordings.operation_for_document(path, "human"):
+        state = recordings.read_review_pack_state(path)
+        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if hashlib.sha256(encoded).hexdigest() != snapshot["state_hash"]:
+            raise CoreError("ответы изменились после запроса подтверждения")
+        context = recordings.context_for_document(path)
+        for ident in snapshot["answer_ids"]:
+            state["answers"][ident]["confirmation_context"] = context
+        review_pack._write_answers(path, state)
+    return {"recording_id": snapshot["recording_id"], "confirmed": snapshot["answer_ids"]}
+
+
+def list_conspect_conflicts(recording_id):
+    import recordings
+    import storage
+    storage._uuid(recording_id)
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        return [dict(row) for row in store.db.execute(
+            "SELECT f.conflict_id, f.conspect_id, c.name, f.revision, f.kind, f.relative_path, "
+            "f.observed_hash, f.observed_size, (f.observed_bytes IS NOT NULL) AS preserved "
+            "FROM conspect_conflicts f JOIN conspects c USING(conspect_id) "
+            "WHERE c.recording_id=? AND f.resolution_operation_id IS NULL ORDER BY f.rowid",
+            (recording_id,))]
+    finally:
+        store.close()
+
+
+def list_document_conflicts(recording_id):
+    import recordings
+    import storage
+    storage._uuid(recording_id)
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        return [dict(row) for row in store.db.execute(
+            "SELECT conflict_id, document_revision, kind, relative_path, observed_hash, observed_size, "
+            "(observed_bytes IS NOT NULL) AS preserved FROM document_conflicts "
+            "WHERE recording_id=? AND resolution_operation_id IS NULL ORDER BY rowid", (recording_id,))]
+    finally:
+        store.close()
+
+
+def resolve_document_conflict(recording_id, conflict_id):
+    import recordings
+    import storage
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = store.db.execute("SELECT recording_id FROM document_conflicts WHERE conflict_id=?",
+                               (conflict_id,)).fetchone()
+        if row is None or row["recording_id"] != recording_id:
+            raise CoreError("конфликт не найден для этой записи")
+        result = store.resolve_document_conflict(
+            conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
+        completed = recordings.materialize_recording(store, recording_id)
+        result["materialized"] = (recording_id, result["document_revision"]) in completed
+        return result
+    except (OSError, ValueError, storage.StorageError) as ex:
+        raise CoreError(f"конфликт не разрешён или формирование не завершено: {ex}") from ex
+    finally:
+        store.close()
+
+
+def resolve_conspect_conflict(recording_id, conflict_id):
+    import recordings
+    import storage
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = store.db.execute(
+            "SELECT c.recording_id FROM conspect_conflicts f JOIN conspects c USING(conspect_id) "
+            "WHERE f.conflict_id=?", (conflict_id,)).fetchone()
+        if row is None or row["recording_id"] != recording_id:
+            raise CoreError("конфликт не найден для этой записи")
+        result = store.resolve_conspect_conflict(
+            conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
+        completed = recordings.materialize_conspects(store, recording_id)
+        result["materialized"] = (result["conspect_id"], result["revision"]) in completed
+        return result
+    except (OSError, ValueError, storage.StorageError) as ex:
+        raise CoreError(f"конфликт не разрешён или формирование не завершено: {ex}") from ex
+    finally:
+        store.close()
 
 
 # ---------- чтение стенограммы ----------
@@ -259,14 +499,27 @@ def _text_only(s, key):
 
 
 def read_transcript(job_id, fmt="md", offset=0, max_chars=60000, extra=False):
-    s = _need(job_id)
+    s = (_recording_reference(job_id) if isinstance(job_id, str) and job_id.startswith("recording:")
+         else _need(job_id))
     if s.get("state") != "done":
         raise CoreError(f"Ещё не готово: {s.get('stage')} {s.get('progress', 0)}%")
     key = "report" if "report" in s else ("json" if fmt == "json" else "markdown")
     if key != "report" and not extra and s.get("json"):
         text = _text_only(s, key)
     else:
-        text = Path(s[key]).read_text(encoding="utf-8")
+        if s.get("document_sync", "synced") != "synced":
+            raise CoreError("Документы записи ещё не синхронизированы")
+        if isinstance(job_id, str) and job_id.startswith("recording:"):
+            import recordings
+            store = recordings.open_store()
+            try:
+                binding = recordings.document_binding(store, s["recording_id"])
+                doc = store.get_document(s["recording_id"], binding["document_revision"])
+                text = doc["json" if key == "json" else "md"].decode("utf-8")
+            finally:
+                store.close()
+        else:
+            text = Path(s[key]).read_text(encoding="utf-8")
     part = text[offset:offset + max_chars]
     if offset + max_chars < len(text):
         part += f"\n\n[...продолжение: offset={offset + max_chars}, всего символов {len(text)}]"
@@ -274,7 +527,8 @@ def read_transcript(job_id, fmt="md", offset=0, max_chars=60000, extra=False):
 
 
 def _done_json(job_id):
-    s = job_status(job_id)
+    s = (_recording_reference(job_id) if isinstance(job_id, str) and job_id.startswith("recording:")
+         else job_status(job_id))
     if not s or s.get("state") != "done" or "json" not in s:
         raise CoreError("Расшифровка не найдена или ещё не готова")
     return s
@@ -352,6 +606,25 @@ def describe_conspect_confirmation(job_id, name):
     import hashlib
     import conspect
     jp = Path(_done_json(job_id)["json"])
+    import recordings
+    store, binding = recordings.open_for_document(jp)
+    if store is not None:
+        try:
+            saved = recordings.conspect_for_document(jp, name)
+            if saved is None:
+                raise CoreError("конспект не найден")
+            document = store.get_document(
+                binding["recording_id"], binding["document_revision"])
+            current = store.get_current(binding["recording_id"])
+            obj = saved["payload"]
+            if obj.get("recording_id") != binding["recording_id"]:
+                raise CoreError("конспект относится к другой записи")
+            return {"job_id": job_id, "name": name, "recording_id": binding["recording_id"],
+                    "source_revision": current["transcript"]["revision"],
+                    "source_hash": hashlib.sha256(document["json"]).hexdigest(),
+                    "conspect_hash": saved["json_hash"]}
+        finally:
+            store.close()
     cj, _ = conspect.path_for(jp, name)
     try:
         source_bytes, conspect_bytes = jp.read_bytes(), cj.read_bytes()
@@ -370,9 +643,10 @@ def describe_conspect_confirmation(job_id, name):
 
 def preview_conspect_candidates(job_id, text):
     import conspect
+    import transcript
     jp = Path(_done_json(job_id)["json"])
     try:
-        data = json.loads(jp.read_text(encoding="utf-8"))
+        data = transcript.load(jp)
         _, report = conspect.link(text, data)
         return report
     except (OSError, ValueError) as ex:
@@ -437,13 +711,16 @@ def prepare_selected_conspect(job_id, name, text, selections):
     import conspect
     jp = Path(_done_json(job_id)["json"])
     cj, cm = conspect.path_for(jp, name)
-    if cj.exists() or cm.exists():
+    import recordings
+    existing = recordings.conspect_for_document(jp, name)
+    if existing is not None or cj.exists() or cm.exists():
         raise CoreError("конспект с таким названием уже существует; выберите другое название")
     if not isinstance(selections, dict) or not 1 <= len(selections) <= MAX_CONSPECT_SELECTIONS:
         raise CoreError(f"за одно подтверждение выберите от 1 до {MAX_CONSPECT_SELECTIONS} цитат")
     try:
-        source = jp.read_bytes()
-        data = json.loads(source)
+        import transcript
+        data = transcript.load(jp)
+        source = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         obj, report = conspect.link(text, data, selections=selections)
         if len(selections) > report["linked"]:
             raise ValueError("не все выбранные цитаты связаны")
@@ -467,11 +744,12 @@ def save_selected_conspect(snapshot, text, selections):
 
 def _save_selected_conspect_locked(snapshot, text, selections):
     import conspect
+    import transcript
     current, _ = prepare_selected_conspect(snapshot["job_id"], snapshot["name"], text, selections)
     if current != snapshot:
         raise CoreError("стенограмма или выбор изменились после подтверждения")
     jp = Path(_done_json(snapshot["job_id"])["json"])
-    data = json.loads(jp.read_text(encoding="utf-8"))
+    data = transcript.load(jp)
     obj, report = conspect.link(text, data, selections=selections)
     obj.update(name=snapshot["name"], job_json=str(jp))
     md, render_report = conspect.render(obj, data)
@@ -493,18 +771,39 @@ def _save_selected_conspect_locked(snapshot, text, selections):
 def confirm_conspect_analysis(snapshot):
     """Записать подтверждение только если файлы не изменились после показа человеку."""
     import conspect
+    import recordings
     jp = Path(_done_json(snapshot["job_id"])["json"])
     with conspect.write_lock(jp):
         conspect.recover_pending(jp)
-        return _confirm_conspect_analysis_locked(snapshot)
+        with recordings.operation_for_document(jp, "human"):
+            return _confirm_conspect_analysis_locked(snapshot)
 
 
 def _confirm_conspect_analysis_locked(snapshot):
     import conspect
+    import recordings
+    import transcript
     current = describe_conspect_confirmation(snapshot["job_id"], snapshot["name"])
     if current != snapshot:
         raise CoreError("конспект или стенограмма изменились после запроса подтверждения")
     jp = Path(_done_json(snapshot["job_id"])["json"])
+    saved = recordings.conspect_for_document(jp, snapshot["name"])
+    if saved is not None:
+        obj = saved["payload"]
+        data = transcript.load(jp)
+        conspect.confirm_analysis(obj, data)
+        md, _ = conspect.render(obj, data)
+        cj, cm = conspect.path_for(jp, snapshot["name"])
+        conspect.write_files(jp, [
+            (cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
+            (cm, md.encode("utf-8")),
+        ])
+        if describe_conspect_confirmation(snapshot["job_id"], snapshot["name"])["source_revision"] \
+                != snapshot["source_revision"]:
+            raise CoreError("конспект или стенограмма изменились после запроса подтверждения")
+        return {"name": snapshot["name"], "source_revision": snapshot["source_revision"],
+                "analysis_revision": snapshot["source_revision"], "analysis_needs_review": False,
+                "external_publication": "not_tracked"}
     cj, _ = conspect.path_for(jp, snapshot["name"])
     obj = json.loads(cj.read_text(encoding="utf-8"))
     data = json.loads(jp.read_text(encoding="utf-8"))
@@ -529,6 +828,57 @@ def apply_answers(job_id):
 def apply_answers_files(jp, md):
     """Применить ответы к указанной паре файлов готовой задачи."""
     import conspect
+    import recordings
+    store, binding = recordings.open_for_document(jp)
+    if store is not None:
+        try:
+            with conspect.write_lock(jp):
+                import transcript
+                initial = recordings.load_recording(store, binding["recording_id"])
+                state = recordings.read_review_pack_state(jp)
+                expected = state["_expected_versions"]
+                context = recordings.operation_context(store, "human")
+                import review_pack
+                applied = review_pack._applied_map(state)
+                if any(answer.get("kind") not in ("skip", "repeat") and
+                       applied.get(aid) != review_pack._sig(answer) and
+                       answer.get("actor_kind") != "human" and
+                       (answer.get("confirmation_context") or {}).get("actor_kind") != "human"
+                       for aid, answer in state.get("answers", {}).items()):
+                    raise CoreError("Ответ неизвестного происхождения нельзя применять как человеческий; "
+                                    "необходимо явное подтверждение")
+                with recordings.answer_draft(jp, initial, state, context) as draft:
+                    report = _apply_answers_files_locked(jp, md)
+                    candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
+                if candidate == initial:
+                    latest = recordings.document_binding(store, binding["recording_id"])
+                    current = store.db.execute(
+                        "SELECT state FROM document_outbox WHERE recording_id=? AND document_revision=?",
+                        (binding["recording_id"], latest["document_revision"])).fetchone()
+                    if current["state"] != "synced":
+                        completed = recordings.materialize_recording(store, binding["recording_id"])
+                        if (binding["recording_id"], latest["document_revision"]) not in completed:
+                            raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
+                    report["document_sync"] = "synced"
+                    try:
+                        report["conspects"] = recordings.refresh_conspects(store, binding["recording_id"], jp)
+                    except Exception as ex:
+                        raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
+                    return report
+                result = recordings.commit_recording_data(
+                    store, binding["recording_id"], candidate, expected,
+                    context=context)
+                completed = recordings.materialize_recording(store, binding["recording_id"])
+                if (binding["recording_id"], result["document_revision"]) not in completed:
+                    raise CoreError("Ответы сохранены в БД; обновление документа не завершено")
+                report["document_sync"] = "synced"
+                try:
+                    report["conspects"] = recordings.refresh_conspects(store, binding["recording_id"], jp)
+                except Exception as ex:
+                    raise CoreError(f"Ответы сохранены, но конспекты не обновлены: {ex}") from ex
+                return report
+        finally:
+            store.close()
     with conspect.write_lock(jp):
         return _apply_answers_files_locked(jp, md)
 
@@ -677,9 +1027,21 @@ def reopen_review(job_id, ids):
 
 # ---------- настройки, группы, профили ----------
 def settings_info():
-    return {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
-            "overrides": settings.load_overrides(), "effective": settings.load_config(),
-            "groups": paths.list_groups()}
+    import recordings
+    import storage
+    result = {"data_dir": str(paths.DATA_DIR), "config_file": str(paths.CONFIG_FILE),
+              "overrides": settings.load_overrides(), "effective": settings.load_config(),
+              "recording_backend": settings.recording_backend(), "groups": paths.list_groups()}
+    if paths.STATE_DB.is_file():
+        try:
+            store = recordings.open_store()
+            try:
+                result["recording_identity"] = store.current_identity()
+            finally:
+                store.close()
+        except (OSError, storage.StorageError) as ex:
+            result["recording_store_error"] = str(ex)
+    return result
 
 
 def _voice_vocab_context(data, json_path, group_override=None):
@@ -735,6 +1097,11 @@ def preview_voice_learning(job_id, group_override=None):
     jp, _ = job_json(job_id)
     if not jp:
         raise CoreError("готовая расшифровка не найдена")
+    import recordings
+    store, binding = recordings.open_for_document(jp)
+    if store is not None:
+        store.close()
+        raise CoreError("Обновление голосового профиля по SQLite-записи пока не поддерживается")
     try:
         data = json.loads(Path(jp).read_text(encoding="utf-8"))
         if data.get("no_profile"):

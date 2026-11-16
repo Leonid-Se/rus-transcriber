@@ -122,6 +122,24 @@ def recover_pending(json_path):
 
 
 def write_files(json_path, files, create=False):
+    """Для SQLite-записи сохранить экспорт как консект-ревизию; legacy остаётся файловым."""
+    import recordings
+    store, binding = recordings.open_for_document(json_path)
+    if store is not None:
+        try:
+            if len(files) == 1 and Path(files[0][0]).name.endswith(".conspect.json"):
+                obj = json.loads(files[0][1].decode("utf-8"))
+                import transcript
+                md, _ = render(obj, transcript.load(json_path))
+                md_path = Path(str(files[0][0])[:-len(".json")] + ".md")
+                files = [*files, (md_path, md.encode("utf-8"))]
+        finally:
+            store.close()
+        return recordings.save_conspect_files(json_path, files, create=create)
+    return _write_files_raw(json_path, files, create=create)
+
+
+def _write_files_raw(json_path, files, create=False):
     """Под блокировкой записать набор файлов; при сбое оставить журнал для отката."""
     journal = _journal_path(json_path)
     if journal.exists():
@@ -389,13 +407,19 @@ def save_linked(json_path, name, conspect_md):
 
 
 def _save_linked_locked(json_path, name, conspect_md):
-    data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    import recordings
+    import transcript
+    data = transcript.load(json_path)
     obj, rep = link(conspect_md, data)
     obj.update(name=name, job_json=str(json_path))
     cj, cm = path_for(json_path, name)
     md, rrep = render(obj, data)
+    store, binding = recordings.open_for_document(json_path)
+    sqlite_mode = store is not None
+    if store is not None:
+        store.close()
     write_files(json_path, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
-                            (cm, md.encode("utf-8"))])
+                            (cm, md.encode("utf-8"))], create=sqlite_mode)
     check = Q.check(md, data)["summary"]
     return {"conspect_json": str(cj), "conspect_md": str(cm), **rep,
             "analysis_needs_review": rrep["analysis_needs_review"],
@@ -412,7 +436,30 @@ def rerender(json_path, name=None):
 
 def _rerender_locked(json_path, name=None):
     jp = Path(json_path)
-    data = json.loads(jp.read_text(encoding="utf-8"))
+    import transcript
+    import recordings
+    data = transcript.load(jp)
+    store, binding = recordings.open_for_document(jp)
+    if store is not None:
+        try:
+            out = {}
+            for saved in store.list_conspects(binding["recording_id"]):
+                obj = saved["payload"]
+                if name and obj.get("name") != name:
+                    continue
+                md, rep = render(obj, data)
+                obj["source_revision"] = data.get("source_revision")
+                paths = recordings.document_binding(store, binding["recording_id"])["root"]
+                cj, cm = paths / saved["json_relative"], paths / saved["md_relative"]
+                write_files(jp, [(cj, json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")),
+                                 (cm, md.encode("utf-8"))])
+                chk = Q.check(md, data)
+                out[obj.get("name", saved["name"])] = {
+                    "conspect_md": str(cm), **rep, "check": chk["summary"],
+                    "check_problems": chk["problems"][:20], "markdown_chars": len(md)}
+            return out
+        finally:
+            store.close()
     stem = jp.name[:-len(".transcript.json")] if jp.name.endswith(".transcript.json") else jp.stem
     out = {}
     for cj in sorted(jp.parent.glob(f"{stem}.*.conspect.json")):

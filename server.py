@@ -25,9 +25,13 @@ import paths  # noqa: E402
 import settings  # noqa: E402
 import migrate  # noqa: E402
 import confirm  # noqa: E402
+import storage  # noqa: E402
 
 JOBS = core.JOBS
-_status = core.job_status        # короткие имена для инструментов разбора и конспекта ниже
+def _status(job_id):
+    if isinstance(job_id, str) and job_id.startswith("recording:"):
+        return core._recording_reference(job_id)
+    return core.job_status(job_id)
 _launch = core.launch
 _job_json = core.job_json
 try:
@@ -70,7 +74,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.15.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.17.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -208,26 +212,59 @@ def start_benchmark(audio_path: str, seconds: int = 180, only: str = "", chunk_m
 
 
 @mcp.tool()
-def rename_speakers(job_id: str, names: dict[str, str]) -> str:
+async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
     """Подписывает спикеров именами в готовой расшифровке (переписывает .md и .json).
 
     names: соответствие меток именам, например {"Спикер 1": "Вера", "Спикер 4": "Анна"}.
     Ключом можно указать и уже данное имя, чтобы исправить его. Исходные метки сохраняются
     в .json (поле label), поэтому переименовывать можно сколько угодно раз.
     """
+    import recordings
     import transcript
-    s = _status(job_id)
-    if not s:
-        return f"Задача {job_id} не найдена"
-    if s.get("state") != "done" or "json" not in s:
-        return "Расшифровка ещё не готова"
-    data, unknown = transcript.rename(s["json"], s["markdown"], names)
-    msg = {"speakers": data["speakers"], "mapping": data["speaker_names"], "markdown": s["markdown"]}
-    if data.get("_conspects"):
-        msg["conspects"] = data["_conspects"]
-    if unknown:
-        msg["warning"] = f"таких меток нет в расшифровке: {unknown}"
-    return json.dumps(msg, ensure_ascii=False, indent=2)
+    import unicodedata
+    try:
+        s = _status(job_id)
+        if not s or s.get("state") != "done" or "json" not in s:
+            return "Расшифровка не найдена или ещё не готова"
+        store, binding = recordings.open_for_document(s["json"])
+        sqlite_mode = store is not None
+        if store is not None:
+            store.close()
+
+        def run(expected=None):
+            try:
+                data, unknown = transcript.rename(s["json"], s["markdown"], names,
+                                                  expected_versions=expected)
+            except (ValueError, storage.StorageError) as ex:
+                raise core.CoreError(str(ex)) from ex
+            msg = {"speakers": data["speakers"], "mapping": data["speaker_names"], "markdown": s["markdown"]}
+            if data.get("_conspects"):
+                msg["conspects"] = data["_conspects"]
+            if unknown:
+                msg["warning"] = f"таких меток нет в расшифровке: {unknown}"
+            return msg
+
+        if not sqlite_mode:
+            return json.dumps(run(), ensure_ascii=False, indent=2)
+        if (not isinstance(names, dict) or not 1 <= len(names) <= 6 or
+                any(not isinstance(k, str) or not isinstance(v, str) or not k.strip() or not v.strip() or
+                    len(k) > 80 or len(v) > 80 or
+                    any(unicodedata.category(ch).startswith("C") for ch in k + v)
+                    for k, v in names.items())):
+            return "Имена нельзя полностью и однозначно показать для подтверждения"
+        lines = [f"{key} → {value}" for key, value in names.items()]
+        if sum(len(line) + 1 for line in lines) > 900:
+            return "Список имён слишком длинный для подтверждения"
+        before = transcript.load(s["json"])
+        expected = {"source_revision": before["source_revision"], "review_revision": before["review_revision"]}
+        recording_id = before["recording_id"]
+        return await _gated("Подписать говорящих",
+                            {"job_id": job_id, "recording_id": recording_id, "names": names, **expected},
+                            lambda: [f"Запись: {recording_id}; ревизия текста: {expected['source_revision']}",
+                                     "Подтвердить имена говорящих?"] + lines,
+                            lambda: run(expected))
+    except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
+        return f"Ошибка: {ex}"
 
 
 @mcp.tool()
@@ -261,8 +298,16 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
     закрываются. Пишется в журнал правок. by — "human", если текст продиктовал человек, иначе "claude".
     note — пояснение для журнала. Время слов — read_transcript(fmt="json", extra=True) или review_items."""
     try:
+        if by == "human":
+            import recordings
+            jp, _ = _job_json(job_id)
+            if jp:
+                store, binding = recordings.open_for_document(jp)
+                if store is not None:
+                    store.close()
+                    return "Человеческую правку SQLite-записи внесите через локальную карточку с подтверждением"
         return json.dumps(core.edit_span(job_id, t1, t2, text, speaker, note, by), ensure_ascii=False, indent=1)
-    except core.CoreError as ex:
+    except (core.CoreError, storage.StorageError, ValueError) as ex:
         return str(ex)
 
 
@@ -444,6 +489,154 @@ def get_settings() -> str:
 
 
 @mcp.tool()
+def initialize_recording_store(display_name: str = "") -> str:
+    """Явно создать новую пустую SQLite-БД и локальную identity; существующие файлы не мигрируются."""
+    import recordings
+    try:
+        store = recordings.initialize_store(display_name=display_name)
+        try:
+            identity = store.current_identity()
+        finally:
+            store.close()
+        return json.dumps({"initialized": True, "database": str(paths.STATE_DB),
+                           "identity": identity, "recording_backend": settings.recording_backend()},
+                          ensure_ascii=False, indent=2)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return json.dumps({"initialized": False, "error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def find_recording_results(source_path: str) -> str:
+    """Найти SQLite-результаты исходного файла независимо от истории фоновых задач."""
+    try:
+        return json.dumps(core.find_recording_results(source_path), ensure_ascii=False)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def read_recording_result(recording_id: str) -> str:
+    """Прочитать SQLite-результат по recording_id без сохранённого job."""
+    try:
+        return json.dumps(core.read_recording_result(recording_id), ensure_ascii=False)
+    except (OSError, ValueError, KeyError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def sync_recording_documents(recording_id: str) -> str:
+    """Повторить формирование файлов SQLite-записи, не затирая внешние изменения."""
+    try:
+        return json.dumps(core.sync_recording_documents(recording_id), ensure_ascii=False)
+    except (OSError, ValueError, KeyError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def list_conspect_conflicts(recording_id: str) -> str:
+    """Показать неразрешённые внешние правки конспектов SQLite-записи."""
+    try:
+        return json.dumps(core.list_conspect_conflicts(recording_id), ensure_ascii=False)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def request_review_answer_verification(recording_id: str, answer_ids: list[str]) -> str:
+    """Явно подтвердить выбранные ответы неизвестного происхождения перед применением."""
+    try:
+        snapshot = core.prepare_answer_confirmation(recording_id, answer_ids)
+        return await _gated(
+            "Подтвердить ответы разбора",
+            {"recording_id": recording_id, "answer_ids": answer_ids, "state_hash": snapshot["state_hash"]},
+            lambda: [f"Запись: {recording_id}",
+                     "Подтвердить следующие ответы как проверенные человеком:"] + snapshot["lines"],
+            lambda: core.confirm_review_answers(snapshot))
+    except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+def list_document_conflicts(recording_id: str) -> str:
+    """Показать неразрешённые внешние правки документов SQLite-записи."""
+    try:
+        return json.dumps(core.list_document_conflicts(recording_id), ensure_ascii=False)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
+    """После подтверждения сохранить внешние байты и восстановить документ из БД."""
+    try:
+        row = next((item for item in core.list_document_conflicts(recording_id)
+                    if item["conflict_id"] == conflict_id), None)
+        if row is None:
+            return "Конфликт не найден или уже разрешён"
+        if row["kind"].startswith("archive_"):
+            return "Изменён неизменяемый архив; требуется ручной разбор"
+        if not row["preserved"]:
+            return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
+        return await _gated(
+            "Разрешить конфликт документа",
+            {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
+            lambda: ["Внешняя редакция сохранена в БД; файл может быть заменён версией из БД.",
+                     f"Запись: {recording_id}; файл: {row['relative_path']}",
+                     f"Размер: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
+            lambda: core.resolve_document_conflict(recording_id, conflict_id))
+    except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
+    """После подтверждения сохранить внешние байты и восстановить версию конспекта из БД."""
+    try:
+        conflicts = core.list_conspect_conflicts(recording_id)
+        row = next((item for item in conflicts if item["conflict_id"] == conflict_id), None)
+        if row is None:
+            return "Конфликт не найден или уже разрешён"
+        if not row["preserved"]:
+            return "Внешний файл слишком велик для сохранения в БД; требуется ручной разбор"
+        return await _gated(
+            "Разрешить конфликт конспекта",
+            {"recording_id": recording_id, "conflict_id": conflict_id, "hash": row["observed_hash"]},
+            lambda: ["Внешняя редакция сохранена в БД; файл может быть заменён версией из БД.",
+                     f"Запись: {recording_id}; конспект: {row['name']}",
+                     f"Файл: {row['relative_path']}",
+                     f"Тип файла: {row['kind']}; размер: {row['observed_size']} байт.",
+                     f"SHA-256 внешней редакции: {row['observed_hash']}"],
+            lambda: core.resolve_conspect_conflict(recording_id, conflict_id))
+    except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
+        return f"Ошибка: {ex}"
+
+
+@mcp.tool()
+def set_recording_display_name(display_name: str) -> str:
+    """Изменить локальное имя в SQLite; оно не записывается в config.json."""
+    import recordings
+    try:
+        store = recordings.open_store()
+        try:
+            name = settings.set_user_display_name(store, display_name)
+        finally:
+            store.close()
+        return json.dumps({"display_name": name}, ensure_ascii=False)
+    except (OSError, ValueError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def set_recording_backend(backend: str) -> str:
+    """Выбрать legacy_files или подготовленный SQLite backend; старые записи не перемещаются."""
+    try:
+        settings.set_recording_backend(backend)
+        return json.dumps({"recording_backend": settings.recording_backend()}, ensure_ascii=False)
+    except (ValueError, RuntimeError, OSError, storage.StorageError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
 async def self_check(tests: bool = True) -> str:
     """Самопроверка программы на этом компьютере — после обновления или при подозрении на сбой: тесты (в отдельном
     процессе, с отдельной временной папкой данных — настоящие данные не трогаются), проверка файлов программы на
@@ -532,8 +725,8 @@ def _local_voice_tool():
 # ---------- пакет разбора: локальный и облачный режимы ----------
 @mcp.tool()
 def build_review_pack(job_id: str, items: list[dict] | None = None) -> str:
-    """Собирает пакет разбора сомнительных мест: клипы (3,5 с до места, 1,5 с после) (mp3 моно 64 кбит/с) и manifest.json
-    в папке <имя>.review рядом с расшифровкой. Целиком запись никуда не уходит.
+    """Собирает пакет разбора сомнительных мест: клипы (3,5 с до места, 1,5 с после) (mp3 моно 64 кбит/с).
+    Manifest хранится в файле для legacy или в SQLite для SQLite-записи. Целиком запись никуда не уходит.
 
     items — вопросы клиента по местам из review_items; без items — нейтральные вопросы:
       [{"id": "r5", "question": "Кто говорит «…»?", "options": [
@@ -560,14 +753,17 @@ def review_pack_info(job_id: str, include_manifest: bool = False) -> str:
     if not man:
         return "Пакет разбора не собран: build_review_pack"
     pd = P.pack_dir(jp)
-    ans = P._read(pd / "answers.json", {"answers": {}})
+    ans = P.answers_state(jp, {"answers": {}})
+    sqlite_mode = "_expected_versions" in ans
     src = {}
     for a in ans.get("answers", {}).values():
         src[a.get("source")] = src.get(a.get("source"), 0) + 1
     out = {"pack": str(pd), "version": man["version"], "items": len(man["items"]),
            "answered": len(ans.get("answers", {})), "by_source": src,
            "conflicts": len(ans.get("conflicts") or []), "rejected": len(ans.get("rejected") or []),
-           "files": ["cards.html", "manifest.json"] + [it["clip"] for it in man["items"]]}
+           "manifest_storage": "sqlite" if sqlite_mode else "file",
+           "files": ["cards.html"] + ([] if sqlite_mode else ["manifest.json"]) +
+                    [it["clip"] for it in man["items"]]}
     if include_manifest:
         out["manifest"] = man
     return json.dumps(out, ensure_ascii=False, indent=1)
@@ -847,7 +1043,7 @@ def _listen_reply(seconds, job_id, item_id):
     if jp and item_id:
         man = P.manifest(jp)
         out["answer"] = P.add_answers(jp, [{"id": item_id, "version": man["version"], "text": text,
-                                            "audio": str(wav), "heard": True}], "local")
+                                            "audio": str(wav), "heard": True}], "local", trusted_actor="human")
     return json.dumps(out, ensure_ascii=False, indent=1)
 
 

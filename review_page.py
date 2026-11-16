@@ -87,11 +87,17 @@ def main():
                 html = (HERE / "cards.html").read_text(encoding="utf-8")
                 return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"), "text/html; charset=utf-8")
             if u == "api/answers":
-                store = P._read(pd / "answers.json", {"answers": {}})
+                store = P.answers_state(a.json_path, {"answers": {}})
                 store["applied_answers"] = store.get("applied_answers") or {}
                 return self._send(200, store)
+            if u == "manifest.json":
+                manifest = P.manifest(a.json_path)
+                if manifest is None:
+                    return self._send(404, {"error": "пакет разбора не найден"})
+                return self._send(200, manifest)
             f = (pd / u).resolve()
-            if pd.resolve() in f.parents and f.is_file() and f.parent.name in ("clips", pd.name) \
+            if pd.resolve() in f.parents and f.is_file() and (f.parent == pd.resolve() or
+                    (pd / "clips").resolve() in f.parents) \
                     and f.name != "answers.json":
                 return self._send(200, f.read_bytes(), mimetypes.guess_type(f.name)[0] or "application/octet-stream")
             self._send(404, {"error": "не найдено"})
@@ -154,7 +160,7 @@ def main():
                     # Браузер не должен указывать произвольный путь к аудиофайлу.
                     ans.pop("audio", None)
                     with lock:
-                        rep = P.add_answers(a.json_path, [ans], "local")
+                        rep = P.add_answers(a.json_path, [ans], "local", trusted_actor="human")
                     return self._send(200, rep)
                 if u == "api/event":
                     event = json.loads(body.decode("utf-8"))

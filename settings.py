@@ -22,7 +22,8 @@ DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnn
             "asr_third_batch": 4, "asr_third_long_chunks": True, "asr_third_max_repeat": 3,
             "diar_embeddings": "auto", "diar_ov_device": "CPU", "diar_chunks_per_batch": 16,
             "diar_segmentation_batch": 0, "torch_threads": 0,
-            "pipeline": "words", "max_heavy_jobs": 2, "default_group": "", "voice_auto_learn_default": True,
+             "pipeline": "words", "max_heavy_jobs": 2, "default_group": "", "voice_auto_learn_default": True,
+             "recording_backend": "legacy_files",
             "voice_quality_policy_default": "warn",
             # порог совпадения текста с эталоном при выборе устройства в тесте скорости.
             # 0.97 — обычный компромисс; для работы, где важнее точность, поднимите до 0.99.
@@ -74,6 +75,40 @@ def update(explicit=(), **kv):
     cur = load_overrides()
     cur.update(kv)
     return save_overrides(cur, explicit=explicit)
+
+
+def user_display_name(store):
+    """Имя текущего пользователя установки хранится только в SQLite, не в config.json."""
+    return store.current_identity()["display_name"]
+
+
+def set_user_display_name(store, display_name):
+    """Переименовать локального пользователя, сохраняя прежние снимки авторства."""
+    identity = store.current_identity()
+    store.rename_user(identity["user_id"], display_name)
+    return store.current_identity()["display_name"]
+
+
+def recording_backend():
+    value = load_config().get("recording_backend", "legacy_files")
+    if value not in ("legacy_files", "sqlite"):
+        raise ValueError("recording_backend must be legacy_files or sqlite")
+    return value
+
+
+def set_recording_backend(value):
+    if value not in ("legacy_files", "sqlite"):
+        raise ValueError("recording_backend must be legacy_files or sqlite")
+    import recordings
+    if value == "sqlite" and not recordings.SQLITE_RUNTIME_READY:
+        raise RuntimeError("SQLite backend is unavailable until all recording writers are routed")
+    if value == "sqlite":
+        store = recordings.open_store()
+        try:
+            store.current_identity()
+        finally:
+            store.close()
+    return update(recording_backend=value)
 
 
 def group_voice_settings(group, initialize=False):

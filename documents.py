@@ -12,7 +12,7 @@ from pathlib import Path
 
 import storage
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 RENDERER_VERSION = 1
 MAX_CONFLICT_BYTES = 8 * 1024 * 1024
 
@@ -210,6 +210,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
             try:
                 fault("writing", rid, rev)
                 doc = store.get_document(rid, rev)
+                paths = current_paths_from_document(doc, rid)
                 expected_hashes = storage._loads(row["expected_previous_hashes"])
                 if row["generation"] != rev:
                     raise storage.StorageError("outbox generation mismatch")
@@ -223,24 +224,27 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     if current is None:
                         _write_atomic(path, value, immutable=True, conflict_kind="archive_" + kind)
                     fault("archive_" + kind, rid, rev)
-                for kind, filename in current_paths(rid).items():
+                for kind, filename in paths.items():
                     path = _target(root, filename)
                     current = _file_hash(path)
                     desired = _digest(doc[kind])
                     expected = expected_hashes[kind]
-                    if current not in (None, desired, expected):
-                        override = store.db.execute(
-                            "SELECT observed_hash FROM document_conflicts WHERE recording_id=? "
-                            "AND document_revision=? AND kind=? AND resolution_operation_id IS NOT NULL "
-                            "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind)).fetchone()
-                        if override is None or current != override["observed_hash"]:
-                            raise _FileConflict(kind, path)
+                    override = store.db.execute(
+                        "SELECT observed_hash FROM document_conflicts WHERE recording_id=? "
+                        "AND document_revision=? AND kind=? AND resolution_operation_id IS NOT NULL "
+                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind)).fetchone()
+                    if override is not None and current not in (desired, override["observed_hash"]):
+                        if current is None:
+                            raise storage.Conflict("external document disappeared after confirmation")
+                        raise _FileConflict(kind, path)
+                    if override is None and current not in (None, desired, expected):
+                        raise _FileConflict(kind, path)
                     if current != desired:
                         _write_atomic(path, doc[kind])
                     fault("replace_" + kind, rid, rev)
                 fault("before_ack", rid, rev)
                 with store._transaction():
-                    for kind, filename in current_paths(rid).items():
+                    for kind, filename in paths.items():
                         store.db.execute("UPDATE file_locations SET confirmed_revision=?, confirmed_hash=?, "
                                          "generation=?, conflict=0 WHERE root_id=? AND relative_path=?",
                                          (rev, doc["hashes"][kind], rev, root_id, filename))
@@ -276,7 +280,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
             rid, rev = row["recording_id"], row["document_revision"]
             try:
                 doc = store.get_document(rid, rev)
-                for kind, filename in current_paths(rid).items():
+                for kind, filename in current_paths_from_document(doc, rid).items():
                     target = _target(root, filename)
                     observed = _file_hash(target)
                     if observed is None:
@@ -415,7 +419,14 @@ def _registry_gaps(store, root_id, seen, states):
                                 "WHERE root_id=? ORDER BY recording_id, document_revision",
                                 (root_id,)).fetchall():
         rid, revision = row["recording_id"], row["document_revision"]
-        expected = list(current_paths(rid).items())
+        saved = store.db.execute(
+            "SELECT json FROM document_versions WHERE recording_id=? AND document_revision=?",
+            (rid, revision)).fetchone()
+        try:
+            paths = current_paths_from_document({"json": saved["json"]}, rid) if saved else current_paths(rid)
+        except storage.StorageError:
+            paths = current_paths(rid)
+        expected = list(paths.items())
         expected += [("archive_" + kind, path) for kind, path in archive_paths(rid, revision).items()]
         for kind, relative in expected:
             if (rid, relative) in seen:
@@ -545,12 +556,16 @@ def _public_review(review):
     for ident, answer in review.get("answers", {}).items():
         public = _select_scalars(answer, {"id": (str,), "version": (str,), "kind": (str,),
                                           "text": (str,), "source": (str,), "actor_kind": (str,),
+                                          "option": (int, type(None)), "ts": (str,),
                                           "legacy_author_label": (str,)})
         if "actor_kind" in public and public["actor_kind"] not in storage.ACTOR_KINDS:
             raise ValueError("invalid answer actor")
         for key in ("author_ref", "initiated_by"):
             if key in answer:
                 public[key] = _public_ref(answer[key])
+        if "confirmation_context" in answer:
+            storage._context(answer["confirmation_context"])
+            public["confirmation_context"] = answer["confirmation_context"]
         if (public.get("actor_kind") in ("model", "system", "unknown") and
                 public.get("author_ref", {}).get("user_id") is not None):
             raise ValueError("automatic answer cannot have a human author")
@@ -562,7 +577,10 @@ def _public_review(review):
     for action in actions:
         if not isinstance(action, dict):
             raise ValueError("invalid application")
-        public = _select_scalars(action, {"id": (str,), "kind": (str,), "answer_id": (str,)})
+        public = _select_scalars(action, {"id": (str,), "kind": (str,), "answer_id": (str,),
+                                          "version": (str,), "action": (str,), "outcome": (str,),
+                                          "answer_source": (str, type(None)), "answer_ts": (str, type(None)),
+                                          "at": (str,)})
         if "answer_id" in public and public["answer_id"] not in result["answers"]:
             raise ValueError("application references missing answer")
         if "context" in action:
@@ -608,10 +626,54 @@ def archive_paths(recording_id, document_revision):
             "manifest": base + "/manifest.json"}
 
 
-def current_paths(recording_id):
+def current_paths(recording_id, basename=None):
     storage._uuid(recording_id)
-    return {"md": recording_id + ".transcript.md", "json": recording_id + ".transcript.json",
-            "manifest": recording_id + ".manifest.json"}
+    basename = recording_id if basename is None else _safe_basename(basename)
+    return paths_for_basename(basename)
+
+
+def _safe_basename(basename):
+    if (not isinstance(basename, str) or not basename or basename in (".", "..")
+            or Path(basename).name != basename or "/" in basename or "\\" in basename
+            or "\0" in basename or any(char in basename for char in '<>:"|?*')
+            or basename.endswith((" ", "."))):
+        raise ValueError("invalid document basename")
+    return basename
+
+
+def paths_for_basename(basename):
+    basename = _safe_basename(basename)
+    return {"md": basename + ".transcript.md", "json": basename + ".transcript.json",
+            "manifest": basename + ".manifest.json"}
+
+
+def current_paths_from_document(document, recording_id):
+    """Прочитать сохранённые цели из passport, с поддержкой формата П1."""
+    raw = document.get("json")
+    if not isinstance(raw, (bytes, bytearray)):
+        raise storage.StorageError("invalid stored document JSON")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        passport = payload["passport"]
+        paths = passport.get("current_paths")
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise storage.StorageError("invalid stored document paths") from exc
+    if paths is None:
+        if passport.get("format_version", 1) >= 2:
+            raise storage.StorageError("missing stored document paths")
+        return current_paths(recording_id)
+    if not isinstance(paths, dict) or set(paths) != {"md", "json", "manifest"}:
+        raise storage.StorageError("invalid stored document paths")
+    checked = {}
+    for kind, relative in paths.items():
+        try:
+            parts = _relative_parts(relative)
+        except (TypeError, ValueError) as exc:
+            raise storage.StorageError("invalid stored document paths") from exc
+        checked[kind] = Path(*parts).as_posix()
+    if len(set(checked.values())) != 3:
+        raise storage.StorageError("duplicate stored document paths")
+    return checked
 
 
 def _author_refs(value):
@@ -628,7 +690,7 @@ def _author_refs(value):
 
 def prepare(recording_id, source_revision, review_revision, document_revision,
             transcript, review, source_context, review_context, generated_at,
-            *, source_content_context=None, annotation=None):
+            *, source_content_context=None, annotation=None, document_paths=None):
     """Вернуть bytes MD/JSON/manifest без I/O; время передаёт вызывающий сервис."""
     storage._uuid(recording_id)
     for version in (source_revision, review_revision, document_revision):
@@ -650,7 +712,12 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
                 annotation["source_revision"] < 1):
             raise ValueError("invalid annotation")
         storage._context(annotation["context"])
-    paths = current_paths(recording_id)
+    paths = current_paths(recording_id) if document_paths is None else document_paths
+    if not isinstance(paths, dict) or set(paths) != {"md", "json", "manifest"}:
+        raise ValueError("invalid document paths")
+    paths = {kind: Path(*_relative_parts(value)).as_posix() for kind, value in paths.items()}
+    if len(set(paths.values())) != len(paths):
+        raise ValueError("document paths must be distinct")
     archives = archive_paths(recording_id, document_revision)
     public_transcript = _public_transcript(transcript)
     names = public_transcript["speaker_names"]
@@ -673,7 +740,8 @@ def prepare(recording_id, source_revision, review_revision, document_revision,
     passport = {"recording_id": recording_id, "source_revision": source_revision,
                 "review_revision": review_revision, "document_revision": document_revision,
                 "format_version": FORMAT_VERSION, "renderer_version": RENDERER_VERSION,
-                "generated_at": generated_at, "archive_paths": archives,
+                "generated_at": generated_at, "storage_backend": "sqlite",
+                "current_paths": paths, "archive_paths": archives,
                 "source": {key: public_transcript.get(key) for key in
                            ("file", "duration", "recorded_at", "recorded_timezone", "container",
                             "codec", "audio_sha256", "audio_available")}}

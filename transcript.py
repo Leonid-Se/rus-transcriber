@@ -6,6 +6,7 @@
 """
 import copy
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -19,8 +20,14 @@ def recording_locked(func):
     @wraps(func)
     def wrapped(json_path, *args, **kwargs):
         import conspect
+        import recordings
+        bound = inspect.signature(func).bind_partial(json_path, *args, **kwargs)
+        bound.apply_defaults()
+        by = bound.arguments.get("by")
+        actor_kind = "human" if by is None or by == "human" else ("model" if by == "claude" else "unknown")
         with conspect.write_lock(json_path):
-            return func(json_path, *args, **kwargs)
+            with recordings.operation_for_document(json_path, actor_kind):
+                return func(json_path, *args, **kwargs)
     return wrapped
 
 
@@ -247,12 +254,49 @@ def _save_locked(data, json_path, md_path):
             item["status"] = "open"
             item["note"] = "Слова интервала изменились после прослушивания; нужна новая проверка."
             data["review_done"] = False
+    import recordings
+    draft = recordings.answer_draft_for(json_path)
+    if draft is not None:
+        draft["data"] = copy.deepcopy(data)
+        return {"draft": True}
+    store, binding = recordings.open_for_document(json_path)
+    if store is not None:
+        try:
+            recording_id = data.get("recording_id")
+            if recording_id != binding["recording_id"]:
+                raise RuntimeError("путь и recording_id не совпадают")
+            expected = {"source_revision": data.get("source_revision"),
+                        "review_revision": data.get("review_revision")}
+            result = recordings.commit_recording_data(
+                store, recording_id, data, expected)
+            data.update(source_revision=result["source_revision"],
+                        review_revision=result["review_revision"],
+                        document_revision=result["document_revision"],
+                        document_sync=result["document_sync"])
+            if result["document_sync"] != "synced":
+                completed = recordings.materialize_recording(store, recording_id)
+                if (recording_id, result["document_revision"]) not in completed:
+                    raise RuntimeError("SQLite commit succeeded but document materialization is pending")
+            data["document_sync"] = "synced"
+            return result
+        finally:
+            store.close()
     data["source_revision"] = data.get("source_revision", 0) + 1
     Path(json_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     Path(md_path).write_text(render_md(data), encoding="utf-8")
 
 
 def load(json_path):
+    import recordings
+    draft = recordings.answer_draft_for(json_path)
+    if draft is not None:
+        return copy.deepcopy(draft["data"])
+    store, binding = recordings.open_for_document(json_path)
+    if store is not None:
+        try:
+            return recordings.load_recording(store, binding["recording_id"])
+        finally:
+            store.close()
     return json.loads(Path(json_path).read_text(encoding="utf-8"))
 
 
@@ -338,10 +382,14 @@ def undo_answer(json_path, md_path, aid, snapshot):
 
 
 @recording_locked
-def rename(json_path, md_path, mapping):
+def rename(json_path, md_path, mapping, *, expected_versions=None):
     """mapping: {"Спикер 4": "Анна", ...}. Ключом может быть исходная метка или уже данное имя.
     Исходная метка сохраняется в поле label каждого сегмента, поэтому переименовывать можно повторно."""
     data = load(json_path)
+    if expected_versions is not None and (
+            data.get("source_revision") != expected_versions.get("source_revision") or
+            data.get("review_revision") != expected_versions.get("review_revision")):
+        raise ValueError("стенограмма изменилась после запроса подтверждения")
     mapping = {str(k).strip(): str(v).strip() for k, v in mapping.items() if str(v).strip()}
     current = data.get("speaker_names") or {}            # исходная метка -> имя
     for label, name in list(current.items()):
@@ -374,6 +422,9 @@ def rename(json_path, md_path, mapping):
 
 def _refresh_conspects(json_path):
     """После любой правки стенограммы пересобираем связанные с ней конспекты (conspect.py)."""
+    import recordings
+    if recordings.answer_draft_for(json_path) is not None:
+        return {"deferred": True}
     try:
         import conspect
         return conspect.rerender(json_path)
@@ -530,7 +581,7 @@ def edit_span(json_path, md_path, t1, t2, text, speaker=None, note=None, by="cla
 
 
 @recording_locked
-def reopen(json_path, md_path, ids):
+def reopen(json_path, md_path, ids, by="unknown"):
     """Снова открывает места разбора (закрытые или оставленные человеку), чтобы решить их заново."""
     data = load(json_path)
     items = {i["id"]: i for i in data.get("review") or []}

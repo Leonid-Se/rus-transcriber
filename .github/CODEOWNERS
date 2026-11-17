@@ -1,0 +1,18 @@
+# Changes that can affect runtime behavior, tests, packaging or repository
+# automation require approval from the maintainer. README and docs are left
+# without a code owner so passing documentation-only PRs can auto-merge.
+*.py @denII-sudo
+*.ps1 @denII-sudo
+*.html @denII-sudo
+*.json @denII-sudo
+*.toml @denII-sudo
+*.yml @denII-sudo
+*.yaml @denII-sudo
+*.bat @denII-sudo
+*.cmd @denII-sudo
+/.github/ @denII-sudo
+/.gitignore @denII-sudo
+/AGENTS.md @denII-sudo
+/CLAUDE.md @denII-sudo
+/LICENSE @denII-sudo
+/THIRD_PARTY_NOTICES.md @denII-sudo

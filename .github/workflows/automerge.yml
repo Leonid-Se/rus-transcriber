@@ -1,0 +1,46 @@
+name: Queue passing pull requests
+
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  queue:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      # This privileged workflow deliberately does not check out or execute
+      # pull-request code. It only asks GitHub to enable its built-in
+      # auto-merge after confirming the PR is open against main and matches
+      # the SHA whose Tests workflow just passed. Branch protection remains
+      # responsible for the code-owner approval requirement.
+      - name: Enable auto-merge for the passing PR
+        shell: bash
+        run: |
+          prs="$(gh api "repos/${REPOSITORY}/commits/${TESTED_SHA}/pulls" \
+            --jq ".[] | select(.state == \"open\" and .base.ref == \"main\" and .head.sha == \"${TESTED_SHA}\") | .number")"
+          if [ -z "$prs" ]; then
+            echo "No open pull request for tested commit ${TESTED_SHA}."
+            exit 0
+          fi
+          while IFS= read -r pr; do
+            case "$pr" in
+              ''|*[!0-9]*)
+                echo "Skipping unexpected pull-request number."
+                exit 1
+                ;;
+            esac
+            gh pr merge "$pr" --repo "$REPOSITORY" --auto --squash
+          done <<< "$prs"

@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      RUS_TRANSCRIBER_DATA: ${{ runner.temp }}\rus-transcriber-data
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare isolated Windows test directories
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:LOCALAPPDATA "Temp\opencode\stage6-acceptance"
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          "TEMP=$testTemp" >> $env:GITHUB_ENV
+          "TMP=$testTemp" >> $env:GITHUB_ENV
+      - name: Install lightweight test dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          numpy==2.3.5
+          mcp==2.3.0
+          pymorphy3==2.0.6
+          pymorphy3-dicts-ru==2.4.417150.4580142
+      - name: Run unit tests
+        run: python -B -m unittest discover -s tests -v

@@ -1,4 +1,8 @@
+import http.server
+import json
+import os
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -35,6 +39,54 @@ class OpenCodeProviderTests(unittest.TestCase):
             result, raw = client.generate(task)
         self.assertIsNone(result)
         self.assertEqual(raw, "not json")
+
+    def test_local_api_request_bypasses_configured_proxy(self):
+        target_hits, proxy_hits = [], []
+
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                target_hits.append((self.path, self.headers.get("Authorization"),
+                                    self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def log_message(self, *args):
+                pass
+
+        class Proxy(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                proxy_hits.append((self.path, self.headers.get("Authorization")))
+                self.send_response(502)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        for server in (target, proxy):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = llm_provider.OpenCodeTextClient()
+            client.base_url = f"http://127.0.0.1:{target.server_port}"
+            client.auth = "Basic synthetic-local-secret"
+            with mock.patch.dict(os.environ, {
+                "HTTP_PROXY": f"http://127.0.0.1:{proxy.server_port}",
+                "http_proxy": f"http://127.0.0.1:{proxy.server_port}",
+                "NO_PROXY": "", "no_proxy": "", "ALL_PROXY": "", "all_proxy": "",
+            }):
+                result = client._request("/api/info", {"prompt": "синтетический текст"}, timeout=3)
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(len(target_hits), 1)
+            self.assertEqual(target_hits[0][1], "Basic synthetic-local-secret")
+            self.assertIn("синтетический текст".encode("utf-8"), target_hits[0][2])
+            self.assertEqual(proxy_hits, [])
+        finally:
+            target.shutdown()
+            proxy.shutdown()
+            target.server_close()
+            proxy.server_close()
 
 
 class AutonomousWorkflowTests(unittest.TestCase):
@@ -173,3 +225,34 @@ class AutonomousWorkflowTests(unittest.TestCase):
         saved = workflow.get(self.store, request)
         self.assertEqual(saved["state"], "failed")
         self.assertEqual(saved["model_attempts"], 2)
+
+    def test_retry_failed_resets_invalid_response_repair_budget(self):
+        request = self.prepare_request()
+        task = workflow.prepare_model_task(self.store, request)
+        word_id = task["words"][0]["word_id"]
+        invalid = {"source_revision": task["source_revision"],
+                   "sections": [{"text": "Итог.", "evidence": ["unknown"]}]}
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                workflow.accept_model_result(self.store, request, invalid)
+        self.assertEqual(workflow.get(self.store, request)["state"], "failed")
+
+        valid = {"source_revision": task["source_revision"],
+                 "sections": [{"text": "Краткий итог.", "evidence": [word_id]}]}
+
+        class RepairingClient:
+            calls = 0
+
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+            def generate(self, *_args, **kwargs):
+                self.calls += 1
+                return (invalid, '{"bad":true}') if kwargs.get("repair_error") is None \
+                    else (valid, '{"ok":true}')
+
+        client = RepairingClient()
+        with mock.patch("llm_provider.OpenCodeTextClient", return_value=client):
+            result = workflow.execute_model(self.store, request, retry_failed=True)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(client.calls, 2)

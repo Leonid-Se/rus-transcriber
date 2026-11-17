@@ -206,6 +206,7 @@ def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_simila
 def start_workflow(audio_path, policy=None):
     """Создать сохранённый запрос и один раз запустить SQLite-worker без обучения голосов."""
     import recordings
+    import storage
     import workflow
     if settings.recording_backend() != "sqlite":
         raise CoreError("Для сохранённого процесса требуется явно выбранный SQLite backend")
@@ -219,8 +220,15 @@ def start_workflow(audio_path, policy=None):
                                 workflow_context=request["context"], workflow_request_id=request_id)
         except Exception:
             with store._transaction():
+                now = storage._now()
                 store.db.execute("UPDATE workflow_requests SET state='interrupted', updated_at=? WHERE request_id=?",
-                                 (__import__("storage")._now(), request_id))
+                                 (now, request_id))
+                store.db.execute("UPDATE workflow_runs SET state='interrupted', updated_at=? "
+                                 "WHERE request_id=? AND kind='asr' AND state='running'",
+                                 (now, request_id))
+                store.db.execute("UPDATE workflow_steps SET state='interrupted', updated_at=? WHERE run_id IN "
+                                 "(SELECT run_id FROM workflow_runs WHERE request_id=? AND kind='asr') "
+                                 "AND state='running'", (now, request_id))
             return {"request_id": request_id, "job_id": job_id, "state": "interrupted",
                     "note": "Исход запуска неизвестен; автоматический повтор отключён."}
         return {"request_id": request_id, "job_id": job_id}
@@ -542,6 +550,11 @@ def recording_revisions(recording_id, kind):
             item["created_at"] = row["created_at"] if row else None
             if kind == "review":
                 item["source_revision"] = data["source_revision"]
+            else:
+                paired = store.db.execute(
+                    "SELECT revision FROM review_revisions WHERE recording_id=? AND source_revision=? "
+                    "ORDER BY revision DESC LIMIT 1", (recording_id, revision)).fetchone()
+                item["restore_review_revision"] = paired["revision"] if paired else None
             result.append(item)
         return result
     finally:

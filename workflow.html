@@ -201,10 +201,22 @@ async function loadHistory(kind) {
       `<tr><td>${r.revision}${r.restored_from ? ` <span class="muted">(возврат ${r.restored_from})</span>` : ""}</td>
       <td>${esc(fmtTime(r.created_at))}</td><td>${esc(r.actor_kind || "")} ${esc(r.initiated_by || "")}</td>
       <td><button data-rev="${r.revision}" class="view">просмотр</button>
-      ${r.revision !== (d.revisions.at(-1) || {}).revision ? `<button data-rev="${r.revision}" data-k="${kind}" class="restore">вернуть</button>` : ""}</td></tr>`).join("");
+      ${r.revision !== (d.revisions.at(-1) || {}).revision && restorePair(kind, r)
+        ? `<button data-rev="${r.revision}" data-source="${restorePair(kind, r).source_revision}"
+             data-review="${restorePair(kind, r).review_revision}" data-k="${kind}" class="restore">вернуть</button>` : ""}</td></tr>`).join("");
     table.querySelectorAll(".view").forEach(b => b.onclick = () => viewRevision(kind, b.dataset.rev));
-    table.querySelectorAll(".restore").forEach(b => b.onclick = () => prepareRestore(kind, b.dataset.rev));
+    table.querySelectorAll(".restore").forEach(b => b.onclick = () =>
+      prepareRestore(kind, b.dataset.rev, b.dataset.source, b.dataset.review));
   } catch (ex) { say(ex.message, true); }
+}
+
+function restorePair(kind, revision) {
+  if (kind === "transcript") {
+    return revision.restore_review_revision
+      ? {source_revision: revision.revision, review_revision: revision.restore_review_revision} : null;
+  }
+  return revision.source_revision
+    ? {source_revision: revision.source_revision, review_revision: revision.revision} : null;
 }
 
 async function viewRevision(kind, rev) {
@@ -230,14 +242,14 @@ function segmentText(s) {
   return ((s.words || []).map(w => (w && w.w) || "")).join(" ");
 }
 
-async function prepareRestore(kind, rev) {
+async function prepareRestore(kind, rev, sourceRevision, reviewRevision) {
   try {
     const snap = await post("api/restore/prepare", {recording_id: recordingId,
-                                                    source_revision: Number(rev),
-                                                    review_revision: Number(rev)});
+                                                    source_revision: Number(sourceRevision),
+                                                    review_revision: Number(reviewRevision)});
     const root = $("revision-view");
     const div = document.createElement("div");
-    div.innerHTML = `<h3>Возврат ревизии ${esc(rev)} как текущей</h3>
+    div.innerHTML = `<h3>Возврат пары: текст ${esc(snap.source_revision)}, разбор ${esc(snap.review_revision)}</h3>
       <p>Будет создана новая текущая ревизия с содержимым прежней. Файл:
       <code>${esc(snap.document)}</code>. История сохраняется.</p>`;
     const ok = document.createElement("button");

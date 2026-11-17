@@ -16,6 +16,7 @@ import recordings
 import storage
 
 import core
+import rt
 import workflow_page
 
 
@@ -89,6 +90,26 @@ class P5ServiceTests(unittest.TestCase):
         self.assertEqual(restored["restored_from"], 1)
         binding = recordings.document_binding(self.store, ident)
         self.assertTrue(documents.verify_files(self.store, binding["root_id"], binding["root"])["consistent"])
+
+    def test_history_exposes_compatible_restore_pairs(self):
+        ident, root_id, _ = self.make_recording()
+        current = self.store.get_current(ident)
+        self.store.commit_change_with_document(
+            ident, {"source_revision": 1, "review_revision": 1},
+            str(uuid.uuid4()), recordings.operation_context(self.store, "human"),
+            review=current["review"]["payload"], root_id=root_id,
+            generated_at="2026-01-01T00:01:00Z")
+        self.change_text(ident, root_id, "исправлено")
+
+        transcript = core.recording_revisions(ident, "transcript")
+        review = core.recording_revisions(ident, "review")
+        self.assertEqual([item["restore_review_revision"] for item in transcript], [2, 3])
+        self.assertEqual([(item["source_revision"], item["revision"]) for item in review],
+                         [(1, 1), (1, 2), (2, 3)])
+        self.assertEqual(core.prepare_restore_snapshot(ident, 1, transcript[0]["restore_review_revision"])
+                         ["source_revision"], 1)
+        self.assertEqual(core.prepare_restore_snapshot(ident, 2, review[2]["revision"])
+                         ["review_revision"], 3)
 
     def test_restore_rejects_stale_snapshot(self):
         ident, root_id, _ = self.make_recording()
@@ -236,7 +257,8 @@ class P5ScreenHTTPTests(unittest.TestCase):
         with mock.patch.object(core, "start_workflow",
                                return_value={"request_id": str(uuid.uuid4()), "job_id": "job"}):
             status, started = self.post("api/start", {"audio": str(self.base / "a.wav"),
-                                                      "require_conspect": True})
+                                                      "require_conspect": True,
+                                                      "allow_cloud_model": False})
         self.assertEqual(status, 200)
         status, backed = self.post("api/backup", {"destination": str(self.base / "copy.sqlite3")})
         self.assertEqual(status, 200)
@@ -254,6 +276,27 @@ class P5ScreenHTTPTests(unittest.TestCase):
         self.assertEqual(self.get(f"api/result?request_id={unknown}")[0], 400)
         status, history = self.get(f"api/history?recording_id={unknown}&kind=transcript")
         self.assertEqual((status, history["revisions"]), (200, []))
+
+    def test_start_rejects_string_booleans_and_non_integer_budget(self):
+        with mock.patch.object(core, "start_workflow") as start:
+            status, error = self.post("api/start", {
+                "audio": str(self.base / "synthetic.wav"),
+                "require_conspect": "false", "allow_cloud_model": False})
+            self.assertEqual(status, 400)
+            self.assertIn("логическое", error["error"])
+            status, error = self.post("api/start", {
+                "audio": str(self.base / "synthetic.wav"),
+                "require_conspect": False, "allow_cloud_model": False,
+                "question_budget": 1.5})
+            self.assertEqual(status, 400)
+            self.assertIn("целое", error["error"])
+        start.assert_not_called()
+
+    def test_rt_screen_passes_cli_arguments_to_page_server(self):
+        parsed = rt.build().parse_args(["screen", "--port", "8799", "--hours", "1.5"])
+        with mock.patch("workflow_page.main") as page_main:
+            rt.run(parsed)
+        page_main.assert_called_once_with(["--port", "8799", "--hours", "1.5"])
 
 
 if __name__ == "__main__":

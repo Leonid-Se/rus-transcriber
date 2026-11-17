@@ -188,11 +188,15 @@ def make_server(port):
                     audio = str(body.get("audio", "")).strip()
                     if not audio or len(audio) > 300:
                         return self._send(400, {"error": "укажите путь к записи"})
-                    policy = {"require_conspect": bool(body.get("require_conspect")),
-                              "allow_cloud_model": bool(body.get("allow_cloud_model")),
-                              "participation": str(body.get("participation") or "simple"),
-                              "goal": str(body.get("goal") or ""),
-                              "question_budget": int(body.get("question_budget") or 0)}
+                    for key in ("require_conspect", "allow_cloud_model"):
+                        if type(body.get(key)) is not bool:
+                            raise ValueError(f"{key}: требуется логическое значение")
+                    import product_policy
+                    policy = product_policy.resolve({
+                        key: body[key] for key in (
+                            "require_conspect", "allow_cloud_model", "participation",
+                            "goal", "question_budget") if key in body
+                    })
                     return self._send(200, core.start_workflow(audio, policy))
                 if u == "api/backup":
                     destination = str(body.get("destination", "")).strip()
@@ -240,11 +244,11 @@ def make_server(port):
     return srv, f"http://127.0.0.1:{port}{prefix}", last
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8766)
     ap.add_argument("--hours", type=float, default=6.0)
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     srv, url, last = make_server(a.port)
     print(f"[экран] {url}", file=sys.stderr, flush=True)
 

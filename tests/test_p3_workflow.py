@@ -120,6 +120,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([p["policy"]["goal"] for p in saved["policy_history"]],
                          ["Первая цель", "Другая цель"])
 
+    def test_cloud_denial_cannot_be_reversed_on_existing_request(self):
+        request = workflow.create(self.store, self.source, {"allow_cloud_model": False})
+        with self.assertRaisesRegex(storage.Conflict, "создайте новый запрос"):
+            workflow.change_policy(self.store, request, {"allow_cloud_model": True}, 1)
+        saved = workflow.get(self.store, request)
+        self.assertFalse(saved["policy"]["allow_cloud_model"])
+        self.assertEqual(saved["policy_revision"], 1)
+
     def test_model_commit_survives_materialization_failure(self):
         request = workflow.create(self.store, self.source, {"require_conspect": True})
         workflow.claim_start(self.store, request)
@@ -173,6 +181,33 @@ class WorkflowTests(unittest.TestCase):
         self.store = storage.open_store(dbpath)
         saved = workflow.get(self.store, started["request_id"])
         self.assertEqual(saved["assessment_history"][0]["assessment"]["policy_revision"], 1)
+
+    def test_spawn_failure_keeps_request_runs_and_steps_interrupted(self):
+        self.store.close()
+        dbpath = self.root / "state.sqlite3"
+        self.store = storage.open_store(dbpath)
+        jobs = self.root / "jobs"
+        jobs.mkdir()
+
+        def failed_launch(script, args, src, kind, *, initial_state=None, job_id=None):
+            (jobs / f"{job_id}.json").write_text(json.dumps(
+                {**(initial_state or {}), "state": "queued", "kind": kind, "file": str(src)}),
+                encoding="utf-8")
+            raise OSError("synthetic process creation failure")
+
+        with mock.patch("recordings.open_store", side_effect=lambda: storage.open_store(dbpath)), \
+             mock.patch("settings.recording_backend", return_value="sqlite"), \
+             mock.patch.object(core, "JOBS", jobs), \
+             mock.patch.object(core, "launch", side_effect=failed_launch):
+            started = core.start_workflow(self.source)
+            saved = workflow.get(self.store, started["request_id"])
+            self.assertEqual(started["state"], "interrupted")
+            self.assertEqual(saved["state"], "interrupted")
+            self.assertEqual([(run["kind"], run["state"]) for run in saved["runs"]],
+                             [("asr", "interrupted")])
+            self.assertEqual([step["state"] for step in saved["steps"]], ["interrupted"])
+            status = core.workflow_status(started["request_id"])
+            self.assertEqual(status["request"]["state"], "interrupted")
 
     def test_worker_commit_is_linked_atomically_and_recoverable_without_job(self):
         request_id = workflow.create(self.store, self.source)

@@ -78,12 +78,17 @@ def change_policy(store, request_id, policy, expected_revision):
     context = recordings.operation_context(store, "unknown")
     with store._transaction():
         store.current_identity()
-        row = store.db.execute("SELECT policy_revision, state FROM workflow_requests WHERE request_id=?",
+        row = store.db.execute("SELECT policy_revision, state, policy_json FROM workflow_requests WHERE request_id=?",
                                (request_id,)).fetchone()
         if row is None:
             raise KeyError(request_id)
         if row["policy_revision"] != expected_revision:
             raise storage.Conflict("политика уже изменилась")
+        previous_policy = storage._loads(row["policy_json"])
+        if not previous_policy["allow_cloud_model"] and policy["allow_cloud_model"]:
+            raise storage.Conflict(
+                "облачный режим нельзя включить для существующего запроса; создайте новый запрос "
+                "с явным разрешением")
         if row["state"] == "waiting_model":
             raise storage.Conflict("сначала завершите текущее модельное задание")
         now, revision = storage._now(), expected_revision + 1
@@ -205,6 +210,10 @@ def observe(store, request_id, job):
     """Зафиксировать наблюдаемый результат, не повторяя завершённое распознавание."""
     request = get(store, request_id)
     if request["state"] not in ("starting", "running", "interrupted"):
+        return request
+    if (request["state"] == "interrupted" and not request["recording_id"]
+            and job and job.get("state") == "queued"):
+        # A stale queued status file can remain if process creation failed.
         return request
     if request["state"] == "interrupted" and not request["recording_id"] and not job:
         return request
@@ -487,7 +496,7 @@ def _resume_model_run(store, request):
     with store._transaction():
         store.current_identity()
         now = storage._now()
-        store.db.execute("UPDATE workflow_requests SET state='waiting_model', updated_at=? "
+        store.db.execute("UPDATE workflow_requests SET state='waiting_model', model_attempts=0, updated_at=? "
                          "WHERE request_id=? AND state='failed'", (now, request["request_id"]))
         store.db.execute("UPDATE workflow_runs SET state='waiting_model', updated_at=? "
                          "WHERE request_id=? AND kind='model' AND state='failed'",

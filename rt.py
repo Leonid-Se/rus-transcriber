@@ -265,7 +265,7 @@ def run(a):
         out(core.workflow_list(a.limit))
     elif c == "screen":
         import workflow_page
-        workflow_page.main()
+        workflow_page.main(["--port", str(a.port), "--hours", str(a.hours)])
     elif c == "db-backup":
         report = core.backup_store(a.dest)
         print(f"Резерв создан: {report['destination']}; проверка: {report['report'].get('integrity')}. "

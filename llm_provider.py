@@ -131,7 +131,8 @@ class OpenCodeTextClient:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.base_url + route, data=data, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=timeout) as response:
                 raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
                     raise ProviderError("invalid_response", "OpenCode вернул слишком большой ответ")

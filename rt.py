@@ -103,6 +103,26 @@ def build():
     t.add_argument("--names", default=""); t.add_argument("--group", default=""); t.add_argument("--speakers", type=int, default=0)
     t.add_argument("--no-emotions", action="store_true"); t.add_argument("--no-voices", action="store_true")
     t.add_argument("--tag", default=""); t.add_argument("--vocab", default=""); t.add_argument("--whisper", default="")
+    wf = sub.add_parser("workflow-start"); wf.add_argument("audio")
+    wf.add_argument("--conspect", action="store_true"); wf.add_argument("--no-cloud-model", action="store_true")
+    wf.add_argument("--named-speakers", action="store_true")
+    wf.add_argument("--human-verified", action="store_true")
+    wf.add_argument("--participation", choices=["simple", "advanced", "developer"], default="simple")
+    wf.add_argument("--goal", default=""); wf.add_argument("--question-budget", type=int, default=0)
+    ws = sub.add_parser("workflow-status"); ws.add_argument("request")
+    wt = sub.add_parser("workflow-task"); wt.add_argument("request")
+    wt.add_argument("--offset", type=int, default=0); wt.add_argument("--limit", type=int, default=1000)
+    wr = sub.add_parser("workflow-result"); wr.add_argument("request"); wr.add_argument("result_file")
+    wmp = sub.add_parser("workflow-part"); wmp.add_argument("request"); wmp.add_argument("index", type=int)
+    wmr = sub.add_parser("workflow-part-result"); wmr.add_argument("request"); wmr.add_argument("index", type=int)
+    wmr.add_argument("result_file")
+    we = sub.add_parser("workflow-execute"); we.add_argument("request")
+    we.add_argument("--retry-failed", action="store_true")
+    wp = sub.add_parser("workflow-policy"); wp.add_argument("request"); wp.add_argument("policy_file")
+    wp.add_argument("expected_revision", type=int)
+    wv = sub.add_parser("workflow-confirm"); wv.add_argument("request")
+    wa = sub.add_parser("workflow-abandon"); wa.add_argument("request")
+    wq = sub.add_parser("workflow-questions"); wq.add_argument("request")
     s = sub.add_parser("status"); s.add_argument("job"); s.add_argument("--wait", type=int, default=0)
     j = sub.add_parser("jobs"); j.add_argument("--limit", type=int, default=10)
     r = sub.add_parser("read"); r.add_argument("job"); r.add_argument("--fmt", default="md", choices=["md", "json"])
@@ -145,7 +165,44 @@ def build():
 
 def run(a):
     c = a.cmd
-    if c == "transcribe":
+    if c == "workflow-start":
+        out(core.start_workflow(a.audio, {"require_conspect": a.conspect,
+                                         "allow_cloud_model": not a.no_cloud_model,
+                                         "require_named_speakers": a.named_speakers,
+                                         "require_human_verification": a.human_verified,
+                                         "participation": a.participation, "goal": a.goal,
+                                         "question_budget": a.question_budget}))
+    elif c == "workflow-status":
+        out(core.workflow_status(a.request))
+    elif c == "workflow-task":
+        out(core.workflow_model_task(a.request, a.offset, a.limit))
+    elif c == "workflow-result":
+        out(core.workflow_model_result(a.request, json.loads(Path(a.result_file).read_text(encoding="utf-8"))))
+    elif c == "workflow-part":
+        out(core.workflow_model_part(a.request, a.index))
+    elif c == "workflow-part-result":
+        out(core.workflow_model_part_result(a.request, a.index, json.loads(Path(a.result_file).read_text(encoding="utf-8"))))
+    elif c == "workflow-execute":
+        out(core.workflow_execute_model(a.request, retry_failed=a.retry_failed))
+    elif c == "workflow-policy":
+        out(core.workflow_change_policy(a.request, json.loads(Path(a.policy_file).read_text(encoding="utf-8")),
+                                        a.expected_revision))
+    elif c == "workflow-questions":
+        out(core.workflow_questions(a.request))
+    elif c == "workflow-confirm":
+        snapshot = core.workflow_verification_snapshot(a.request)
+        return gated("Подтверждение проверки стенограммы",
+                     [f"Стенограмма: {snapshot['document']}", f"Ревизия: {snapshot['source_revision']}",
+                      f"Ревизия разбора: {snapshot['review_revision']}",
+                      "Подтвердите только если самостоятельно проверили всю стенограмму."],
+                     lambda: core.workflow_confirm_verification(snapshot))
+    elif c == "workflow-abandon":
+        snapshot = core.workflow_abandon_snapshot(a.request)
+        return gated("Отказ от незавершённого запуска",
+                     [f"Источник: {snapshot['source']}", f"Задача: {snapshot['job_id']}",
+                      "Старый worker больше не сможет сохранить результат; процесс не останавливается."],
+                     lambda: core.workflow_abandon(snapshot))
+    elif c == "transcribe":
         out(core.start_transcription(a.audio, a.speakers, not a.no_emotions, a.vocab, a.tag, not a.no_voices,
                                      a.names, a.whisper, -1, a.group))
     elif c == "status":
@@ -159,7 +216,6 @@ def run(a):
     elif c == "review-build":
         items = None
         if a.items:
-            from pathlib import Path
             items = json.loads(Path(a.items).read_text(encoding="utf-8-sig"))
             if not isinstance(items, list):
                 raise core.CoreError("Файл вопросов должен содержать JSON-массив")
@@ -261,6 +317,12 @@ def main(argv=None):
     except core.CoreError as ex:
         say(f"Ошибка: {ex}")
         return 1
+    except Exception as ex:
+        import llm_provider
+        if isinstance(ex, llm_provider.ProviderError):
+            say(f"Ошибка модельного исполнителя [{ex.code}]: {ex}")
+            return 1
+        raise
 
 
 if __name__ == "__main__":

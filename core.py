@@ -97,12 +97,13 @@ def _need(job_id):
     return s
 
 
-def launch(script, args, src, kind, *, initial_state=None):
+def launch(script, args, src, kind, *, initial_state=None, job_id=None):
     """Запускает фоновый процесс-задачу (worker.py и др.), возвращает job_id."""
-    job_id = time.strftime("%Y%m%d-%H%M%S-") + kind[0] + uuid.uuid4().hex[:5]
+    job_id = job_id or time.strftime("%Y%m%d-%H%M%S-") + kind[0] + uuid.uuid4().hex[:5]
     status = JOBS / f"{job_id}.json"
-    status.write_text(json.dumps({**(initial_state or {}), "state": "queued", "kind": kind, "file": str(src)}, ensure_ascii=False),
-                      encoding="utf-8")
+    with status.open("x", encoding="utf-8") as stream:
+        json.dump({**(initial_state or {}), "state": "queued", "kind": kind, "file": str(src)},
+                  stream, ensure_ascii=False)
     cmd = [sys.executable, str(HERE / script), str(src), "--status", str(status), *args]
     log = open(JOBS / f"{job_id}.log", "w", encoding="utf-8")
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
@@ -139,7 +140,8 @@ def cancel_job(job_id):
 
 
 def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path="", tag="", voices=True,
-                        names="", whisper="", whisper_max_repeat=-1, group=""):
+                        names="", whisper="", whisper_max_repeat=-1, group="", *,
+                        workflow_job_id=None, workflow_context=None, workflow_request_id=None):
     src = Path(audio_path).expanduser()
     if not src.exists():
         raise CoreError(f"Файл не найден: {src}")
@@ -154,7 +156,10 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
         try:
             store = recordings.open_store()
             try:
-                initial_state = {"recording_context": recordings.operation_context(store, "model")}
+                store.current_identity()
+                initial_state = {"recording_context": workflow_context or recordings.operation_context(store, "model")}
+                if workflow_request_id is not None:
+                    initial_state["workflow_request_id"] = workflow_request_id
             finally:
                 store.close()
         except (OSError, storage.StorageError) as ex:
@@ -178,7 +183,11 @@ def start_transcription(audio_path, num_speakers=0, emotions=True, vocab_path=""
     if names_list:
         args += ["--names", ",".join(names_list)]
     if initial_state is not None:
-        job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state)
+        if workflow_job_id is None:
+            job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state)
+        else:
+            job_id = launch("worker.py", args, src, "transcribe", initial_state=initial_state,
+                            job_id=workflow_job_id)
     else:
         job_id = launch("worker.py", args, src, "transcribe")
     return {"job_id": job_id, "file": str(src)}
@@ -192,6 +201,312 @@ def start_benchmark(audio_path, seconds=180, only="", chunk_max=20.0, min_simila
     if min_similarity is not None and float(min_similarity) > 0:
         args += ["--min-similarity", str(min_similarity)]
     return {"job_id": launch("bench.py", args, src, "benchmark")}
+
+
+def start_workflow(audio_path, policy=None):
+    """Создать сохранённый запрос и один раз запустить SQLite-worker без обучения голосов."""
+    import recordings
+    import workflow
+    if settings.recording_backend() != "sqlite":
+        raise CoreError("Для сохранённого процесса требуется явно выбранный SQLite backend")
+    store = recordings.open_store()
+    try:
+        request_id = workflow.create(store, audio_path, policy)
+        job_id = workflow.claim_start(store, request_id)
+        request = workflow.get(store, request_id)
+        try:
+            start_transcription(request["source"], voices=False, workflow_job_id=job_id,
+                                workflow_context=request["context"], workflow_request_id=request_id)
+        except Exception:
+            with store._transaction():
+                store.db.execute("UPDATE workflow_requests SET state='interrupted', updated_at=? WHERE request_id=?",
+                                 (__import__("storage")._now(), request_id))
+            return {"request_id": request_id, "job_id": job_id, "state": "interrupted",
+                    "note": "Исход запуска неизвестен; автоматический повтор отключён."}
+        return {"request_id": request_id, "job_id": job_id}
+    finally:
+        store.close()
+
+
+def workflow_status(request_id):
+    import documents
+    import product_policy
+    import recordings
+    import storage
+    import workflow
+    store = recordings.open_store()
+    try:
+        request = workflow.get(store, request_id)
+        if request["state"] in ("starting", "running", "interrupted") and request["job_id"]:
+            request = workflow.observe(store, request_id, job_status(request["job_id"]))
+        recording_id = request["recording_id"]
+        sync, unresolved, incomplete, has_conspect, unnamed = "not_started", 0, False, False, 1
+        source_revision, review_revision, human_verification = None, None, "none"
+        if recording_id:
+            current = store.get_current(recording_id)
+            source_revision, review_revision = current["transcript"]["revision"], current["review"]["revision"]
+            if store.db.execute(
+                    "SELECT 1 FROM workflow_verifications WHERE request_id=? AND recording_id=? "
+                    "AND source_revision=? AND review_revision=? LIMIT 1",
+                    (request_id, recording_id, source_revision, review_revision)).fetchone():
+                human_verification = "confirmed"
+            review = current["review"]["payload"]
+            unresolved = sum(1 for item in (review.get("review") or [])
+                             if item.get("status", "open") in ("open", "human"))
+            quality = current["transcript"]["payload"].get("quality") or {}
+            diagnostics = quality.get("asr_diagnostics")
+            incomplete = bool(quality.get("asr_incomplete_chunks")) or not isinstance(diagnostics, dict) or not diagnostics
+            if isinstance(diagnostics, dict):
+                incomplete = incomplete or any(
+                    chunk.get("state") in ("error", "empty_unknown") or chunk.get("filtered_all")
+                    for stage in diagnostics.values() if isinstance(stage, dict)
+                    for chunk in (stage.get("chunks") or []) if isinstance(chunk, dict))
+            transcript_snapshot = current["transcript"]["payload"]
+            segments = transcript_snapshot.get("segments") or []
+            names = transcript_snapshot.get("speaker_names") or {}
+            labels = {segment.get("label", segment.get("speaker")) for segment in segments}
+            unnamed = (sum(1 for label in labels if not label or not names.get(label)
+                           or names[label] == label) if labels and transcript_snapshot.get("names_confirmed") else 1)
+            row = store.db.execute("SELECT state FROM document_outbox WHERE recording_id=? "
+                                   "ORDER BY document_revision DESC LIMIT 1", (recording_id,)).fetchone()
+            sync = row["state"] if row else "not_started"
+            if sync == "synced":
+                binding = recordings.document_binding(store, recording_id)
+                verified = documents.verify_files(store, binding["root_id"], binding["root"])
+                entries = [entry for entry in verified["entries"]
+                           if entry["recording_id"] == recording_id and entry["kind"] in ("md", "json", "manifest")]
+                if len(entries) != 3 or any(entry["status"] != "ok" for entry in entries):
+                    sync = "error"
+            if request["model_result"] is not None and request["model_task"] is not None:
+                conspect_id = str(uuid.uuid5(uuid.UUID(recording_id), "conspect:workflow-" + request_id))
+                row = store.db.execute(
+                    "SELECT c.current_revision, r.source_revision, o.state FROM conspects c "
+                    "JOIN conspect_revisions r ON r.conspect_id=c.conspect_id AND r.revision=c.current_revision "
+                    "JOIN conspect_outbox o ON o.conspect_id=r.conspect_id AND o.revision=r.revision "
+                    "WHERE c.conspect_id=?", (conspect_id,)).fetchone()
+                has_conspect = bool(row and row["source_revision"] == current["transcript"]["revision"]
+                                    and request["model_task"]["review_revision"] == current["review"]["revision"]
+                                    and request["model_task"]["goal"] == request["policy"]["goal"])
+                if row and row["state"] != "synced":
+                    sync = row["state"]
+                elif row:
+                    locations = store.db.execute(
+                        "SELECT f.relative_path, f.confirmed_hash, r.path FROM conspect_file_locations f "
+                        "JOIN allowed_roots r USING(root_id) WHERE f.conspect_id=?", (conspect_id,)).fetchall()
+                    try:
+                        if len(locations) != 2:
+                            sync = "error"
+                        else:
+                            for location in locations:
+                                target, exists = documents._read_only_target(
+                                    Path(location["path"]), location["relative_path"])
+                                if not exists or documents._file_digest(target)[0] != location["confirmed_hash"]:
+                                    sync = "error"
+                    except (OSError, ValueError):
+                        sync = "error"
+        execution = {"starting": "running", "processed": "completed",
+                     "model_received": "waiting_model"}.get(request["state"], request["state"])
+        if execution == "processed":
+            execution = "completed"
+        if request["policy"]["require_conspect"] and not has_conspect and execution == "completed":
+            execution = "waiting_model"
+        readiness = product_policy.evaluate(request["policy"], execution=execution, document_sync=sync,
+                                            unresolved=unresolved, unnamed_speakers=unnamed,
+                                            incomplete=incomplete, conspect=has_conspect,
+                                            human_verification=human_verification)
+        assessment = {"policy_revision": request["policy_revision"], "recording_id": recording_id,
+                      "source_revision": source_revision, "review_revision": review_revision,
+                      "readiness": readiness}
+        with store._transaction():
+            store.current_identity()
+            policy_head = store.db.execute("SELECT policy_revision FROM workflow_requests WHERE request_id=?",
+                                           (request_id,)).fetchone()
+            if policy_head is None or policy_head["policy_revision"] != request["policy_revision"]:
+                raise storage.Conflict("политика изменилась во время оценки")
+            if recording_id:
+                head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
+                                        (recording_id,)).fetchone()
+                if (head is None or head["source_revision"] != source_revision
+                        or head["review_revision"] != review_revision):
+                    raise storage.Conflict("состояние записи изменилось во время оценки")
+            store.db.execute("INSERT OR IGNORE INTO workflow_assessments VALUES (?, ?, ?, ?)",
+                             (request_id, storage._hash(assessment), storage._json(assessment), storage._now()))
+        public_request = dict(request)
+        public_request["model_task"] = bool(request["model_task"])
+        public_request["model_result"] = bool(request["model_result"])
+        public_request["model_failure"] = None
+        if request["model_task"] and request["state"] == "failed":
+            failure = store.db.execute(
+                "SELECT s.result_json FROM workflow_steps s JOIN workflow_runs r USING(run_id) "
+                "WHERE r.request_id=? AND r.kind='model' AND s.state='failed' "
+                "ORDER BY s.updated_at DESC LIMIT 1", (request_id,)).fetchone()
+            if failure and failure["result_json"]:
+                details = storage._loads(failure["result_json"])
+                if isinstance(details, dict):
+                    public_request["model_failure"] = {
+                        "code": details.get("error_code", "model_failed"),
+                        "message": details.get("message", "модельный шаг завершился с ошибкой"),
+                    }
+        return {"request": public_request, "readiness": readiness}
+    finally:
+        store.close()
+
+
+def workflow_model_task(request_id, offset=0, limit=1000):
+    import recordings
+    import workflow
+    if (type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 2000):
+        raise ValueError("неверные границы страницы")
+    store = recordings.open_store()
+    try:
+        task = workflow.prepare_model_task(store, request_id)
+        total = len(task["words"])
+        return {**task, "words": task["words"][offset:offset + limit], "offset": offset,
+                "total_words": total, "next_offset": offset + limit if offset + limit < total else None}
+    finally:
+        store.close()
+
+
+def workflow_model_result(request_id, result):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.accept_model_result(store, request_id, result)
+    finally:
+        store.close()
+
+
+def workflow_model_part(request_id, part_index):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.model_part(store, request_id, part_index)
+    finally:
+        store.close()
+
+
+def workflow_model_part_result(request_id, part_index, result):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.accept_model_part(store, request_id, part_index, result)
+    finally:
+        store.close()
+
+
+def workflow_execute_model(request_id, *, retry_failed=False):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.execute_model(store, request_id, retry_failed=retry_failed)
+    finally:
+        store.close()
+
+
+def workflow_change_policy(request_id, policy, expected_revision):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return {"policy_revision": workflow.change_policy(store, request_id, policy, expected_revision)}
+    finally:
+        store.close()
+
+
+def workflow_questions(request_id):
+    """Показать ограниченный пакет добровольных уточнений без автоматического ответа."""
+    import recordings
+    import storage
+    import workflow
+    store = recordings.open_store()
+    try:
+        request = workflow.get(store, request_id)
+        budget = request["policy"]["question_budget"]
+        if not request["recording_id"] or not budget:
+            return {"questions": [], "budget": budget, "recording_id": request["recording_id"]}
+        current = store.get_current(request["recording_id"])
+        items = [item for item in (current["review"]["payload"].get("review") or [])
+                 if item.get("status", "open") in ("open", "human") and isinstance(item.get("id"), str)]
+        with store._transaction():
+            store.current_identity()
+            head = store.db.execute("SELECT source_revision, review_revision FROM recordings WHERE recording_id=?",
+                                    (request["recording_id"],)).fetchone()
+            policy_head = store.db.execute("SELECT policy_revision FROM workflow_requests WHERE request_id=?",
+                                           (request_id,)).fetchone()
+            if (head["source_revision"] != current["transcript"]["revision"]
+                    or head["review_revision"] != current["review"]["revision"]
+                    or policy_head["policy_revision"] != request["policy_revision"]):
+                raise storage.Conflict("запись или политика изменились")
+            slots = store.db.execute("SELECT slot, question_id FROM workflow_question_slots "
+                                     "WHERE request_id=? ORDER BY slot", (request_id,)).fetchall()
+            seen = {slot["question_id"] for slot in slots}
+            next_slot = max((slot["slot"] for slot in slots), default=0)
+            for item in items:
+                if next_slot >= budget:
+                    break
+                if item["id"] not in seen:
+                    next_slot += 1
+                    store.db.execute("INSERT INTO workflow_question_slots VALUES (?, ?, ?, ?)",
+                                     (request_id, next_slot, item["id"], storage._now()))
+                    seen.add(item["id"])
+            slots = store.db.execute("SELECT question_id FROM workflow_question_slots "
+                                     "WHERE request_id=? AND slot<=? ORDER BY slot",
+                                     (request_id, budget)).fetchall()
+        by_id = {item["id"]: item for item in items}
+        selected = [by_id[slot["question_id"]] for slot in slots if slot["question_id"] in by_id]
+        questions = [{"id": item.get("id"), "question": "Проверьте текст и говорящего в этом месте.",
+                      "text": item.get("text"), "t1": item.get("t1"), "t2": item.get("t2"),
+                      "word_ids": item.get("word_ids") or []} for item in selected]
+        return {"recording_id": request["recording_id"], "source_revision": current["transcript"]["revision"],
+                "review_revision": current["review"]["revision"], "budget": budget,
+                "questions": questions, "remaining": max(0, len(items) - len(questions)),
+                "note": "Ответы человека обрабатываются отдельно через существующий интерфейс разбора."}
+    finally:
+        store.close()
+
+
+def workflow_verification_snapshot(request_id):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.verification_snapshot(store, request_id)
+    finally:
+        store.close()
+
+
+def workflow_confirm_verification(snapshot):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.confirm_verification(store, snapshot)
+    finally:
+        store.close()
+
+
+def workflow_abandon_snapshot(request_id):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.abandon_snapshot(store, request_id)
+    finally:
+        store.close()
+
+
+def workflow_abandon(snapshot):
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        return workflow.abandon(store, snapshot)
+    finally:
+        store.close()
 
 
 def live(s, job_id):

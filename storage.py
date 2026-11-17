@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TRANSCRIPT_FIELDS = frozenset(("file", "duration", "speakers", "speaker_names",
                                "names_source", "names_confirmed", "segments",
                                "quality", "edits", "vocab_suggestions", "title", "recorded_at", "recorded_timezone",
@@ -419,6 +419,43 @@ def _initialize_at(path, initial_display_name=None):
             observed_bytes BLOB, observed_hash TEXT NOT NULL, observed_size INTEGER NOT NULL,
             resolution_operation_id TEXT REFERENCES operations(operation_id),
             FOREIGN KEY(conspect_id, revision) REFERENCES conspect_outbox(conspect_id, revision));
+        CREATE TABLE workflow_requests (
+            request_id TEXT PRIMARY KEY, source TEXT NOT NULL, policy_json TEXT NOT NULL,
+            context_json TEXT NOT NULL, state TEXT NOT NULL, job_id TEXT UNIQUE,
+            recording_id TEXT REFERENCES recordings(recording_id), model_task_json TEXT,
+            model_result_json TEXT, model_attempts INTEGER NOT NULL DEFAULT 0,
+            policy_revision INTEGER NOT NULL DEFAULT 1, model_run_id TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE workflow_policy_versions (
+            request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+            revision INTEGER NOT NULL, policy_json TEXT NOT NULL, context_json TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(request_id, revision));
+        CREATE TABLE workflow_assessments (
+            request_id TEXT NOT NULL REFERENCES workflow_requests(request_id), assessment_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(request_id, assessment_hash));
+        CREATE TABLE workflow_verifications (
+            verification_id TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+            recording_id TEXT NOT NULL REFERENCES recordings(recording_id), source_revision INTEGER NOT NULL,
+            review_revision INTEGER NOT NULL, context_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(recording_id, source_revision) REFERENCES transcript_revisions(recording_id, revision),
+            FOREIGN KEY(recording_id, review_revision) REFERENCES review_revisions(recording_id, revision));
+        CREATE TABLE workflow_model_parts (
+            request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+            task_hash TEXT NOT NULL, part_index INTEGER NOT NULL, result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(request_id, task_hash, part_index));
+        CREATE TABLE workflow_question_slots (
+            request_id TEXT NOT NULL REFERENCES workflow_requests(request_id), slot INTEGER NOT NULL,
+            question_id TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(request_id, slot), UNIQUE(request_id, question_id));
+        CREATE TABLE workflow_runs (
+            run_id TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+            kind TEXT NOT NULL, state TEXT NOT NULL, executor TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE workflow_steps (
+            step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES workflow_runs(run_id),
+            kind TEXT NOT NULL, state TEXT NOT NULL, result_json TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(run_id, kind));
         """)
         db.execute("INSERT INTO store_meta VALUES (?, ?)", (str(uuid.uuid4()), SCHEMA_VERSION))
         if initial_display_name is not None:
@@ -462,7 +499,9 @@ def _check_schema(db):
                 "transcript_revisions", "review_revisions", "document_versions", "allowed_roots",
                 "restore_guard", "document_outbox", "document_conflicts", "file_locations",
                 "materialization_events", "conspects", "conspect_revisions", "conspect_outbox",
-                "conspect_file_locations", "conspect_conflicts"}
+                "conspect_file_locations", "conspect_conflicts", "workflow_requests",
+                "workflow_runs", "workflow_steps", "workflow_policy_versions", "workflow_assessments",
+                "workflow_verifications", "workflow_model_parts", "workflow_question_slots"}
     try:
         names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not required <= names:
@@ -489,6 +528,17 @@ def _check_schema(db):
                                         "kind", "confirmed_revision", "confirmed_hash", "generation", "conflict"},
             "conspect_conflicts": {"conflict_id", "conspect_id", "revision", "kind", "relative_path",
                                    "observed_bytes", "observed_hash", "observed_size", "resolution_operation_id"},
+            "workflow_requests": {"request_id", "source", "policy_json", "context_json", "state",
+                                  "job_id", "recording_id", "model_task_json", "model_result_json",
+                                  "model_attempts", "policy_revision", "model_run_id", "created_at", "updated_at"},
+            "workflow_policy_versions": {"request_id", "revision", "policy_json", "context_json", "created_at"},
+            "workflow_assessments": {"request_id", "assessment_hash", "payload_json", "created_at"},
+            "workflow_verifications": {"verification_id", "request_id", "recording_id", "source_revision",
+                                       "review_revision", "context_json", "created_at"},
+            "workflow_model_parts": {"request_id", "task_hash", "part_index", "result_json", "created_at"},
+            "workflow_question_slots": {"request_id", "slot", "question_id", "created_at"},
+            "workflow_runs": {"run_id", "request_id", "kind", "state", "executor", "created_at", "updated_at"},
+            "workflow_steps": {"step_id", "run_id", "kind", "state", "result_json", "created_at", "updated_at"},
         }
         for table, expected in columns.items():
             if not expected <= {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
@@ -703,6 +753,10 @@ class Store:
             target.execute("UPDATE restore_guard SET locked=1 WHERE id=1")
             target.execute("UPDATE allowed_roots SET requires_remap=1")
             target.execute("UPDATE installations SET active=0")
+            target.execute("UPDATE workflow_requests SET state='interrupted', job_id=NULL "
+                           "WHERE state IN ('queued', 'starting', 'running')")
+            target.execute("UPDATE workflow_runs SET state='interrupted' WHERE state IN ('queued', 'running')")
+            target.execute("UPDATE workflow_steps SET state='interrupted' WHERE state IN ('queued', 'running')")
             target.execute("COMMIT")
         except BaseException:
             if target.in_transaction:

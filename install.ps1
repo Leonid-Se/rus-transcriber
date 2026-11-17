@@ -267,7 +267,7 @@ if (-not $DataDir.StartsWith($env:USERPROFILE + "\", [StringComparison]::Ordinal
 
 Step "4/9" "Копирование файлов программы"
 if ($Source -ne $Target) {
-    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "download_hint.py", "transcript.py",
+    foreach ($f in @("server.py", "worker.py", "bench.py", "backends.py", "paths.py", "recordings.py", "storage.py", "documents.py", "workflow.py", "product_policy.py", "model_tasks.py", "llm_provider.py", "download_hint.py", "transcript.py",
                      "diar_fast.py", "vocab.py", "voices.py", "gender.py", "words.py", "quotes.py", "conspect.py",
                      "review_pack.py", "freeform.py", "jobslots.py", "settings.py", "migrate.py", "data_io.py", "core.py", "confirm.py", "tmpfiles.py", "selfcheck.py", "rt.py", "voice_io.py", "voice_review.py", "review_page.py", "cards.html", "README.md", "install.ps1")) {
         Copy-Item (Join-Path $Source $f) (Join-Path $Target $f) -Force
@@ -275,6 +275,8 @@ if ($Source -ne $Target) {
     $docsTarget = Join-Path $Target "docs"
     New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
     Copy-Item (Join-Path $Source "docs\model-download-certificate.md") (Join-Path $docsTarget "model-download-certificate.md") -Force
+    Copy-Item (Join-Path $Source "docs\2026-11-17-p3-workflow-handoff.md") (Join-Path $docsTarget "2026-11-17-p3-workflow-handoff.md") -Force
+    Copy-Item (Join-Path $Source "docs\2026-11-17-p4-opencode-openai-handoff.md") (Join-Path $docsTarget "2026-11-17-p4-opencode-openai-handoff.md") -Force
     # tools — проверка качества и check_repo.py; tests — для самопроверки (self_check);
     # examples — вымышленный пример группы. Это копии комплекта программы, а личные данные
     # лежат в папке данных, поэтому при обновлении папки заменяются целиком: иначе старые

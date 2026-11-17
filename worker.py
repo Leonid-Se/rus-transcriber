@@ -1239,8 +1239,9 @@ def main():
             if names_outside:
                 quality["names_outside_vocab"] = names_outside
             saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
+            model = _execute_workflow_model(st)
             st.set(state="done", stage="готово", progress=100, markdown=str(md_path), json=str(json_path),
-                   **saved,
+                   **saved, **model,
                    timing=timing, quality={"pipeline": "words", "vocab": quality["vocab"],
                                            "names": data.get("speaker_names") or None,
                                             "review_items": len(data.get("review", [])),
@@ -1363,9 +1364,10 @@ def main():
             data.update(speaker_names={l: label_name[l] for l in labels if l in label_name},
                         names_source="voices", names_confirmed=False)
         saved = _save_worker_result(data, src, st, sqlite_target, json_path, md_path)
+        model = _execute_workflow_model(st)
 
         st.set(state="done", stage="готово", progress=100, markdown=str(md_path),
-               json=str(json_path), **saved, timing=timing,
+               json=str(json_path), **saved, **model, timing=timing,
                quality={"vocab": quality["vocab"], "names": label_name or None,
                         "speaker_fixes": len(quality["speaker_fixes"]),
                         "vocab_fixes": sum(len(v["fixes"]) for v in quality["vocab_fixes"]),
@@ -1384,13 +1386,41 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
     import recordings
     store = recordings.open_store()
     try:
-        recording_id, operation_id = str(uuid.uuid4()), str(uuid.uuid4())
+        workflow_request_id = getattr(status, "data", {}).get("workflow_request_id")
+        if workflow_request_id:
+            request_uuid = uuid.UUID(workflow_request_id)
+            recording_id = str(uuid.uuid5(request_uuid, "worker-recording"))
+            operation_id = str(uuid.uuid5(request_uuid, "worker-result"))
+        else:
+            recording_id, operation_id = str(uuid.uuid4()), str(uuid.uuid4())
         context = sqlite_target["context"]
-        result = recordings.commit_worker_result(
-            store, data, src, sqlite_target["root_id"], context,
-            recording_id=recording_id, operation_id=operation_id,
-            generated_at=datetime.now(timezone.utc).isoformat(),
-            document_paths=sqlite_target["paths"])
+        with store._transaction():
+            if workflow_request_id:
+                import storage
+                row = store.db.execute(
+                    "SELECT source, context_json, state, recording_id FROM workflow_requests WHERE request_id=?",
+                    (workflow_request_id,)).fetchone()
+                if (row is None or row["state"] not in ("starting", "running", "interrupted")
+                        or row["recording_id"] is not None
+                        or storage._loads(row["context_json"]) != context
+                        or recordings.normalize_location(row["source"]) != recordings.normalize_location(src)):
+                    raise RuntimeError("workflow request no longer permits this worker result")
+            result = recordings.commit_worker_result(
+                store, data, src, sqlite_target["root_id"], context,
+                recording_id=recording_id, operation_id=operation_id,
+                generated_at=datetime.now(timezone.utc).isoformat(),
+                document_paths=sqlite_target["paths"])
+            if workflow_request_id:
+                now = storage._now()
+                store.db.execute("UPDATE workflow_requests SET recording_id=?, state='processed', updated_at=? "
+                                 "WHERE request_id=?", (recording_id, now, workflow_request_id))
+                store.db.execute("UPDATE workflow_runs SET state='completed', updated_at=? "
+                                 "WHERE request_id=? AND kind='asr' AND state='running'",
+                                 (now, workflow_request_id))
+                store.db.execute("UPDATE workflow_steps SET state='completed', result_json=?, updated_at=? "
+                                 "WHERE run_id IN (SELECT run_id FROM workflow_runs "
+                                 "WHERE request_id=? AND kind='asr') AND state='running'",
+                                 (storage._json({"recording_id": recording_id}), now, workflow_request_id))
         status.set(recording_id=recording_id, source_revision=result["source_revision"],
                    review_revision=result["review_revision"], document_revision=result["document_revision"],
                    document_sync=result["document_sync"])
@@ -1400,6 +1430,30 @@ def _save_worker_result(data, src, status, sqlite_target, json_path, md_path):
         return {"recording_id": recording_id, "source_revision": result["source_revision"],
                 "review_revision": result["review_revision"], "document_revision": result["document_revision"],
                 "document_sync": "synced"}
+    finally:
+        store.close()
+
+
+def _execute_workflow_model(status):
+    """После commit ASR выполнить заказанный конспект; ошибки не скрывают готовую стенограмму."""
+    request_id = getattr(status, "data", {}).get("workflow_request_id")
+    if not request_id:
+        return {}
+    import llm_provider
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        request = workflow.get(store, request_id)
+        if not request["policy"]["require_conspect"]:
+            return {}
+        if not request["policy"]["allow_cloud_model"]:
+            return {"model_state": "waiting_model", "model_error": "облачный исполнитель запрещён политикой"}
+        try:
+            result = workflow.execute_model(store, request_id)
+            return {"model_state": result["state"], "model": result["model"]}
+        except llm_provider.ProviderError as ex:
+            return {"model_state": "failed", "model_error": str(ex)}
     finally:
         store.close()
 

@@ -40,8 +40,15 @@ except Exception as _ex:   # старт сервера из-за этого не
     print(f"миграция данных не выполнена: {_ex}", file=sys.stderr)
 
 INSTRUCTIONS = """\
-rus-transcriber: расшифровка русской речи (в том числе детских разговоров) на этом компьютере. Модели считаются
-локально; в разговор попадает только то, что вы прочитаете инструментами. Рабочий процесс:
+rus-transcriber: расшифровка речи на этом компьютере. При заказанном конспекте П4 автоматически отправляет
+только текст слов, их ID/признаки сомнений, цель и ревизии в OpenAI GPT-6 Luna через OpenCode. Аудио,
+биометрия, пути и журналы не передаются. Ответ остаётся модельным предложением и проходит локальную проверку;
+он не является подтверждением человека. Рабочий процесс:
+
+П3/P4: start_workflow → workflow_status. При заказанном конспекте и allow_cloud_model=true текст слов
+будет передан OpenAI согласно разрешению владельца. Облачный вызов можно запретить в политике запроса.
+Не пытайтесь заменять модельный ответ или подтверждать его от имени человека.
+Реальные и старые данные не подключать до П5 и отдельной миграции.
 
 1. Запуск: start_transcription(audio_path, names="Анна, Борис", group="…"). names — участники записи, если известны
    (голоса ищутся только среди них); num_speakers — только если число голосов известно точно; group нужен, когда в
@@ -74,7 +81,7 @@ rus-transcriber: расшифровка русской речи (в том чи�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.17.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.17.4"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -82,17 +89,21 @@ except TypeError:   # mcp 1.x: параметра version нет
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS)
 
 
-async def _gated(action, args, lines_fn, run_fn):
+async def _gated(action, args, lines_fn, run_fn, *, require_human=False):
     """Выполняет run_fn; опасное действие (action не None) — только после подтверждения человеком (confirm.py).
     Всё блокирующее (окно подтверждения, работа с файлами) идёт в потоке, чтобы не задерживать другие вызовы."""
     def work():
         try:
             if action:
-                confirm.require(action, args, lines_fn())
+                method = confirm.require(action, args, lines_fn())
+                if require_human and method not in ("dialog", "terminal"):
+                    raise confirm.NotConfirmed("Требуется подтверждение человека; без него действие не выполнено.")
             return json.dumps(run_fn(), ensure_ascii=False, indent=1)
         except confirm.NotConfirmed as ex:
             return str(ex)
         except core.CoreError as ex:
+            return f"Ошибка: {ex}"
+        except (storage.StorageError, ValueError, KeyError, OSError) as ex:
             return f"Ошибка: {ex}"
     return await asyncio.to_thread(work)
 
@@ -122,6 +133,136 @@ def make_conspect(job_id: str, focus: str = "") -> str:
     f = f" Акцент: {focus}." if focus else ""
     return (f"Напиши конспект расшифровки {job_id}.{f} Читай read_transcript(job_id) частями. Цитаты «…» бери "
             "только из стенограммы и не из мест ⟦…⟧. Проверь check_quotes, затем conspect_link и conspect_render.")
+
+
+@mcp.tool()
+def start_workflow(audio_path: str, require_conspect: bool = False,
+                   allow_cloud_model: bool = True,
+                   require_named_speakers: bool = False, require_human_verification: bool = False,
+                   participation: str = "simple", goal: str = "", question_budget: int = 0) -> str:
+    """Начать процесс на новой SQLite-схеме; заказанный конспект передаёт текст OpenAI, если облако разрешено."""
+    try:
+        result = core.start_workflow(audio_path, {
+            "require_conspect": require_conspect,
+            "allow_cloud_model": allow_cloud_model,
+            "require_named_speakers": require_named_speakers,
+            "require_human_verification": require_human_verification,
+            "participation": participation, "goal": goal, "question_budget": question_budget,
+        })
+        return json.dumps(result, ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_status(request_id: str) -> str:
+    """Состояние сохранённого запроса и отдельные ограничения готовности."""
+    try:
+        return json.dumps(core.workflow_status(request_id), ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000) -> str:
+    """Получить страницу задания. Прочитайте все страницы до next_offset=null."""
+    try:
+        return json.dumps(core.workflow_model_task(request_id, offset, limit), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_questions(request_id: str) -> str:
+    """Ограниченный политикой список добровольных уточнений; не выбирает ответы."""
+    try:
+        return json.dumps(core.workflow_questions(request_id), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def workflow_abandon_request(request_id: str) -> str:
+    """Отказаться от незавершённого запуска с неизвестным исходом после подтверждения человеком."""
+    try:
+        snapshot = core.workflow_abandon_snapshot(request_id)
+        if confirm.mode() == "off":
+            return "Ошибка: для отказа от результата требуется подтверждение человека"
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+    return await _gated(
+        "Отказ от незавершённого запуска", snapshot,
+        lambda: [f"Источник: {snapshot['source']}", f"Задача: {snapshot['job_id']}",
+                 "Результат старого запуска больше нельзя будет сохранить.",
+                 "Процесс не останавливается; для новой попытки потребуется новый запрос."],
+        lambda: core.workflow_abandon(snapshot), require_human=True)
+
+
+@mcp.tool()
+async def workflow_mark_reviewed(request_id: str) -> str:
+    """Отдельно подтвердить, что человек проверил всю текущую стенограмму."""
+    try:
+        snapshot = core.workflow_verification_snapshot(request_id)
+        if confirm.mode() == "off":
+            return "Ошибка: для подтверждения проверки нужен канал подтверждения человека"
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+    return await _gated(
+        "Подтверждение проверки стенограммы", snapshot,
+        lambda: [f"Стенограмма: {snapshot['document']}",
+                 f"Ревизия: {snapshot['source_revision']}; ревизия разбора: {snapshot['review_revision']}",
+                 "Подтвердите только если самостоятельно проверили всю стенограмму.",
+                 "Это не подтверждение конспекта или точности модели."],
+        lambda: core.workflow_confirm_verification(snapshot), require_human=True)
+
+
+@mcp.tool()
+def workflow_change_policy(request_id: str, policy: dict, expected_revision: int) -> str:
+    """Изменить требования с сохранением предыдущей политики, без повторного ASR."""
+    try:
+        return json.dumps(core.workflow_change_policy(request_id, policy, expected_revision), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_execute_model(request_id: str, retry_failed: bool = False) -> str:
+    """Продолжить автономное модельное задание без повторного распознавания."""
+    import llm_provider
+    try:
+        return json.dumps(core.workflow_execute_model(request_id, retry_failed=retry_failed),
+                          ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+    except llm_provider.ProviderError as ex:
+        return json.dumps({"error_code": ex.code, "error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_model_part(request_id: str, part_index: int) -> str:
+    """Получить один блок длинной стенограммы, не более 500 слов."""
+    try:
+        return json.dumps(core.workflow_model_part(request_id, part_index), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_model_part_result(request_id: str, part_index: int, result: dict) -> str:
+    """Сохранить модельный ответ на блок; документ создаётся после получения всех блоков."""
+    try:
+        return json.dumps(core.workflow_model_part_result(request_id, part_index, result), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_model_result(request_id: str, result: dict) -> str:
+    """Передать модельный ответ; он не становится подтверждением человека."""
+    try:
+        return json.dumps(core.workflow_model_result(request_id, result), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
 
 
 @mcp.tool()

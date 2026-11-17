@@ -68,7 +68,8 @@
 - Workflow и проверки П3: [`2026-11-17-p3-workflow-handoff.md`](2026-11-17-p3-workflow-handoff.md).
 - Облачный исполнитель П4: [`2026-11-17-p4-opencode-openai-handoff.md`](2026-11-17-p4-opencode-openai-handoff.md).
 - Локальный экран и эксплуатация П5: [`2026-11-17-p5-screen-handoff.md`](2026-11-17-p5-screen-handoff.md).
-- Промежуточная техническая приёмка П6: [`2026-11-17-p6-technical-acceptance.md`](2026-11-17-p6-technical-acceptance.md).
+- Техническая приёмка П6 закрыта в согласованном объёме; границы выводов и
+  дальнейшие исследования: [`2026-11-17-p6-technical-acceptance.md`](2026-11-17-p6-technical-acceptance.md).
 
 Подробные исторические основания и исходные проверки сохранены в
 [`history/development-legacy/`](history/development-legacy/README.md).

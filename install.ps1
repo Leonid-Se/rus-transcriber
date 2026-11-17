@@ -12,6 +12,11 @@
       папка личных данных (голосовые профили, словари групп, настройки, задачи): по умолчанию
       %APPDATA%\rus-transcriber-data; путь записывается в настройки сервера (RUS_TRANSCRIBER_DATA)
 
+  powershell -ExecutionPolicy Bypass -File .\install.ps1 -AcceptanceCopyOnly -Target <sandbox>\program
+      -DataDir <sandbox>\data -SkipClaudeConfig
+      только копирование runtime-файлов для локальной приёмки; требует
+      RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1 и пути внутри %LOCALAPPDATA%\Temp\opencode\stage6-acceptance.
+
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
       убирает сервер из настроек приложения ИИ-агента (например, Claude Desktop);
       отдельно спрашивает: удалить папку программы с моделями и кэшами
@@ -24,6 +29,7 @@ param(
     [string]$DataDir = "",
     [string]$Token = "",
     [switch]$SkipClaudeConfig,
+    [switch]$AcceptanceCopyOnly,
     [switch]$Uninstall
 )
 $ErrorActionPreference = "Continue"
@@ -44,6 +50,16 @@ function Check-Pip($what) {
 function Step($n, $msg) { Write-Host "`n[$n] $msg" -ForegroundColor Cyan }
 function HasNonAscii($s) { return $s -match '[^\x00-\x7F]' }
 function WriteUtf8NoBom($path, $text) { [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false)) }
+
+if ($AcceptanceCopyOnly) {
+    if ($Uninstall) { Fail "-AcceptanceCopyOnly нельзя сочетать с -Uninstall." }
+    if (-not $Target -or -not $DataDir -or -not $SkipClaudeConfig) {
+        Fail "-AcceptanceCopyOnly требует явные -Target, -DataDir и -SkipClaudeConfig."
+    }
+    if ($env:RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX -ne "1") {
+        Fail "Для режима приёмки задайте RUS_TRANSCRIBER_ACCEPTANCE_SANDBOX=1."
+    }
+}
 
 # Добавляет в PATH текущего окна пути, появившиеся после установки winget-пакетов
 # (реестр Machine/User и папка ссылок на portable-пакеты). Позволяет не требовать
@@ -132,6 +148,26 @@ $DataDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPa
 if ($DataDir -eq $Target -or $DataDir.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
     Fail "Папка данных ($DataDir) не может лежать внутри папки программы ($Target): при обновлении она бы потерялась. Укажите другую через -DataDir."
 }
+if ($AcceptanceCopyOnly) {
+    $acceptanceRoot = [IO.Path]::GetFullPath(
+        (Join-Path $env:LOCALAPPDATA "Temp\opencode\stage6-acceptance")).TrimEnd("\")
+    $acceptancePrefix = $acceptanceRoot + "\"
+    foreach ($path in @($Target, $DataDir)) {
+        if (-not $path.StartsWith($acceptancePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail "-AcceptanceCopyOnly разрешён только внутри $acceptanceRoot."
+        }
+        if (Test-Path $path -PathType Container) {
+            $item = Get-Item $path -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                Fail "-AcceptanceCopyOnly не принимает ссылки/reparse-папки: $path"
+            }
+        }
+    }
+    if ($Target.StartsWith($DataDir + "\", [StringComparison]::OrdinalIgnoreCase) -or
+        $DataDir.StartsWith($Target + "\", [StringComparison]::OrdinalIgnoreCase)) {
+        Fail "Папки program и data в режиме приёмки должны быть раздельными."
+    }
+}
 
 # ================================ УДАЛЕНИЕ ================================
 if ($Uninstall) {
@@ -161,6 +197,10 @@ if ($Uninstall) {
 # ================================ УСТАНОВКА ================================
 Write-Host "Установка $Name в: $Target" -ForegroundColor Green
 
+$insideProfile = $Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)
+if ($AcceptanceCopyOnly) {
+    Write-Host "  режим приёмки: проверки места, Python и ffmpeg пропущены"
+} else {
 Step "1/9" "Проверка места установки"
 if (HasNonAscii $Target) {
     Fail ("В пути есть кириллица или другие не-латинские символы: $Target`n" +
@@ -172,7 +212,6 @@ foreach ($od in @($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial)
         Fail "Папка внутри OneDrive ($od). Синхронизация сломает окружение Python. Выберите другое место."
     }
 }
-$insideProfile = $Target.StartsWith($env:USERPROFILE + "\", [StringComparison]::OrdinalIgnoreCase)
 $drive = (Split-Path -Qualifier $Target) + "\"
 $free = (Get-PSDrive ($drive.Substring(0,1))).Free / 1GB
 Write-Host ("  свободно на {0} {1:N1} ГБ (нужно около 8)" -f $drive, $free)
@@ -239,6 +278,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
               "Перезапустите PowerShell и запустите снова:`n" + (Invoke-RerunHint))
     }
     Write-Host "  ffmpeg готов" -ForegroundColor Green
+}
 }
 
 Step "3/9" "Папка программы и права доступа"
@@ -331,6 +371,9 @@ $env:PIP_CACHE_DIR = Join-Path $Target "cache\pip"
 $env:HF_HOME       = Join-Path $Target "cache\huggingface"
 $env:TORCH_HOME    = Join-Path $Target "cache\torch"
 
+if ($AcceptanceCopyOnly) {
+    Write-Host "  режим приёмки: venv, зависимости и HF-проверки пропущены"
+} else {
 Step "5/9" "Виртуальное окружение"
 $py = Join-Path $Target ".venv\Scripts\python.exe"
 if (Test-Path $py) {
@@ -419,6 +462,7 @@ if ($Token) {
 } else {
     Write-Host "  пропущено: допишите HF_TOKEN в настройки приложения ИИ-агента позже (см. README)" -ForegroundColor Yellow
 }
+}
 
 Step "9/9" "Подключение к приложению ИИ-агента (например, Claude Desktop)"
 if ($SkipClaudeConfig) {
@@ -446,6 +490,11 @@ if ($SkipClaudeConfig) {
         else { Fail "Запись в $cp не сохранилась. Пришлите этот файл (без токена) для разбора." }
     }
     Write-Host "  Теперь запустите приложение ИИ-агента (например, Claude Desktop)." -ForegroundColor Yellow
+}
+
+if ($AcceptanceCopyOnly) {
+    Write-Host "Копирование runtime-файлов для приёмки завершено; зависимости и настройки не менялись."
+    exit 0
 }
 
 # старые кэши от первой версии в профиле можно удалить

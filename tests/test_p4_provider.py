@@ -29,6 +29,23 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertNotIn("recording_id", payload["prompt"])
         self.assertIn("Синтетика", payload["prompt"])
         self.assertEqual(call.call_args.args[0], "/api/experimental/generate/text")
+        self.assertEqual(call.call_args.kwargs["timeout"], llm_provider.REQUEST_TIMEOUT_SEC)
+        self.assertEqual(llm_provider.REQUEST_TIMEOUT_SEC, 300)
+
+    def test_request_timeout_is_passed_and_keeps_safe_offline_error(self):
+        client = llm_provider.OpenCodeTextClient()
+        client.base_url = "http://127.0.0.1:12345"
+        client.auth = "Basic synthetic-local-secret"
+        opener = mock.Mock()
+        opener.open.side_effect = TimeoutError()
+
+        with mock.patch("llm_provider.urllib.request.build_opener", return_value=opener):
+            with self.assertRaises(llm_provider.ProviderError) as error:
+                client._request("/api/experimental/generate/text", {"prompt": "synthetic"},
+                                timeout=llm_provider.REQUEST_TIMEOUT_SEC)
+
+        self.assertEqual(error.exception.code, "offline")
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 300)
 
     def test_malformed_model_json_is_returned_for_one_repair(self):
         client = llm_provider.OpenCodeTextClient()

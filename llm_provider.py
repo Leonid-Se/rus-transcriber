@@ -19,7 +19,8 @@ MODEL_ID = "gpt-6-luna"
 MAX_WORDS = 10_000
 MAX_OUTPUT_CHARS = 32_000
 MAX_REPAIR_CONTEXT_CHARS = 12_000
-REQUEST_TIMEOUT_SEC = 90
+# Allow slow bounded JSON generation while retaining a per-call time limit.
+REQUEST_TIMEOUT_SEC = 300
 STARTUP_TIMEOUT_SEC = 20
 
 

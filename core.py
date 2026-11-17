@@ -509,6 +509,259 @@ def workflow_abandon(snapshot):
         store.close()
 
 
+# ---------- П5: локальный экран и эксплуатация ----------
+def workflow_list(limit=20):
+    """Последние сохранённые запросы для локального экрана; без тяжёлых чтений."""
+    import recordings
+    import workflow
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        return workflow.list_recent(store, limit)
+    finally:
+        store.close()
+
+
+def recording_revisions(recording_id, kind):
+    """История ревизий записи (transcript/review) с происхождением; хэши снимков проверяются."""
+    import recordings
+    if kind not in ("transcript", "review"):
+        raise CoreError("некорректный тип ревизии")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        result = []
+        for revision in store.list_revisions(recording_id, kind):
+            data = store.get_revision(recording_id, kind, revision)
+            context = data["context"]
+            item = {"kind": kind, "revision": revision, "restored_from": data["restored_from"],
+                    "actor_kind": context.get("actor_kind"),
+                    "initiated_by": (context.get("initiated_by") or {}).get("user_name_snapshot")}
+            row = store.db.execute("SELECT created_at FROM operations WHERE operation_id=?",
+                                   (data["operation_id"],)).fetchone()
+            item["created_at"] = row["created_at"] if row else None
+            if kind == "review":
+                item["source_revision"] = data["source_revision"]
+            result.append(item)
+        return result
+    finally:
+        store.close()
+
+
+def read_recording_revision(recording_id, kind, revision):
+    """Прочитать сохранённую ревизию для просмотра истории; текущая ревизия не меняется."""
+    import recordings
+    if kind not in ("transcript", "review"):
+        raise CoreError("некорректный тип ревизии")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        data = store.get_revision(recording_id, kind, int(revision))
+        context = data["context"]
+        return {"kind": kind, "revision": data["revision"], "restored_from": data["restored_from"],
+                "payload": data["payload"], "actor_kind": context.get("actor_kind"),
+                "initiated_by": (context.get("initiated_by") or {}).get("user_name_snapshot")}
+    finally:
+        store.close()
+
+
+def recording_conspects(recording_id):
+    """Конспекты записи для локального экрана: имя, ревизии, разделы и пути файлов."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        result = []
+        for item in store.list_conspects(recording_id):
+            root = store.db.execute("SELECT path FROM allowed_roots WHERE root_id=?",
+                                    (item["root_id"],)).fetchone()
+            locations = store.db.execute(
+                "SELECT kind, relative_path FROM conspect_file_locations WHERE conspect_id=?",
+                (item["conspect_id"],)).fetchall()
+            files = {loc["kind"]: str(Path(root["path"]) / loc["relative_path"])
+                     for loc in locations} if root else {}
+            sections = item["payload"].get("sections")
+            result.append({"conspect_id": item["conspect_id"], "name": item["name"],
+                           "current_revision": item["current_revision"],
+                           "source_revision": item["source_revision"],
+                           "sections": sections if isinstance(sections, list) else [],
+                           "files": files})
+        return result
+    finally:
+        store.close()
+
+
+def prepare_restore_snapshot(recording_id, source_revision, review_revision):
+    """Снимок для возврата прежней ревизии парой; подтверждение человека привязано к снимку."""
+    import recordings
+    import storage
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        head = store.db.execute("SELECT source_revision, review_revision FROM recordings "
+                                "WHERE recording_id=?", (recording_id,)).fetchone()
+        if head is None:
+            raise KeyError(recording_id)
+        expected = {"source_revision": head["source_revision"], "review_revision": head["review_revision"]}
+        restored_review = store.get_revision(recording_id, "review", int(review_revision))
+        if restored_review["source_revision"] != int(source_revision):
+            raise storage.Conflict("пара ревизий несовместима")
+        store.get_revision(recording_id, "transcript", int(source_revision))
+        binding = recordings.document_binding(store, recording_id)
+        return {"recording_id": recording_id, "source_revision": int(source_revision),
+                "review_revision": int(review_revision), "expected_versions": expected,
+                "document_revision": binding["document_revision"], "root_id": binding["root_id"],
+                "document": str(binding["root"] / binding["paths"]["md"]),
+                "context": recordings.operation_context(store, "human")}
+    finally:
+        store.close()
+
+
+def restore_recording_revision(snapshot):
+    """Вернуть прежнюю ревизию как новую текущую; история сохраняется, файлы формируются заново."""
+    import recordings
+    if not isinstance(snapshot, dict) or "recording_id" not in snapshot:
+        raise CoreError("неверный снимок возврата")
+    current = prepare_restore_snapshot(snapshot["recording_id"], snapshot["source_revision"],
+                                       snapshot["review_revision"])
+    if current != snapshot:
+        raise CoreError("состояние записи изменилось после запроса возврата")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        result = store.restore_with_document(
+            snapshot["recording_id"], snapshot["source_revision"], snapshot["review_revision"],
+            snapshot["expected_versions"], str(uuid.uuid4()), snapshot["context"],
+            root_id=snapshot["root_id"],
+            generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        completed = recordings.materialize_recording(store, snapshot["recording_id"])
+        result["materialized"] = (snapshot["recording_id"], result["document_revision"]) in completed
+        return result
+    except (OSError, ValueError, KeyError) as ex:
+        raise CoreError(f"возврат не выполнен или формирование не завершено: {ex}") from ex
+    finally:
+        store.close()
+
+
+def preview_conflict(recording_id, conflict_id, kind="document"):
+    """Показать сохранённые внешние байты конфликта документа или конспекта до решения человека."""
+    import recordings
+    import storage
+    storage._uuid(conflict_id)
+    if kind not in ("document", "conspect"):
+        raise CoreError("некорректный тип конфликта")
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        if kind == "document":
+            row = store.db.execute(
+                "SELECT recording_id, kind, relative_path, observed_hash, observed_size, observed_bytes "
+                "FROM document_conflicts WHERE conflict_id=?", (conflict_id,)).fetchone()
+        else:
+            row = store.db.execute(
+                "SELECT c.recording_id, f.kind, f.relative_path, f.observed_hash, f.observed_size, "
+                "f.observed_bytes FROM conspect_conflicts f JOIN conspects c USING(conspect_id) "
+                "WHERE f.conflict_id=?", (conflict_id,)).fetchone()
+        if row is None or row["recording_id"] != recording_id:
+            raise CoreError("конфликт не найден для этой записи")
+        preview = None
+        preserved = row["observed_bytes"] is not None
+        if preserved:
+            text = bytes(row["observed_bytes"]).decode("utf-8", errors="replace")
+            preview = text[:20000]
+        return {"conflict_id": conflict_id, "kind": row["kind"], "relative_path": row["relative_path"],
+                "observed_hash": row["observed_hash"], "observed_size": row["observed_size"],
+                "preserved": preserved, "preview": preview,
+                "truncated": bool(preserved) and row["observed_size"] > 20000}
+    finally:
+        store.close()
+
+
+def backup_store(destination):
+    """Понятная операция резерва состояния: новый неактивный файл БД и отчёт проверки копии."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        report = store.backup(destination)
+        return {"destination": str(destination), "report": report}
+    finally:
+        store.close()
+
+
+def inspect_backup(backup_path):
+    """Прочитать резервную копию только для чтения: корни, пользователи, число записей."""
+    import storage
+    store = storage.open_store_readonly(str(backup_path))
+    try:
+        roots = [dict(row) for row in store.db.execute(
+            "SELECT root_id, path, requires_remap FROM allowed_roots ORDER BY path")]
+        users = [dict(row) for row in store.db.execute(
+            "SELECT user_id, display_name FROM local_users ORDER BY display_name")]
+        recordings_count = store.db.execute("SELECT count(*) FROM recordings").fetchone()[0]
+        return {"path": str(backup_path), "roots": roots, "users": users,
+                "recordings": recordings_count,
+                "restore_guard_locked": bool(store.db.execute(
+                    "SELECT locked FROM restore_guard WHERE id=1").fetchone()[0])}
+    finally:
+        store.close()
+
+
+def restore_from_backup(backup_path, destination, root_mapping, user_id, *, replace=True):
+    """Мастер восстановления: копия резерва получает новые корни и установку, документы
+    формируются в новых корнях из сохранённых bytes. Живая база подменяется только
+    при replace=True, её прежний файл сохраняется рядом; из резерва ничего не удаляется."""
+    import shutil
+    import documents
+    import storage
+    backup = Path(backup_path).expanduser()
+    if not backup.is_file():
+        raise CoreError("файл резерва не найден")
+    destination = Path(destination).expanduser()
+    if destination.exists() and destination.resolve() == backup.resolve():
+        raise CoreError("нельзя восстанавливать поверх самого резерва")
+    if not isinstance(root_mapping, dict) or not root_mapping:
+        raise CoreError("нужно переназначить все документные корни")
+    mapping = {str(key): str(value) for key, value in root_mapping.items()}
+    for root_id, path in mapping.items():
+        if not Path(path).is_dir():
+            raise CoreError(f"путь документного корня не существует: {path}")
+    staged = destination.with_name(destination.name + ".incomplete-" + uuid.uuid4().hex)
+    try:
+        shutil.copyfile(backup, staged)
+    except OSError as ex:
+        raise CoreError(f"не удалось скопировать резерв в {staged}: {ex}") from ex
+    try:
+        store = storage.open_store(staged)
+        try:
+            installation_id = str(uuid.uuid4())
+            store.rebind_restored_copy(mapping, installation_id, user_id)
+            materialized = []
+            for root_id, path in mapping.items():
+                materialized.extend(documents.materialize_pending(store, root_id, Path(path)))
+            validation = storage.validate_copy(staged)
+        finally:
+            store.close()
+    except (storage.StorageError, ValueError) as ex:
+        raise CoreError(f"восстановление не выполнено; подготовленный файл остался: {staged} "
+                        f"({ex})") from ex
+    previous_saved_as = None
+    if destination.exists():
+        if not replace:
+            raise CoreError(f"файл {destination} уже существует; укажите другой путь")
+        previous_saved_as = str(destination.with_name(
+            destination.name + ".before-restore-" + time.strftime("%Y%m%d-%H%M%S")))
+        shutil.copy2(destination, previous_saved_as)
+    try:
+        os.replace(staged, destination)
+    except OSError as ex:
+        raise CoreError(f"не удалось опубликовать восстановленную базу (возможно, программа "
+                        f"запущена — закройте её и повторите); файл остался: {staged}") from ex
+    return {"destination": str(destination), "installation_id": installation_id,
+            "previous_saved_as": previous_saved_as, "validation": validation,
+            "materialized": materialized}
+
+
 def live(s, job_id):
     """Статус с вычисленным: сколько идёт задача и текущий этап, давно ли обновлялся файл статуса."""
     s = dict(s)

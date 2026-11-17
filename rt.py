@@ -15,7 +15,13 @@
     python rt.py voice-backup [--group ИМЯ]    # открытый резерв профилей в voice-backups
     python rt.py voice-preview ЗАДАЧА [--group ИМЯ]  # --group только при неизвестной группе
     python rt.py voice-update ЗАДАЧА [--group ИМЯ]   # перед запуском спрашивает подтверждение
-    python rt.py self-check [--no-tests]        # тесты, проверка файлов на личные данные, морфология
+    python rt.py screen [--port 8766]          # локальный экран П5 в браузере (запуск, состояние, резерв)
+    python rt.py workflow-list [--limit 20]    # последние запросы workflow
+    python rt.py db-backup НОВЫЙ-ФАЙЛ.sqlite3  # проверенная неактивная копия базы состояния
+    python rt.py db-restore РЕЗЕРВ.sqlite3 [--dest ПУТЬ] [--root ID=ПУТЬ]
+        # мастер восстановления: новые корни и установка, документы формируются заново,
+        # прежняя база сохраняется рядом; спрашивает подтверждение на клавиатуре
+    python rt.py self-check [--no-tests]       # тесты, проверка файлов на личные данные, морфология
 
     Данные (опасные действия: спрашивают согласие на клавиатуре, только в настоящем терминале):
     python rt.py export [--group g] [--dest папка] [--with-jobs]
@@ -35,6 +41,7 @@ from pathlib import Path
 
 import core
 import confirm
+import paths
 
 
 def out(obj):
@@ -72,6 +79,63 @@ def gated(action, lines, run, must_type=None):
         return 2
     out(run())
     return 0
+
+
+def ask(prompt):
+    """Ответ человека в настоящем терминале; без него восстановление не продолжается."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise core.CoreError("мастеру восстановления нужен настоящий терминал")
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        raise core.CoreError("ввод прерван; восстановление не выполнено")
+
+
+def cmd_db_restore(a):
+    """Мастер: резерв → новые корни и установка → проверка → файлы → замена базы."""
+    info = core.inspect_backup(a.backup)
+    say(f"Резерв: {info['path']}; записей: {info['recordings']}; "
+        f"корней: {len(info['roots'])}; пользователей: {len(info['users'])}.")
+    if not info["roots"]:
+        raise core.CoreError("в резерве нет документных корней; восстанавливать нечего")
+    if not info["restore_guard_locked"]:
+        raise core.CoreError("это не подготовленный резерв (копия не помечена как неактивная)")
+    mapping = {}
+    for item in a.root:
+        root_id, _, path = item.partition("=")
+        if not root_id.strip() or not path.strip():
+            raise core.CoreError("формат --root: ID_корня=ПУТЬ")
+        mapping[root_id.strip()] = path.strip()
+    for root in info["roots"]:
+        if root["root_id"] in mapping:
+            continue
+        default = root["path"] + "-restored"
+        answer = ask(f"Новый путь для корня «{root['path']}» (Enter — {default}): ")
+        mapping[root["root_id"]] = answer or default
+    for root_id, path in mapping.items():
+        if not Path(path).is_dir():
+            if ask(f"Папка «{path}» не существует; создать для восстановленных документов? "
+                   f"[да/нет]: ").lower() in ("да", "д", "y", "yes"):
+                Path(path).mkdir(parents=True, exist_ok=True)
+            else:
+                raise core.CoreError("пути документных корней должны существовать")
+    users = info["users"]
+    if len(users) == 1:
+        user_id = users[0]["user_id"]
+    else:
+        for index, user in enumerate(users, 1):
+            say(f"{index}. {user['display_name'] or '(без имени)'}")
+        choice = int(ask("Кому принадлежит восстановленная база? Введите номер: ")) - 1
+        if not 0 <= choice < len(users):
+            raise core.CoreError("некорректный номер пользователя")
+        user_id = users[choice]["user_id"]
+    destination = Path(a.dest) if a.dest else paths.STATE_DB
+    lines = [f"Резерв: {a.backup}", f"Восстановленная база: {destination}",
+             f"Корни документов: " + "; ".join(f"{k} → {v}" for k, v in mapping.items()),
+             "Документы будут сформированы в новых корнях из сохранённых байтов.",
+             "Прежняя база (если есть) будет сохранена рядом, из резерва ничего не удаляется."]
+    return gated("Восстановление базы из резерва", lines,
+                 lambda: core.restore_from_backup(a.backup, destination, mapping, user_id))
 
 
 def cmd_approve(a):
@@ -123,6 +187,9 @@ def build():
     wv = sub.add_parser("workflow-confirm"); wv.add_argument("request")
     wa = sub.add_parser("workflow-abandon"); wa.add_argument("request")
     wq = sub.add_parser("workflow-questions"); wq.add_argument("request")
+    wl = sub.add_parser("workflow-list"); wl.add_argument("--limit", type=int, default=20)
+    sc = sub.add_parser("screen"); sc.add_argument("--port", type=int, default=8766)
+    sc.add_argument("--hours", type=float, default=6.0)
     s = sub.add_parser("status"); s.add_argument("job"); s.add_argument("--wait", type=int, default=0)
     j = sub.add_parser("jobs"); j.add_argument("--limit", type=int, default=10)
     r = sub.add_parser("read"); r.add_argument("job"); r.add_argument("--fmt", default="md", choices=["md", "json"])
@@ -154,6 +221,11 @@ def build():
     vqp.add_argument("--group", default="")
     vrp = sub.add_parser("voice-refresh-plan"); vrp.add_argument("--group", default="")
     vbk = sub.add_parser("voice-backup"); vbk.add_argument("--group", default="")
+    dbk = sub.add_parser("db-backup"); dbk.add_argument("dest")
+    dbr = sub.add_parser("db-restore"); dbr.add_argument("backup")
+    dbr.add_argument("--dest", default="", help="куда восстановить; по умолчанию текущая база состояния")
+    dbr.add_argument("--root", action="append", default=[], metavar="ID=ПУТЬ",
+                     help="новый путь документного корня; недостающие мастер спросит в терминале")
     sc = sub.add_parser("self-check"); sc.add_argument("--no-tests", action="store_true")
     e = sub.add_parser("export"); e.add_argument("--group", default=""); e.add_argument("--dest", default=""); e.add_argument("--with-jobs", action="store_true")
     i = sub.add_parser("import"); i.add_argument("zip"); i.add_argument("--replace", action="store_true"); i.add_argument("--apply", action="store_true")
@@ -189,6 +261,17 @@ def run(a):
                                         a.expected_revision))
     elif c == "workflow-questions":
         out(core.workflow_questions(a.request))
+    elif c == "workflow-list":
+        out(core.workflow_list(a.limit))
+    elif c == "screen":
+        import workflow_page
+        workflow_page.main()
+    elif c == "db-backup":
+        report = core.backup_store(a.dest)
+        print(f"Резерв создан: {report['destination']}; проверка: {report['report'].get('integrity')}. "
+              "Копия неактивна; для использования нужен rebind_restored_copy.")
+    elif c == "db-restore":
+        return cmd_db_restore(a)
     elif c == "workflow-confirm":
         snapshot = core.workflow_verification_snapshot(a.request)
         return gated("Подтверждение проверки стенограммы",

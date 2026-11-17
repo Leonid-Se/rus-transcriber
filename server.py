@@ -48,7 +48,8 @@ rus-transcriber: расшифровка речи на этом компьюте�
 П3/P4: start_workflow → workflow_status. При заказанном конспекте и allow_cloud_model=true текст слов
 будет передан OpenAI согласно разрешению владельца. Облачный вызов можно запретить в политике запроса.
 Не пытайтесь заменять модельный ответ или подтверждать его от имени человека.
-Реальные и старые данные не подключать до П5 и отдельной миграции.
+П5: для человека есть локальный экран (rt.py screen); он же показывает историю, конфликты и резерв.
+Реальные и старые данные не подключать до отдельной миграции.
 
 1. Запуск: start_transcription(audio_path, names="Анна, Борис", group="…"). names — участники записи, если известны
    (голоса ищутся только среди них); num_speakers — только если число голосов известно точно; group нужен, когда в
@@ -81,7 +82,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.17.4"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.17.5"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -263,6 +264,63 @@ def workflow_model_result(request_id: str, result: dict) -> str:
         return json.dumps(core.workflow_model_result(request_id, result), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def workflow_list(limit: int = 20) -> str:
+    """Последние сохранённые запросы workflow: состояния без тяжёлых чтений."""
+    try:
+        return json.dumps(core.workflow_list(limit), ensure_ascii=False)
+    except (storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def recording_history(recording_id: str, kind: str = "transcript") -> str:
+    """История ревизий SQLite-записи (kind: transcript или review) с авторством; без изменения текущей."""
+    try:
+        return json.dumps(core.recording_revisions(recording_id, kind), ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def read_recording_revision(recording_id: str, kind: str, revision: int) -> str:
+    """Прочитать сохранённую ревизию записи для просмотра истории; текущая ревизия не меняется."""
+    try:
+        return json.dumps(core.read_recording_revision(recording_id, kind, revision), ensure_ascii=False)
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return json.dumps({"error": str(ex)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def restore_recording_revision(recording_id: str, source_revision: int, review_revision: int) -> str:
+    """Вернуть прежнюю ревизию парой (текст + разбор) как новую текущую после подтверждения человека."""
+    try:
+        snapshot = core.prepare_restore_snapshot(recording_id, source_revision, review_revision)
+        if confirm.mode() == "off":
+            return "Ошибка: для возврата ревизии нужен канал подтверждения человека"
+    except (core.CoreError, storage.StorageError, ValueError, KeyError, OSError) as ex:
+        return f"Ошибка: {ex}"
+    return await _gated(
+        "Возврат прежней ревизии как текущей", snapshot,
+        lambda: [f"Стенограмма: {snapshot['document']}",
+                 f"Возвращается пара: текст {snapshot['source_revision']}, разбор {snapshot['review_revision']}.",
+                 f"Текущая пара {snapshot['expected_versions']['source_revision']}/"
+                 f"{snapshot['expected_versions']['review_revision']} станет предыдущей в истории.",
+                 "История сохраняется; файлы документа формируются заново."],
+        lambda: core.restore_recording_revision(snapshot), require_human=True)
+
+
+@mcp.tool()
+async def backup_state(destination: str) -> str:
+    """Создать проверенную неактивную копию базы состояния; аудио и папки документов она не заменяет."""
+    return await _gated(
+        "Создание резерва состояния БД", {"destination": destination},
+        lambda: [f"Новый файл: {destination}",
+                 "Копия неактивна: установки отключены, незавершённые запуски прерываются.",
+                 "Существующие файлы не изменяются и не удаляются."],
+        lambda: core.backup_store(destination))
 
 
 @mcp.tool()

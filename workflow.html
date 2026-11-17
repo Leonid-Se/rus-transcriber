@@ -1,0 +1,352 @@
+<style>
+body{padding:12px;max-width:900px;margin:0 auto}
+h1{font-size:20px}h2{font-size:16px;margin:18px 0 6px}
+section{border:1px solid #ddd;border-radius:8px;padding:10px;margin-bottom:12px}
+button{margin:2px 4px 2px 0;padding:4px 10px;cursor:pointer}
+input,select{padding:4px;margin:2px 0}
+input[type=text]{width:100%;box-sizing:border-box}
+table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #ddd;padding:4px;text-align:left;vertical-align:top;font-size:13px}
+.ok{color:#0a7d32}.warn{color:#a05a00}.bad{color:#b3261e}
+.muted{color:#666;font-size:12px}
+pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overflow-x:auto}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+</style>
+<h1>rus-transcriber: обработка записи</h1>
+<div id="msg" class="muted"></div>
+
+<section>
+  <h2>Новый запрос</h2>
+  <label>Файл записи (полный путь):<input type="text" id="audio" placeholder="C:\записи\встреча.mp3"></label>
+  <div class="bar">
+    <label><input type="checkbox" id="conspect"> нужен конспект</label>
+    <label><input type="checkbox" id="cloud" checked> разрешить облачную модель для конспекта</label>
+    <label>уточнений: <input type="number" id="budget" value="0" min="0" max="20" style="width:60px"></label>
+  </div>
+  <label>Цель (необязательно):<input type="text" id="goal" placeholder="например: протокол встречи"></label>
+  <button id="start">Запустить обработку</button>
+</section>
+
+<section>
+  <h2>Запросы</h2>
+  <button id="refresh">Обновить</button>
+  <table id="requests"><tr><th>Запущен</th><th>Состояние</th><th>Запись</th><th></th></tr></table>
+</section>
+
+<div id="detail" hidden>
+<section>
+  <h2>Состояние запроса <span id="req-id" class="muted"></span></h2>
+  <div id="status"></div>
+  <div id="verify-box"></div>
+</section>
+
+<section>
+  <h2>Результат</h2>
+  <div id="result"></div>
+  <h2>Конспекты</h2>
+  <div id="conspects"></div>
+</section>
+
+<section>
+  <h2>Уточнения (добровольные)</h2>
+  <div id="questions"></div>
+</section>
+
+<section>
+  <h2>История версий</h2>
+  <div class="bar">
+    <button data-kind="transcript" class="hist">Текст</button>
+    <button data-kind="review" class="hist">Разбор</button>
+  </div>
+  <table id="history"><tr><th>Ревизия</th><th>Когда</th><th>Кто</th><th></th></tr></table>
+  <div id="revision-view"></div>
+</section>
+
+<section>
+  <h2>Конфликты документов</h2>
+  <div id="conflicts"></div>
+</section>
+</div>
+
+<section>
+  <h2>Резерв состояния</h2>
+  <p class="muted">Создаёт новый файл-копию базы состояния (неактивную: без активной установки и запусков).
+  Исходные аудио и папки документов резерв не заменяет.</p>
+  <label>Куда сохранить (полный путь к новому файлу .sqlite3):
+    <input type="text" id="backup-dest" placeholder="C:\резервы\state-2026-11-17.sqlite3"></label>
+  <button id="backup">Создать резерв</button>
+  <div id="backup-report"></div>
+</section>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = t => String(t ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let requestId = null, recordingId = null, pending = null;
+
+function say(text, bad) { $("msg").textContent = text || ""; $("msg").className = bad ? "bad" : "muted"; }
+
+async function api(path, body, method) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: method || "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body || {})});
+  const data = await res.json().catch(() => ({error: "нечитаемый ответ"}));
+  if (!res.ok || data.error) throw new Error(data.error || ("код " + res.status));
+  return data;
+}
+const call = (path, body) => api(path, body);
+const post = (path, body) => api(path, body, "POST");
+
+const fmtTime = iso => (iso || "").replace("T", " ").slice(0, 16);
+const revName = {transcript: "текст", review: "разбор"};
+
+function renderStatus(s) {
+  const r = s.readiness || {};
+  const blockers = (r.blockers || []).map(b => `<li class="warn">${esc(b)}</li>`).join("");
+  const limits = (r.limits || []).map(l => `<li class="muted">${esc(l)}</li>`).join("");
+  const deliverable = {"ready_for_request": "результат готов",
+    "usable_with_limits": "результат пригоден с оговорками", "blocked": "есть препятствия"}[r.deliverable] || r.deliverable;
+  const dclass = r.deliverable === "blocked" ? "bad" : (r.deliverable === "ready_for_request" ? "ok" : "warn");
+  const failure = s.model_failure ? `<p class="bad">Модельный шаг: ${esc(s.model_failure.message || s.model_failure.code)}</p>` : "";
+  const sync = s.policy && s.policy.require_conspect ? `<p>Конспект заказан${s.model_task ? "" : " (ещё не создан)"}</p>` : "";
+  return `<p>Состояние: <b>${esc(s.state_ru || s.state)}</b></p>${failure}${sync}
+    <p>Готовность: <b class="${dclass}">${esc(deliverable)}</b></p>
+    ${blockers ? `<ul>${blockers}</ul>` : ""}${limits ? `<ul>${limits}</ul>` : ""}
+    <p class="muted">Источник: ${esc(s.source || "")}</p>`;
+}
+
+async function showVerify() {
+  const box = $("verify-box");
+  box.innerHTML = "";
+  try {
+    const snap = await post("api/verify/prepare", {request_id: requestId});
+    const div = document.createElement("div");
+    div.innerHTML = `<p>Стенограмма проверена вами целиком? Файл: <code>${esc(snap.document)}</code>,
+      ревизия текста ${esc(snap.source_revision)}, ревизия разбора ${esc(snap.review_revision)}.</p>`;
+    const b = document.createElement("button");
+    b.textContent = "Подтвердить проверку стенограммы человеком";
+    b.onclick = async () => {
+      try { await post("api/verify/confirm", {snapshot: snap}); say("Проверка стенограммы подтверждена."); loadStatus(); }
+      catch (ex) { say(ex.message, true); }
+    };
+    div.appendChild(b);
+    box.appendChild(div);
+  } catch (ex) { box.innerHTML = `<p class="muted">Подтверждение проверки пока недоступно: ${esc(ex.message)}</p>`; }
+}
+
+function renderResult(d) {
+  const root = $("result");
+  root.innerHTML = "";
+  if (!d || !d.recording_id) { root.innerHTML = '<p class="muted">Стенограмма ещё не сохранена.</p>'; return; }
+  const files = d.files || {};
+  const lines = d.segments.map(s =>
+    `<p><b>${esc(s.speaker || "?")}</b> <span class="muted">${esc(fmtDur(s.start))}</span><br>${esc(s.text)}</p>`).join("");
+  const doubts = (d.doubts || []).filter(x => x.status === "open" || x.status === "human");
+  root.innerHTML = `<p>${esc(d.speakers && d.speakers.join(", "))} · ${esc(d.duration || "")} ·
+    ревизия текста ${esc(d.source_revision)}, разбора ${esc(d.review_revision)} ·
+    синхронизация файлов: ${esc(d.document_sync)}</p>
+    <p class="muted">Файлы (читаются без программы):<br>
+    <code>${esc(files.markdown || "")}</code><br><code>${esc(files.json || "")}</code></p>
+    ${doubts.length ? `<p>Нерешённых сомнительных мест: ${doubts.length} — отмечены ⟦…⟧ и списком ниже.</p>
+      <ul>${doubts.map(x => `<li>${esc(x.text || x.id)}</li>`).join("")}</ul>` : ""}
+    ${lines}`;
+  recordingId = d.recording_id;
+  loadConspects(); loadConflicts();
+}
+
+const fmtDur = sec => (sec === null || sec === undefined) ? "" :
+  `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+
+async function loadConspects() {
+  const root = $("conspects");
+  try {
+    const d = await call(`api/conspects?recording_id=${encodeURIComponent(recordingId)}`);
+    root.innerHTML = d.conspects.length ? "" : '<p class="muted">Конспектов нет.</p>';
+    for (const c of d.conspects) {
+      const div = document.createElement("div");
+      div.innerHTML = `<p><b>${esc(c.name)}</b> · ревизия ${esc(c.current_revision)} ·
+        по тексту ревизии ${esc(c.source_revision)}</p>
+        <p class="muted">Файлы: ${Object.values(c.files || {}).map(esc).join(" · ") || "ещё не сформированы"}</p>`;
+      for (const s of c.sections || []) {
+        const p = document.createElement("p");
+        p.textContent = s.text || "";
+        div.appendChild(p);
+      }
+      root.appendChild(div);
+    }
+  } catch (ex) { root.innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
+}
+
+async function loadQuestions() {
+  const root = $("questions");
+  try {
+    const d = await call(`api/questions?request_id=${encodeURIComponent(requestId)}`);
+    if (!d.questions || !d.questions.length) {
+      root.innerHTML = `<p class="muted">Уточнений нет${d.budget ? "" : " (бюджет — 0)"}.</p>`;
+      return;
+    }
+    root.innerHTML = `<p>Добровольные места для проверки (до ${esc(d.budget)}): ответы даются в карточках разбора
+      или через AI-клиент; экран их не выбирает. Осталось мест сверх бюджета: ${esc(d.remaining)}.</p>
+      <ul>${d.questions.map(q => `<li>${esc(q.text || "")} <span class="muted">${esc(fmtDur(q.t1))}</span></li>`).join("")}</ul>`;
+  } catch (ex) { root.innerHTML = `<p class="muted">Уточнения недоступны: ${esc(ex.message)}</p>`; }
+}
+
+async function loadHistory(kind) {
+  kind = kind || "transcript";
+  document.querySelectorAll(".hist").forEach(b => b.style.fontWeight = b.dataset.kind === kind ? "bold" : "");
+  const table = $("history");
+  try {
+    const d = await call(`api/history?recording_id=${encodeURIComponent(recordingId)}&kind=${kind}`);
+    table.innerHTML = "<tr><th>Ревизия</th><th>Когда</th><th>Кто</th><th></th></tr>" + d.revisions.map(r =>
+      `<tr><td>${r.revision}${r.restored_from ? ` <span class="muted">(возврат ${r.restored_from})</span>` : ""}</td>
+      <td>${esc(fmtTime(r.created_at))}</td><td>${esc(r.actor_kind || "")} ${esc(r.initiated_by || "")}</td>
+      <td><button data-rev="${r.revision}" class="view">просмотр</button>
+      ${r.revision !== (d.revisions.at(-1) || {}).revision ? `<button data-rev="${r.revision}" data-k="${kind}" class="restore">вернуть</button>` : ""}</td></tr>`).join("");
+    table.querySelectorAll(".view").forEach(b => b.onclick = () => viewRevision(kind, b.dataset.rev));
+    table.querySelectorAll(".restore").forEach(b => b.onclick = () => prepareRestore(kind, b.dataset.rev));
+  } catch (ex) { say(ex.message, true); }
+}
+
+async function viewRevision(kind, rev) {
+  const root = $("revision-view");
+  try {
+    const d = await call(`api/revision?recording_id=${encodeURIComponent(recordingId)}&kind=${kind}&revision=${rev}`);
+    const box = document.createElement("div");
+    let body = "";
+    if (kind === "transcript") {
+      body = (d.payload.segments || []).map(s =>
+        `<p><b>${esc(s.speaker || s.label || "?")}</b> ${esc(segmentText(s))}</p>`).join("");
+    } else {
+      body = `<pre>${esc(JSON.stringify(d.payload, null, 1))}</pre>`;
+    }
+    box.innerHTML = `<h3>${esc(revName[kind])} ревизия ${esc(d.revision)}</h3>${body}
+      <p class="muted">Это просмотр старой версии; текущая не меняется.</p>`;
+    root.replaceChildren(box);
+  } catch (ex) { say(ex.message, true); }
+}
+
+function segmentText(s) {
+  if (typeof s.text === "string" && s.text) return s.text;
+  return ((s.words || []).map(w => (w && w.w) || "")).join(" ");
+}
+
+async function prepareRestore(kind, rev) {
+  try {
+    const snap = await post("api/restore/prepare", {recording_id: recordingId,
+                                                    source_revision: Number(rev),
+                                                    review_revision: Number(rev)});
+    const root = $("revision-view");
+    const div = document.createElement("div");
+    div.innerHTML = `<h3>Возврат ревизии ${esc(rev)} как текущей</h3>
+      <p>Будет создана новая текущая ревизия с содержимым прежней. Файл:
+      <code>${esc(snap.document)}</code>. История сохраняется.</p>`;
+    const ok = document.createElement("button");
+    ok.textContent = "Подтвердить возврат";
+    ok.onclick = async () => {
+      try { await post("api/restore/confirm", {snapshot: snap}); say("Возврат выполнен."); loadStatus(); loadHistory(kind); }
+      catch (ex) { say(ex.message, true); }
+    };
+    const cancel = document.createElement("button");
+    cancel.textContent = "Отмена";
+    cancel.onclick = () => div.remove();
+    div.append(ok, cancel);
+    root.replaceChildren(div);
+  } catch (ex) { say(ex.message, true); }
+}
+
+async function loadConflicts() {
+  const root = $("conflicts");
+  try {
+    const d = await call(`api/conflicts?recording_id=${encodeURIComponent(recordingId)}`);
+    const items = [...d.documents.map(x => ({...x, scope: "document"})),
+                   ...d.conspects.map(x => ({...x, scope: "conspect"}))];
+    if (!items.length) { root.innerHTML = '<p class="muted">Конфликтов нет.</p>'; return; }
+    root.innerHTML = "";
+    for (const c of items) {
+      const div = document.createElement("div");
+      div.innerHTML = `<p><b>Конфликт</b> (${esc(c.scope === "document" ? "документ" : "конспект")}):
+        ${esc(c.relative_path || c.kind)} · размер ${esc(c.observed_size)}
+        ${c.preserved ? "· внешние байты сохранены" : '· файл крупный, остался на диске'}</p>`;
+      const pv = document.createElement("button");
+      pv.textContent = "Предпросмотр внешней правки";
+      pv.onclick = async () => {
+        try {
+          const p = await post("api/conflict/preview", {recording_id: recordingId,
+            conflict_id: c.conflict_id, kind: c.scope});
+          const pre = document.createElement("pre");
+          pre.textContent = p.preview || "(байты не сохранены — разбирайте файл на диске)";
+          div.appendChild(pre);
+          if (p.truncated) { const m = document.createElement("p"); m.className = "muted"; m.textContent = "Показаны первые символы."; div.appendChild(m); }
+        } catch (ex) { say(ex.message, true); }
+      };
+      const rs = document.createElement("button");
+      rs.textContent = "Сохранить внешнюю правку";
+      rs.onclick = async () => {
+        if (!confirm("Сохранить внешнюю правку как текущую?")) return;
+        try {
+          await post("api/conflict/resolve", {recording_id: recordingId, conflict_id: c.conflict_id,
+                                              kind: c.scope, confirm: true});
+          say("Конфликт разрешён, файлы формируются заново.");
+          loadStatus();
+        } catch (ex) { say(ex.message, true); }
+      };
+      div.append(pv, rs);
+      root.appendChild(div);
+    }
+  } catch (ex) { root.innerHTML = `<p class="muted">Конфликты недоступны: ${esc(ex.message)}</p>`; }
+}
+
+async function loadStatus() {
+  try {
+    const s = await call(`api/status?request_id=${encodeURIComponent(requestId)}`);
+    $("req-id").textContent = requestId;
+    $("status").innerHTML = renderStatus(s);
+    showVerify(); renderResult(await call(`api/result?request_id=${encodeURIComponent(requestId)}`));
+    loadQuestions();
+  } catch (ex) { say(ex.message, true); }
+}
+
+async function loadRequests() {
+  try {
+    const d = await call("api/requests");
+    const table = $("requests");
+    table.innerHTML = "<tr><th>Запущен</th><th>Состояние</th><th>Запись</th><th></th></tr>" +
+      d.requests.map(r => `<tr><td>${esc(fmtTime(r.created_at))}</td>
+        <td>${esc(stateRu(r.state))}</td><td class="muted">${esc((r.source || "").split("\\").pop())}</td>
+        <td><button data-id="${r.request_id}">открыть</button></td></tr>`).join("");
+    table.querySelectorAll("button").forEach(b => b.onclick = () => openRequest(b.dataset.id));
+  } catch (ex) { say(ex.message, true); }
+}
+
+function stateRu(state) {
+  return {"queued": "в очереди", "starting": "запуск", "running": "выполняется",
+    "processed": "обработано", "waiting_model": "ожидает модель", "completed": "завершено",
+    "failed": "ошибка модели", "interrupted": "прервано"}[state] || state;
+}
+
+function openRequest(id) {
+  requestId = id; recordingId = null;
+  $("detail").hidden = false;
+  loadStatus();
+  $("detail").scrollIntoView();
+}
+
+$("start").onclick = async () => {
+  try {
+    const d = await post("api/start", {audio: $("audio").value, require_conspect: $("conspect").checked,
+      allow_cloud_model: $("cloud").checked, goal: $("goal").value, question_budget: Number($("budget").value)});
+    say(`Запрос сохранён: ${d.request_id}. Обработка идёт в фоне; обновляйте состояние.`);
+    openRequest(d.request_id); loadRequests();
+  } catch (ex) { say(ex.message, true); }
+};
+$("refresh").onclick = loadRequests;
+document.querySelectorAll(".hist").forEach(b => b.onclick = () => loadHistory(b.dataset.kind));
+$("backup").onclick = async () => {
+  try {
+    const d = await post("api/backup", {destination: $("backup-dest").value});
+    $("backup-report").innerHTML = `<p class="ok">Резерв создан: ${esc(d.destination)}.
+      Проверка копии: ${esc(d.report.integrity)}, схема ${esc(d.report.schema_version)}.</p>`;
+  } catch (ex) { $("backup-report").innerHTML = `<p class="bad">${esc(ex.message)}</p>`; }
+};
+loadRequests();
+</script>

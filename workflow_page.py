@@ -1,0 +1,261 @@
+"""Локальный экран П5: запуск, состояние и результат нового workflow без терминала.
+
+Отдаёт workflow.html на секретном адресе (только 127.0.0.1) и принимает запросы к core.py:
+запуск обработки, состояние и готовность, чтение стенограммы и конспектов, добровольные
+уточнения, история ревизий с просмотром старой версии и возвратом как текущей, конфликты
+документов с предпросмотром внешней правки, резерв состояния БД. Сам выключается после
+--hours часов без запросов.
+
+    python workflow_page.py [--port 8766] [--hours 6]
+
+Реальные и старые данные не подключаются до П5 и отдельно согласованной миграции.
+"""
+import argparse
+import json
+import mimetypes
+import secrets
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import paths  # noqa: E402,F401
+import core  # noqa: E402
+import storage  # noqa: E402
+
+SKELETON = ('<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+            '<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px)}'
+            'body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}'
+            '[hidden]{display:none!important}</style></head><body>{BODY}</body></html>')
+mimetypes.add_type("audio/mpeg", ".mp3")
+MAX_BODY_BYTES = 64 * 1024
+
+
+def segment_text(segment):
+    words = segment.get("words") or []
+    if isinstance(segment.get("text"), str) and segment["text"]:
+        return segment["text"]
+    return " ".join(str(word.get("w", "")) for word in words if isinstance(word, dict))
+
+
+def result_view(data):
+    """Сокращённый вид SQLite-записи для экрана; полные данные остаются в БД и файлах."""
+    segments = []
+    for segment in data.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        segments.append({"start": segment.get("start"), "end": segment.get("end"),
+                         "speaker": segment.get("speaker") or segment.get("label"),
+                         "text": segment_text(segment)})
+    doubts = [{"id": item.get("id"), "text": item.get("text"), "t1": item.get("t1"),
+               "t2": item.get("t2"), "status": item.get("status", "open")}
+              for item in data.get("review") or [] if isinstance(item, dict)]
+    return {"recording_id": data.get("recording_id"), "title": data.get("title"),
+            "duration": data.get("duration"), "speakers": data.get("speakers"),
+            "speaker_names": data.get("speaker_names"),
+            "names_confirmed": data.get("names_confirmed"),
+            "source_revision": data.get("source_revision"),
+            "review_revision": data.get("review_revision"),
+            "document_sync": data.get("document_sync"),
+            "files": {"json": data.get("json"), "markdown": data.get("markdown"),
+                      "manifest": data.get("manifest")},
+            "segments": segments, "doubts": doubts}
+
+
+def state_ru(state):
+    return {"queued": "в очереди", "starting": "запуск", "running": "выполняется",
+            "processed": "обработано", "waiting_model": "ожидает конспект от модели",
+            "completed": "завершено", "failed": "ошибка модельного шага",
+            "interrupted": "прервано"}.get(state, state)
+
+
+def make_server(port):
+    """Собрать локальный сервер экрана; возвращает (server, url, last)."""
+    last = [time.time()]
+    token = secrets.token_urlsafe(32)
+    prefix = f"/{token}/"
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            # URL содержит секрет сессии: не записывать запрос целиком в журнал.
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8"):
+            b = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(b)
+
+        def _path(self, post=False):
+            host = f"127.0.0.1:{self.server.server_port}"
+            if self.headers.get("Host") != host:
+                self._send(403, {"error": "недопустимый адрес"})
+                return None
+            if post and self.headers.get("Origin") != f"http://{host}":
+                self._send(403, {"error": "недопустимый источник"})
+                return None
+            u = urlparse(self.path)
+            if not u.path.startswith(prefix):
+                self._send(403, {"error": "недействительная сессия"})
+                return None
+            return u.path[len(prefix):]
+
+        def do_GET(self):
+            u = self._path()
+            if u is None:
+                return
+            last[0] = time.time()
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            try:
+                if u in ("", "index.html"):
+                    html = (HERE / "workflow.html").read_text(encoding="utf-8")
+                    return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"),
+                                      "text/html; charset=utf-8")
+                if u == "api/requests":
+                    return self._send(200, {"requests": core.workflow_list(30)})
+                if u == "api/status":
+                    status = core.workflow_status(q.get("request_id", ""))
+                    request = status["request"]
+                    return self._send(200, {
+                        "request_id": q.get("request_id"), "state": request["state"],
+                        "state_ru": state_ru(request["state"]),
+                        "source": request["source"], "recording_id": request["recording_id"],
+                        "policy_revision": request["policy_revision"],
+                        "policy": request["policy"], "model_task": request["model_task"],
+                        "model_failure": request["model_failure"],
+                        "readiness": status["readiness"]})
+                if u == "api/questions":
+                    return self._send(200, core.workflow_questions(q.get("request_id", "")))
+                if u == "api/result":
+                    status = core.workflow_status(q.get("request_id", ""))
+                    recording_id = status["request"]["recording_id"]
+                    if not recording_id:
+                        return self._send(200, {"recording_id": None})
+                    return self._send(200, result_view(core.read_recording_result(recording_id)))
+                if u == "api/conspects":
+                    recording_id = q.get("recording_id", "")
+                    return self._send(200, {"conspects": core.recording_conspects(recording_id)})
+                if u == "api/history":
+                    kind = q.get("kind", "transcript")
+                    return self._send(200, {"revisions": core.recording_revisions(
+                        q.get("recording_id", ""), kind)})
+                if u == "api/revision":
+                    return self._send(200, core.read_recording_revision(
+                        q.get("recording_id", ""), q.get("kind", "transcript"),
+                        int(q.get("revision", "0"))))
+                if u == "api/conflicts":
+                    recording_id = q.get("recording_id", "")
+                    return self._send(200, {
+                        "documents": core.list_document_conflicts(recording_id),
+                        "conspects": core.list_conspect_conflicts(recording_id)})
+                return self._send(404, {"error": "не найдено"})
+            except (core.CoreError, storage.StorageError) as ex:
+                return self._send(400, {"error": str(ex)})
+            except (ValueError, KeyError, OSError) as ex:
+                return self._send(400, {"error": f"не удалось выполнить запрос: {ex}"})
+
+        def do_POST(self):
+            u = self._path(post=True)
+            if u is None:
+                return
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return self._send(415, {"error": "недопустимый тип данных"})
+            length = self.headers.get("Content-Length", "")
+            if len(length) > 12 or not length.isascii() or not length.isdecimal() \
+                    or self.headers.get("Transfer-Encoding"):
+                return self._send(400, {"error": "неверная длина запроса"})
+            n = int(length)
+            if n <= 0 or n > MAX_BODY_BYTES:
+                return self._send(413, {"error": "недопустимый размер запроса"})
+            self.connection.settimeout(30)
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                if not isinstance(body, dict):
+                    raise ValueError("ожидается объект запроса")
+                last[0] = time.time()
+                if u == "api/start":
+                    audio = str(body.get("audio", "")).strip()
+                    if not audio or len(audio) > 300:
+                        return self._send(400, {"error": "укажите путь к записи"})
+                    policy = {"require_conspect": bool(body.get("require_conspect")),
+                              "allow_cloud_model": bool(body.get("allow_cloud_model")),
+                              "participation": str(body.get("participation") or "simple"),
+                              "goal": str(body.get("goal") or ""),
+                              "question_budget": int(body.get("question_budget") or 0)}
+                    return self._send(200, core.start_workflow(audio, policy))
+                if u == "api/backup":
+                    destination = str(body.get("destination", "")).strip()
+                    if not destination or len(destination) > 300:
+                        return self._send(400, {"error": "укажите путь к новому файлу резерва"})
+                    return self._send(200, core.backup_store(destination))
+                if u == "api/verify/prepare":
+                    return self._send(200, core.workflow_verification_snapshot(
+                        str(body.get("request_id", ""))))
+                if u == "api/verify/confirm":
+                    return self._send(200, core.workflow_confirm_verification(body.get("snapshot")))
+                if u == "api/restore/prepare":
+                    return self._send(200, core.prepare_restore_snapshot(
+                        str(body.get("recording_id", "")), int(body.get("source_revision", 0)),
+                        int(body.get("review_revision", 0))))
+                if u == "api/restore/confirm":
+                    return self._send(200, core.restore_recording_revision(body.get("snapshot")))
+                if u == "api/conflict/preview":
+                    return self._send(200, core.preview_conflict(
+                        str(body.get("recording_id", "")), str(body.get("conflict_id", "")),
+                        str(body.get("kind") or "document")))
+                if u == "api/conflict/resolve":
+                    if not body.get("confirm"):
+                        return self._send(400, {"error": "требуется явное подтверждение"})
+                    kind = str(body.get("kind") or "document")
+                    recording_id, conflict_id = str(body.get("recording_id", "")), str(body.get("conflict_id", ""))
+                    if kind == "document":
+                        return self._send(200, core.resolve_document_conflict(recording_id, conflict_id))
+                    return self._send(200, core.resolve_conspect_conflict(recording_id, conflict_id))
+                return self._send(404, {"error": "не найдено"})
+            except (core.CoreError, storage.StorageError) as ex:
+                return self._send(400, {"error": str(ex)})
+            except (ValueError, KeyError, OSError) as ex:
+                return self._send(400, {"error": f"не удалось обработать запрос: {ex}"})
+
+    srv, port = None, port
+    for port in range(port, port + 20):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        raise SystemExit("нет свободного порта")
+    return srv, f"http://127.0.0.1:{port}{prefix}", last
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8766)
+    ap.add_argument("--hours", type=float, default=6.0)
+    a = ap.parse_args()
+    srv, url, last = make_server(a.port)
+    print(f"[экран] {url}", file=sys.stderr, flush=True)
+
+    def idle():
+        while time.time() - last[0] < a.hours * 3600:
+            time.sleep(30)
+        srv.shutdown()
+
+    threading.Thread(target=idle, daemon=True).start()
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

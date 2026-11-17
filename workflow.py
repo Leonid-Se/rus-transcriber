@@ -33,6 +33,14 @@ def create(store, source, policy=None):
     return request_id
 
 
+def list_recent(store, limit=20):
+    """Короткий список последних запросов для локального экрана."""
+    limit = max(0, min(int(limit), 100))
+    return [dict(row) for row in store.db.execute(
+        "SELECT request_id, state, source, recording_id, policy_revision, created_at, updated_at "
+        "FROM workflow_requests ORDER BY updated_at DESC LIMIT ?", (limit,))]
+
+
 def get(store, request_id):
     storage._uuid(request_id)
     store.current_identity()

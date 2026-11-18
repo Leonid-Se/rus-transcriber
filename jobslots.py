@@ -6,6 +6,7 @@
 """
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -21,6 +22,20 @@ def _try_lock(f):
         return True
     except OSError:
         return False
+
+
+@contextmanager
+def file_lock(path, poll=0.05, timeout=60):
+    """Межпроцессная блокировка короткой записи; закрытие файла освобождает lock."""
+    deadline = time.monotonic() + timeout
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as f:
+        while not _try_lock(f):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"не удалось получить блокировку {path.name}")
+            time.sleep(poll)
+        yield
 
 
 def acquire(jobs_dir, limit, status=None, job_id=None, poll=2.0):

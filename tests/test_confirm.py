@@ -2,6 +2,7 @@
 import atexit
 import shutil
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
@@ -100,6 +101,12 @@ class ConfirmTests(unittest.TestCase):
 
     def test_approve_unknown_key_fails(self):
         self.assertFalse(confirm.approve("нет-такого"))
+
+    def test_parallel_confirmation_requests_are_not_lost(self):
+        keys = [f"key-{i}" for i in range(20)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda key: confirm.request_terminal(key, "test", key), keys))
+        self.assertEqual(set(confirm.pending_requests()), set(keys))
 
     def test_expired_approval_and_request(self):
         with cfg(), mock.patch.object(confirm, "dialog_available", return_value=False):

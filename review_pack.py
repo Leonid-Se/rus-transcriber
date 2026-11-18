@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 PAD_BEFORE = 3.5     # клип начинается за 3,5 с до места (было 1,5)
@@ -61,15 +62,32 @@ def _read(p, default):
 
 def _write(p, obj):
     p = Path(p)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
-    for k in range(20):
-        try:
-            os.replace(tmp, p)
-            return
-        except PermissionError:
-            time.sleep(0.05 * (k + 1))
-    raise RuntimeError(f"не удалось записать {p}")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent,
+                                     prefix=p.name + ".", suffix=".tmp", delete=False) as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+        tmp = Path(f.name)
+    try:
+        for k in range(20):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (k + 1))
+        raise RuntimeError(f"не удалось записать {p}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def _answers_lock(json_path):
+    """Сериализует read-modify-write ответов между страницей и отдельными MCP-процессами."""
+    import jobslots
+    lock_path = pack_dir(json_path) / "answers.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as f:
+        while not jobslots._try_lock(f):
+            time.sleep(0.05)
+        yield
 
 
 def _ffmpeg():
@@ -306,20 +324,21 @@ def add_interaction_event(json_path, aid, version, event_type, session):
     item = next((it for it in man.get("items") or [] if it.get("id") == aid), None)
     if not item:
         raise ValueError("карточка не найдена")
-    store = _read_answers(json_path, {"version": man["version"], "answers": {}})
-    events = store.setdefault("interaction_events", [])
-    if event_type == "card_visible" and any(
-            row.get("id") == aid and row.get("version") == version and
-            row.get("type") == event_type and row.get("session") == session for row in events):
-        return {"stored": False, "duplicate": True}
-    event = {"id": aid, "version": version, "diagnostic_id": item.get("diagnostic_id"),
-             "type": event_type, "session": session, "source": "local", "ts": _now()}
-    events.append(event)
-    if len(events) > MAX_INTERACTION_EVENTS:
-        removed = len(events) - MAX_INTERACTION_EVENTS
-        del events[:removed]
-        store["interaction_events_dropped"] = store.get("interaction_events_dropped", 0) + removed
-    _write_answers(json_path, store)
+    with _answers_lock(json_path):
+        store = _read_answers(json_path, {"version": man["version"], "answers": {}})
+        events = store.setdefault("interaction_events", [])
+        if event_type == "card_visible" and any(
+                row.get("id") == aid and row.get("version") == version and
+                row.get("type") == event_type and row.get("session") == session for row in events):
+            return {"stored": False, "duplicate": True}
+        event = {"id": aid, "version": version, "diagnostic_id": item.get("diagnostic_id"),
+                 "type": event_type, "session": session, "source": "local", "ts": _now()}
+        events.append(event)
+        if len(events) > MAX_INTERACTION_EVENTS:
+            removed = len(events) - MAX_INTERACTION_EVENTS
+            del events[:removed]
+            store["interaction_events_dropped"] = store.get("interaction_events_dropped", 0) + removed
+        _write_answers(json_path, store)
     return {"stored": True, "event": event}
 
 
@@ -383,10 +402,11 @@ def add_answers(json_path, answers, source, *, trusted_actor="unknown"):
     if trusted_actor not in ("human", "unknown"):
         raise ValueError("invalid answer actor")
     with recordings.operation_for_document(json_path, trusted_actor):
-        return _add_answers(json_path, answers, source)
+        with _answers_lock(json_path):
+            return _add_answers(json_path, answers, source, trusted_actor)
 
 
-def _add_answers(json_path, answers, source):
+def _add_answers(json_path, answers, source, trusted_actor="unknown"):
     """Сводит ответы в answers.json. answers: [{id, version, kind|option|text|audio, ts?}].
     Голосовые ответы без текста распознаются GigaAM (отдельный процесс) и сопоставляются с вариантами."""
     import recordings
@@ -419,6 +439,8 @@ def _add_answers(json_path, answers, source):
         if context is not None:
             ans.update(actor_kind=context["actor_kind"], author_ref=context["author_ref"],
                        initiated_by=context["initiated_by"])
+        else:
+            ans["actor_kind"] = trusted_actor
         if it.get("diagnostic_id"):
             ans["diagnostic_id"] = it["diagnostic_id"]
         if isinstance(a.get("text"), str):          # пометки сомнения ⟦…⟧ из скопированной стенограммы
@@ -818,9 +840,19 @@ def drop_audio(json_path):
     pd = pack_dir(json_path)
     n = 0
     for sub in ("clips", "voice"):
-        for f in (pd / sub).glob("*"):
-            f.unlink()
+        root = pd / sub
+        if not root.exists():
+            continue
+        for f in root.iterdir():
+            if f.is_dir():
+                shutil.rmtree(f)
+            else:
+                f.unlink()
             n += 1
+        try:
+            root.rmdir()
+        except OSError:
+            pass
     return n
 
 

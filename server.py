@@ -82,7 +82,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.17.5"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.18.1"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -320,7 +320,7 @@ async def backup_state(destination: str) -> str:
         lambda: [f"Новый файл: {destination}",
                  "Копия неактивна: установки отключены, незавершённые запуски прерываются.",
                  "Существующие файлы не изменяются и не удаляются."],
-        lambda: core.backup_store(destination))
+        lambda: core.backup_store(destination), require_human=True)
 
 
 @mcp.tool()
@@ -443,8 +443,6 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
                 msg["warning"] = f"таких меток нет в расшифровке: {unknown}"
             return msg
 
-        if not sqlite_mode:
-            return json.dumps(run(), ensure_ascii=False, indent=2)
         if (not isinstance(names, dict) or not 1 <= len(names) <= 6 or
                 any(not isinstance(k, str) or not isinstance(v, str) or not k.strip() or not v.strip() or
                     len(k) > 80 or len(v) > 80 or
@@ -454,6 +452,10 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
         lines = [f"{key} → {value}" for key, value in names.items()]
         if sum(len(line) + 1 for line in lines) > 900:
             return "Список имён слишком длинный для подтверждения"
+        if not sqlite_mode:
+            return await _gated("Подписать говорящих", {"job_id": job_id, "names": names},
+                                lambda: ["Подтвердить имена говорящих?"] + lines,
+                                lambda: run(), require_human=True)
         before = transcript.load(s["json"])
         expected = {"source_revision": before["source_revision"], "review_revision": before["review_revision"]}
         recording_id = before["recording_id"]
@@ -461,7 +463,7 @@ async def rename_speakers(job_id: str, names: dict[str, str]) -> str:
                             {"job_id": job_id, "recording_id": recording_id, "names": names, **expected},
                             lambda: [f"Запись: {recording_id}; ревизия текста: {expected['source_revision']}",
                                      "Подтвердить имена говорящих?"] + lines,
-                            lambda: run(expected))
+                             lambda: run(expected), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
 
@@ -498,13 +500,7 @@ def edit_span(job_id: str, t1: float, t2: float, text: str, speaker: str = "", n
     note — пояснение для журнала. Время слов — read_transcript(fmt="json", extra=True) или review_items."""
     try:
         if by == "human":
-            import recordings
-            jp, _ = _job_json(job_id)
-            if jp:
-                store, binding = recordings.open_for_document(jp)
-                if store is not None:
-                    store.close()
-                    return "Человеческую правку SQLite-записи внесите через локальную карточку с подтверждением"
+            return "Правку с авторством человека вносите через локальную карточку с подтверждением"
         return json.dumps(core.edit_span(job_id, t1, t2, text, speaker, note, by), ensure_ascii=False, indent=1)
     except (core.CoreError, storage.StorageError, ValueError) as ex:
         return str(ex)
@@ -538,7 +534,7 @@ def apply_review(job_id: str, decisions: list[dict]) -> str:
 
 
 @mcp.tool()
-def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") -> str:
+async def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") -> str:
     """Проверяет цитаты «…» конспекта по стенограмме задачи: дословны ли они и тот ли говорящий.
 
     conspect_text — текст конспекта (markdown или обычный), либо conspect_path — путь к .md/.txt на этом
@@ -549,13 +545,37 @@ def check_quotes(job_id: str, conspect_text: str = "", conspect_path: str = "") 
     s = _status(job_id)
     if not s or s.get("state") != "done" or "json" not in s:
         return "Расшифровка не найдена или ещё не готова"
-    text = conspect_text or (Path(conspect_path).expanduser().read_text(encoding="utf-8-sig") if conspect_path else "")
-    if not text.strip():
-        return "Передайте conspect_text или conspect_path"
-    res = quotes.check(text, transcript.load(s["json"]))
-    for r in res["problems"]:
-        r["t"] = transcript.hms(r["t"])
-    return json.dumps(res, ensure_ascii=False, indent=1)
+    try:
+        path = Path(conspect_path).expanduser().resolve() if conspect_path and not conspect_text else None
+        if path:
+            if path.suffix.lower() not in (".md", ".txt") or not path.is_file():
+                return "Путь должен указывать на существующий .md или .txt файл"
+            if path.stat().st_size > 2 * 1024 * 1024:
+                return "Файл конспекта слишком велик (лимит 2 МиБ)"
+    except OSError as ex:
+        return f"Ошибка чтения конспекта: {ex}"
+    if len(conspect_text) > 2 * 1024 * 1024:
+        return "Текст конспекта слишком велик (лимит 2 МиБ)"
+
+    def run():
+        text = conspect_text or (path.read_text(encoding="utf-8-sig") if path else "")
+        if not text.strip():
+            return "Передайте conspect_text или conspect_path"
+        res = quotes.check(text, transcript.load(s["json"]))
+        for r in res["problems"]:
+            r["t"] = transcript.hms(r["t"])
+        return json.dumps(res, ensure_ascii=False, indent=1)
+
+    if path and not path.is_relative_to(paths.DATA_DIR.resolve()):
+        return await _gated("Чтение внешнего файла для проверки цитат",
+                            {"path": str(path), "size": path.stat().st_size},
+                            lambda: [f"Файл: {path}", f"Размер: {path.stat().st_size} байт",
+                                     "Содержимое будет прочитано только для проверки цитат."],
+                            run, require_human=True)
+    try:
+        return await asyncio.to_thread(run)
+    except (OSError, ValueError) as ex:
+        return f"Ошибка чтения конспекта: {ex}"
 
 
 @mcp.tool()
@@ -606,7 +626,7 @@ async def conspect_mark_reviewed(job_id: str, name: str = "конспект") ->
                         lambda: [f"Конспект: {name}", f"Задача: {job_id}",
                                  f"Ревизия источника: {snapshot['source_revision']}",
                                  "Подтвердите только если сами проверили смысл и цитаты по текущей стенограмме."],
-                        lambda: core.confirm_conspect_analysis(snapshot))
+                         lambda: core.confirm_conspect_analysis(snapshot), require_human=True)
 
 
 @mcp.tool()
@@ -632,7 +652,8 @@ async def conspect_link_selected(job_id: str, conspect_text: str, selections: di
     except core.CoreError as ex:
         return f"Ошибка: {ex}"
     return await _gated("Выбор мест цитат", snapshot, lambda: lines,
-                        lambda: core.save_selected_conspect(snapshot, conspect_text, selections))
+                        lambda: core.save_selected_conspect(snapshot, conspect_text, selections),
+                        require_human=True)
 
 
 @mcp.tool()
@@ -750,7 +771,7 @@ async def request_review_answer_verification(recording_id: str, answer_ids: list
             {"recording_id": recording_id, "answer_ids": answer_ids, "state_hash": snapshot["state_hash"]},
             lambda: [f"Запись: {recording_id}",
                      "Подтвердить следующие ответы как проверенные человеком:"] + snapshot["lines"],
-            lambda: core.confirm_review_answers(snapshot))
+            lambda: core.confirm_review_answers(snapshot), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
 
@@ -782,7 +803,7 @@ async def resolve_document_conflict(recording_id: str, conflict_id: str) -> str:
             lambda: ["Внешняя редакция сохранена в БД; файл может быть заменён версией из БД.",
                      f"Запись: {recording_id}; файл: {row['relative_path']}",
                      f"Размер: {row['observed_size']} байт; SHA-256: {row['observed_hash']}"],
-            lambda: core.resolve_document_conflict(recording_id, conflict_id))
+            lambda: core.resolve_document_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
 
@@ -805,7 +826,7 @@ async def resolve_conspect_conflict(recording_id: str, conflict_id: str) -> str:
                      f"Файл: {row['relative_path']}",
                      f"Тип файла: {row['kind']}; размер: {row['observed_size']} байт.",
                      f"SHA-256 внешней редакции: {row['observed_hash']}"],
-            lambda: core.resolve_conspect_conflict(recording_id, conflict_id))
+            lambda: core.resolve_conspect_conflict(recording_id, conflict_id), require_human=True)
     except (OSError, ValueError, storage.StorageError, core.CoreError) as ex:
         return f"Ошибка: {ex}"
 
@@ -856,7 +877,7 @@ async def migrate_data(dry_run: bool = True) -> str:
     if dry_run:
         return json.dumps(core.do_migrate(True), ensure_ascii=False, indent=1)
     return await _gated("Перенос данных", {"dry_run": False}, core.describe_migrate,
-                        lambda: core.do_migrate(False))
+                        lambda: core.do_migrate(False), require_human=True)
 
 
 @mcp.tool()
@@ -869,7 +890,7 @@ async def export_group(group: str = "", dest_dir: str = "", with_jobs: bool = Fa
     появится окно, где человек сам подтверждает выгрузку (подтвердить за него нельзя)."""
     return await _gated("Выгрузка группы", {"group": group, "dest": dest_dir, "jobs": with_jobs},
                         lambda: core.describe_export(group, dest_dir, with_jobs),
-                        lambda: core.do_export(group, dest_dir, with_jobs))
+                        lambda: core.do_export(group, dest_dir, with_jobs), require_human=True)
 
 
 @mcp.tool()
@@ -883,7 +904,7 @@ async def import_group(zip_path: str, mode: str = "merge", apply: bool = False) 
         return await _gated(None, None, None, lambda: core.do_import(zip_path, mode, False))
     return await _gated("Загрузка архива", {"zip": zip_path, "mode": mode},
                         lambda: core.describe_import(zip_path, mode),
-                        lambda: core.do_import(zip_path, mode, True))
+                        lambda: core.do_import(zip_path, mode, True), require_human=True)
 
 
 @mcp.tool()
@@ -893,11 +914,12 @@ async def delete_group(group: str, confirm: str, permanent: bool = False) -> str
     просьбе человека, назвавшего группу; permanent=true — только если он прямо сказал «навсегда». Человек
     дополнительно подтверждает удаление в окне на экране; без его «Да» ничего не удаляется."""
     def lines():
-        if confirm != group:
-            raise core.CoreError(f"Подтверждение не совпало: для удаления передайте confirm=«{group}»")
+        canonical = paths.safe_group(group)
+        if confirm != canonical:
+            raise core.CoreError(f"Подтверждение не совпало: для удаления передайте confirm=«{canonical}»")
         return core.describe_delete(group, permanent)
     return await _gated("Удаление группы", {"group": group, "permanent": permanent}, lines,
-                        lambda: core.do_delete_group(group, confirm, permanent))
+                        lambda: core.do_delete_group(group, confirm, permanent), require_human=True)
 
 
 @mcp.tool()
@@ -1034,7 +1056,8 @@ async def update_voice_profiles(job_id: str, group_override: str = "") -> str:
     except core.CoreError as ex:
         return f"Ошибка: {ex}"
     return await _gated("Обновление голосового профиля", snapshot,
-                        lambda: core.voice_action_lines(snapshot), lambda: core.start_voice_update(snapshot))
+                        lambda: core.voice_action_lines(snapshot), lambda: core.start_voice_update(snapshot),
+                        require_human=True)
 
 
 @mcp.tool()
@@ -1048,7 +1071,7 @@ async def revoke_voice_profiles(job_id: str) -> str:
         return f"Ошибка: {ex}"
     return await _gated("Отзыв голосового вклада", snapshot,
                         lambda: core.voice_action_lines(snapshot, revoke=True),
-                        lambda: core.revoke_voice_source(snapshot))
+                        lambda: core.revoke_voice_source(snapshot), require_human=True)
 
 
 @mcp.tool()
@@ -1057,7 +1080,7 @@ async def set_voice_auto_learn(enabled: bool, group: str = "") -> str:
     Изменение требует отдельного подтверждения человеком."""
     return await _gated("Настройка автопополнения голосов", {"group": group, "enabled": enabled},
                         lambda: [f"Группа: {group or 'умолчание новых групп'}", f"Автопополнение: {enabled}"],
-                        lambda: core.set_voice_auto_learn(enabled, group))
+                        lambda: core.set_voice_auto_learn(enabled, group), require_human=True)
 
 
 @mcp.tool()
@@ -1081,7 +1104,7 @@ async def set_voice_quality_policy(policy: str, group: str = "") -> str:
                         lambda: [f"Группа: {group or 'умолчание новых групп'}", f"Политика качества: {policy}",
                                  "reject_clipping отбраковывает только источник с клиппингом; "
                                  "тихая речь не отбраковывается."],
-                        lambda: core.set_voice_quality_policy(policy, group))
+                        lambda: core.set_voice_quality_policy(policy, group), require_human=True)
 
 
 @mcp.tool()
@@ -1104,7 +1127,7 @@ async def backup_voice_profiles(group: str = "") -> str:
                             lambda: [f"Группа: {group or 'все группы'}",
                                      "Резерв — биометрия в открытом виде.",
                                      "Старые резервы не заменяются и не удаляются."],
-                            lambda: core.backup_voice_profiles(group))
+                            lambda: core.backup_voice_profiles(group), require_human=True)
     except core.CoreError as ex:
         return f"Ошибка: {ex}"
 
@@ -1118,6 +1141,8 @@ def resolve_voice(name: str, recording: str, decision: str, profile: str = "") -
     profile — группа (имя из voice_profiles), если групп несколько. Возвращает итог решения."""
     if decision not in ("same", "different"):
         return 'decision: "same" или "different"'
+    if confirm.mode() == "off":
+        return "Ошибка: для решения по голосовому профилю требуется подтверждение человека"
     g = profile.replace(".voices.json", "").strip() if profile else ""
     files = [paths.voices_path(g)] if g else sorted(paths.GROUPS.glob("*/voices.json"))
     hits = []
@@ -1182,6 +1207,8 @@ def import_answers(job_id: str, answers: list[dict], source: str = "cloud") -> s
     Голосовые ответы распознаются GigaAM и сопоставляются с вариантами. Ответ на прежнюю version не
     принимается; на одно место из двух режимов побеждает более поздний, расхождение — в conflicts."""
     import review_pack as P
+    if any(isinstance(answer, dict) and answer.get("audio") for answer in answers):
+        return "Импорт ответов не принимает пути к аудиофайлам; используйте локальный голосовой разбор"
     jp, _ = _job_json(job_id)
     if not jp:
         return "Расшифровка не найдена или ещё не готова"
@@ -1234,7 +1261,16 @@ def _listen_reply(seconds, job_id, item_id):
     import voice_io
     jp, _ = _job_json(job_id) if job_id else (None, None)
     folder = (P.pack_dir(jp) / "voice") if jp else (JOBS / "voice")
-    wav = folder / f"{item_id or 'reply'}-listen-{int(time.time())}.wav"
+    safe_item_id = "reply"
+    if jp and item_id:
+        man = P.manifest(jp)
+        it = next((row for row in (man or {}).get("items", []) if row.get("id") == item_id), None)
+        if it is None:
+            return "Нет такого места в пакете"
+        safe_item_id = str(it["id"])
+    wav = folder / f"{safe_item_id}-listen-{int(time.time())}.wav"
+    if not wav.resolve().is_relative_to(folder.resolve()):
+        return "Недопустимый путь для аудиоответа"
     voice_io.beep()
     voice_io.record(wav, min(max(float(seconds), 1.0), 30.0))
     text = P.recognize_files([wav]).get(str(wav), "")

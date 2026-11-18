@@ -85,7 +85,14 @@ def old_default_dirs():
 
 
 def safe_group(group):
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (group or "default"))
+    value = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (group or "default"))
+    if len(value) > 64:
+        raise ValueError("имя группы длиннее 64 символов")
+    reserved = {"CON", "PRN", "AUX", "NUL",
+                *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if value.split(".", 1)[0].upper() in reserved:
+        raise ValueError("имя группы зарезервировано Windows")
+    return value
 
 
 def group_dir(group):

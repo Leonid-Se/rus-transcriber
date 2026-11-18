@@ -270,7 +270,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     with mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("отказ")):
                         self.assertIn("отказ", asyncio.run(server.resolve_document_conflict(draft_id, conflict_id)))
                     self.assertEqual(md_target.read_text(encoding="utf-8"), "external document edit")
-                    with mock.patch.object(confirm, "require") as approved:
+                    with mock.patch.object(confirm, "require", return_value="dialog") as approved:
                         response = asyncio.run(server.resolve_document_conflict(draft_id, conflict_id))
                     self.assertTrue(json.loads(response)["materialized"])
                     approved.assert_called_once()
@@ -543,7 +543,7 @@ class WorkerSnapshotTests(unittest.TestCase):
                     "AND resolution_operation_id IS NULL", (pending["conspect_id"],)).fetchone()
                 self.assertEqual(new_conflict["observed_bytes"], b"new external edit")
                 with mock.patch.object(settings.paths, "STATE_DB", base / "state.sqlite3"), \
-                        mock.patch.object(confirm, "require") as approved:
+                        mock.patch.object(confirm, "require", return_value="dialog") as approved:
                     response = asyncio.run(server.resolve_conspect_conflict(draft_id, new_conflict["conflict_id"]))
                 self.assertTrue(json.loads(response)["materialized"])
                 approved.assert_called_once()
@@ -664,12 +664,14 @@ class BackendSelectionTests(unittest.TestCase):
                                 str(uuid.uuid4()), recordings.operation_context(concurrent, "human"), review=review)
                         finally:
                             concurrent.close()
+                        return "dialog"
 
-                    with mock.patch.object(confirm, "require", side_effect=change_during_confirmation):
+                    with mock.patch.object(confirm, "require", side_effect=change_during_confirmation,
+                                           return_value="dialog"):
                         stale = asyncio.run(server.rename_speakers(reference, {"speaker-1": "Другое имя"}))
                     self.assertIn("изменилась", stale)
                     self.assertEqual(transcript.load(jp)["speaker_names"]["speaker-1"], "Тестовый")
-                    with mock.patch.object(confirm, "require") as approved:
+                    with mock.patch.object(confirm, "require", return_value="dialog") as approved:
                         renamed = asyncio.run(server.rename_speakers(reference, {"speaker-1": "Другое имя"}))
                     self.assertEqual(json.loads(renamed)["mapping"]["speaker-1"], "Другое имя")
                     approved.assert_called_once()
@@ -730,7 +732,7 @@ class BackendSelectionTests(unittest.TestCase):
                     with mock.patch.object(confirm, "require", side_effect=confirm.NotConfirmed("отказ")):
                         self.assertIn("отказ", asyncio.run(server.request_review_answer_verification(rid, ["r1"])))
                     self.assertNotIn("confirmation_context", review_pack.answers_state(jp)["answers"]["r1"])
-                    with mock.patch.object(confirm, "require") as approved:
+                    with mock.patch.object(confirm, "require", return_value="dialog") as approved:
                         response = asyncio.run(server.request_review_answer_verification(rid, ["r1"]))
                     self.assertEqual(json.loads(response)["confirmed"], ["r1"])
                     approved.assert_called_once()

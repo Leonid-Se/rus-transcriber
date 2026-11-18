@@ -63,15 +63,24 @@ class CoreJobsTests(unittest.TestCase):
         with self.assertRaises(core.CoreError):
             core.status("нет-такой")
 
+    def test_job_id_rejects_path_traversal(self):
+        for job_id in ("..\\..\\victim", "C:\\temp\\victim", "a/b", "", "x" * 200):
+            with self.subTest(job_id=job_id):
+                self.assertIsNone(core.job_status(job_id))
+                self.assertIsNone(core.pid_of(job_id))
+                with self.assertRaises(core.CoreError):
+                    core.cancel_job(job_id)
+
     def test_lost_process_becomes_error(self):
-        j = self.job("t-lost", "running", stage="расшифровка")
+        j = self.job("20261118-140000-t00001", "running", stage="расшифровка")
         (core.JOBS / f"{j}.pid").write_text("999999", encoding="utf-8")
         with mock.patch.object(core, "alive", return_value=False):
             s = core.job_status(j)
         self.assertEqual(s["state"], "error")
 
     def test_status_live_fields_and_stage_key(self):
-        j = self.job("t-run", "running", stage="поиск речи 3/10", started_ts=1.0, stage_started_ts=2.0)
+        j = self.job("20261118-140000-t00002", "running", stage="поиск речи 3/10",
+                     started_ts=1.0, stage_started_ts=2.0)
         s = core.status(j)
         self.assertIn("elapsed_sec", s)
         self.assertNotIn("started_ts", s)
@@ -81,7 +90,7 @@ class CoreJobsTests(unittest.TestCase):
                             core.stage_key({"state": "running", "stage": "б 1/2"}))
 
     def test_read_not_ready_and_start_errors(self):
-        j = self.job("t-wait", "running", stage="этап", progress=5)
+        j = self.job("20261118-140000-t00003", "running", stage="этап", progress=5)
         with self.assertRaises(core.CoreError):
             core.read_transcript(j)
         with self.assertRaises(core.CoreError):
@@ -92,11 +101,12 @@ class CoreJobsTests(unittest.TestCase):
             core.start_transcription(str(f), whisper="лишнее")
 
     def test_cancel_finished_job_is_noop(self):
-        j = self.job("t-done", "done", stage="готово")
+        j = self.job("20261118-140000-t00004", "done", stage="готово")
         self.assertIn("note", core.cancel_job(j))
 
     def test_list_jobs(self):
-        j = self.job("t-list", "done", stage="готово", progress=100, kind="transcribe", file="a.mp3")
+        j = self.job("20261118-140000-t00005", "done", stage="готово", progress=100,
+                     kind="transcribe", file="a.mp3")
         row = next(r for r in core.list_jobs(50) if r["job_id"] == j)
         self.assertEqual(row["state"], "done")
 

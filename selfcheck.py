@@ -11,7 +11,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,26 +54,29 @@ def parse_unittest(text):
 
 
 def run_tests(timeout=TESTS_TIMEOUT):
-    data = tempfile.mkdtemp(prefix="rt-data-")           # своя папка данных: тесты не видят настоящую
-    env = dict(os.environ, RUS_TRANSCRIBER_DATA=data, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     t0 = time.time()
-    try:
-        cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
-        if sys.version_info >= (3, 12):
-            cmd += ["--durations", "5"]                # самые медленные тесты — в ответ
-        r = subprocess.run(cmd, cwd=str(HERE), env=env,
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           creationflags=0x08000000 if os.name == "nt" else 0)
-        res = parse_unittest(r.stderr + "\n" + r.stdout)
-        res["exit_code"] = r.returncode
-        if not res["ran"]:
-            res["output_tail"] = (r.stderr or r.stdout)[-800:]
-    except subprocess.TimeoutExpired:
-        res = {"ran": 0, "ok": False, "error": f"тесты не уложились в {timeout} с"}
-    except OSError as ex:
-        res = {"ran": 0, "ok": False, "error": f"не удалось запустить тесты: {ex}"}
-    finally:
-        shutil.rmtree(data, ignore_errors=True)
+    with tempfile.TemporaryDirectory(prefix="rt-selfcheck-") as sandbox:
+        root = Path(sandbox)
+        data, temp = root / "data", root / "tmp"
+        data.mkdir()
+        temp.mkdir()
+        env = dict(os.environ, RUS_TRANSCRIBER_DATA=str(data), TEMP=str(temp), TMP=str(temp),
+                   PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        try:
+            cmd = [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"]
+            if sys.version_info >= (3, 12):
+                cmd += ["--durations", "5"]                # самые медленные тесты — в ответ
+            r = subprocess.run(cmd, cwd=str(HERE), env=env,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                               creationflags=0x08000000 if os.name == "nt" else 0)
+            res = parse_unittest(r.stderr + "\n" + r.stdout)
+            res["exit_code"] = r.returncode
+            if not res["ran"]:
+                res["output_tail"] = (r.stderr or r.stdout)[-800:]
+        except subprocess.TimeoutExpired:
+            res = {"ran": 0, "ok": False, "error": f"тесты не уложились в {timeout} с"}
+        except OSError as ex:
+            res = {"ran": 0, "ok": False, "error": f"не удалось запустить тесты: {ex}"}
     res["wall_sec"] = round(time.time() - t0, 1)
     return res
 

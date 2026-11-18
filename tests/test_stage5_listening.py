@@ -77,7 +77,8 @@ class ListeningTests(unittest.TestCase):
         self.assertEqual(man["items"][0]["options"][1]["decision"], {"listened": "silence"})
         self.assertEqual(man["items"][0]["diagnostic_id"], "missed-0001")
         self.assertEqual(man["items"][0]["automation_diagnostic"]["candidate"]["decision"], "warning")
-        review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "option": 1}], "local")
+        review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "option": 1}],
+                                "local", trusted_actor="human")
         stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
         self.assertEqual(stored["answers"]["r1"]["diagnostic_id"], "missed-0001")
         transcript.save(transcript.load(self.jp), self.jp, self.md)
@@ -89,14 +90,16 @@ class ListeningTests(unittest.TestCase):
         with patch.object(review_pack, "cut_clip", return_value=0):
             review_pack.build(self.jp, [{"id": "r1", "options": [{"label": "OK", "decision": {}}]}])
         man = review_pack.manifest(self.jp)
-        review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "option": 1}], "local")
+        review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "option": 1}],
+                                "local", trusted_actor="human")
         with patch.object(transcript, "_refresh_conspects", return_value=None):
             core.apply_answers_files(self.jp, self.md)
             self.assertEqual(transcript.load(self.jp)["review"][0]["listening"]["result"], "silence")
             stored = review_pack._read(review_pack.pack_dir(self.jp) / "answers.json", {})
             self.assertEqual(stored["application_events"][-1]["diagnostic_id"], "missed-0001")
             self.assertEqual(stored["application_events"][-1]["action"], "applied")
-            review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "kind": "revert"}], "local")
+            review_pack.add_answers(self.jp, [{"id": "r1", "version": man["version"], "kind": "revert"}],
+                                    "local", trusted_actor="human")
             core.apply_answers_files(self.jp, self.md)
         item = transcript.load(self.jp)["review"][0]
         self.assertEqual(item["status"], "open")

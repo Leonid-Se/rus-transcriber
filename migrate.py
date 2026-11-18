@@ -137,6 +137,9 @@ def run(dry=False):
     lk = _lock()
     if lk is None:
         return {"status": "busy", "why": "перенос уже идёт в другом процессе"}
+    moved = 0
+    backup = None
+    relocated = []
     try:
         b = _busy()
         if b:
@@ -183,7 +186,6 @@ def run(dry=False):
             _log(f"config.json: сохранены отличия от умолчаний: {sorted(kept)}")
         # 2. прежние файлы -> резервная копия (только после того, как всё скопировано и проверено)
         backup.mkdir(parents=True, exist_ok=True)
-        moved = 0
         for s, _d in items:
             rel = s.relative_to(paths.HERE)
             t = backup / rel
@@ -209,7 +211,12 @@ def run(dry=False):
         _log(f"готово: скопировано {len(copied)}, в резерв {moved}, резерв {backup}, конфликтов {len(conflicts)}")
         return res
     except Exception as ex:
-        _log(f"ОШИБКА переноса, исходные файлы не тронуты: {ex}")
+        if moved:
+            _log(f"ОШИБКА переноса после перемещения в резерв {moved} файлов; "
+                 f"проверьте исходники и резерв {backup or 'не создан'}: {ex}")
+        else:
+            _log(f"ОШИБКА миграции до перемещения файлов в резерв; копии в DATA_DIR могли появиться, "
+                 f"прежние папки могли быть перенесены: {ex}")
         raise
     finally:
         lk.close()

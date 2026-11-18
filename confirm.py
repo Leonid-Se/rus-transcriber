@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+import unicodedata
 
 import paths
 import settings
@@ -58,8 +59,12 @@ def clean(text, limit=1400):
     """Текст для окна: без управляющих символов, строки и общая длина ограничены."""
     lines = []
     for raw in str(text).splitlines():
-        s = "".join(ch for ch in raw if ch == "\t" or ch >= " ")[:220]
+        s = "".join(ch for ch in raw if ch == "\t" or not unicodedata.category(ch).startswith("C"))
+        if len(s) > 220:
+            s = s[:219] + "…"
         lines.append(s)
+    if len(lines) > 40:
+        lines = lines[:39] + ["… (список строк сокращён)"]
     out = "\n".join(lines)
     return out if len(out) <= limit else out[:limit] + "\n…"
 
@@ -83,10 +88,22 @@ def _read(p):
 
 
 def _write(p, d):
+    import tempfile
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(p)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent,
+                                     prefix=p.name + ".", suffix=".tmp", delete=False) as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+        tmp = f.name
+    try:
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _state_lock():
+    import jobslots
+    return jobslots.file_lock(PENDING.parent / "confirm-state.lock")
 
 
 # ---------- канал 1: окно на экране ----------
@@ -124,19 +141,21 @@ def _prune(d):
 
 
 def request_terminal(key, action, text):
-    d = _prune(_read(PENDING))
-    d[key] = {"action": action, "text": clean(text), "expires": time.time() + TTL}
-    _write(PENDING, d)
+    with _state_lock():
+        d = _prune(_read(PENDING))
+        d[key] = {"action": action, "text": clean(text), "expires": time.time() + TTL}
+        _write(PENDING, d)
 
 
 def consume(key):
     """Есть ли действующее разрешение на это действие; разрешение одноразовое."""
-    d = _prune(_read(APPROVED))
-    if key not in d:
-        return False
-    d.pop(key)
-    _write(APPROVED, d)
-    return True
+    with _state_lock():
+        d = _prune(_read(APPROVED))
+        if key not in d:
+            return False
+        d.pop(key)
+        _write(APPROVED, d)
+        return True
 
 
 def pending_requests():
@@ -145,21 +164,23 @@ def pending_requests():
 
 def approve(key):
     """Вызывается rt.py approve после «да» человека в терминале."""
-    p = _prune(_read(PENDING))
-    if key not in p:
-        return False
-    a = _prune(_read(APPROVED))
-    a[key] = {"action": p[key]["action"], "expires": time.time() + TTL}
-    _write(APPROVED, a)
-    p.pop(key)
-    _write(PENDING, p)
-    return True
+    with _state_lock():
+        p = _prune(_read(PENDING))
+        if key not in p:
+            return False
+        a = _prune(_read(APPROVED))
+        a[key] = {"action": p[key]["action"], "expires": time.time() + TTL}
+        _write(APPROVED, a)
+        p.pop(key)
+        _write(PENDING, p)
+        return True
 
 
 def reject(key):
-    p = _prune(_read(PENDING))
-    p.pop(key, None)
-    _write(PENDING, p)
+    with _state_lock():
+        p = _prune(_read(PENDING))
+        p.pop(key, None)
+        _write(PENDING, p)
 
 
 # ---------- вход для слоя управления ----------

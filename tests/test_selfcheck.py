@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import selfcheck  # noqa: E402
@@ -83,6 +84,23 @@ class SelfCheck(unittest.TestCase):
         r = self._with_check_repo("    return [('a.py:1', 'нарушение')], set(), False\n")
         self.assertFalse(r["ok"])
         self.assertEqual(r["violations"], 1)
+
+    def test_tests_run_with_isolated_temp_data_and_no_bytecode(self):
+        seen = {}
+
+        def run(cmd, *, cwd, env, **kwargs):
+            seen.update(cmd=cmd, cwd=cwd, env=env)
+            return mock.Mock(returncode=0, stdout="", stderr="Ran 1 test in 0.01s\n\nOK\n")
+
+        with mock.patch.object(selfcheck.subprocess, "run", side_effect=run):
+            result = selfcheck.run_tests()
+        env = seen["env"]
+        self.assertTrue(result["ok"])
+        self.assertIn("-B", seen["cmd"])
+        self.assertEqual(env["TEMP"], env["TMP"])
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertTrue(Path(env["RUS_TRANSCRIBER_DATA"]).is_relative_to(Path(env["TEMP"]).parent))
+        self.assertFalse(Path(env["TEMP"]).exists())
 
 
 if __name__ == "__main__":

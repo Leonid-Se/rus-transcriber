@@ -252,7 +252,10 @@ def _save_locked(data, json_path, md_path):
         if _listening_fingerprint(current) != listening.get("fingerprint"):
             item.pop("listening", None)
             item["status"] = "open"
-            item["note"] = "Слова интервала изменились после прослушивания; нужна новая проверка."
+            reminder = "Слова интервала изменились после прослушивания; нужна новая проверка."
+            note = item.get("note") or ""
+            if reminder not in note:
+                item["note"] = f"{note.rstrip()}\n\n{reminder}".strip()
             data["review_done"] = False
     import recordings
     draft = recordings.answer_draft_for(json_path)
@@ -282,11 +285,30 @@ def _save_locked(data, json_path, md_path):
         finally:
             store.close()
     data["source_revision"] = data.get("source_revision", 0) + 1
-    Path(json_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    Path(md_path).write_text(render_md(data), encoding="utf-8")
+    import conspect
+    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    md_bytes = render_md(data).encode("utf-8")
+    md_target = Path(md_path)
+    try:
+        old_md = md_target.read_bytes()
+    except FileNotFoundError:
+        old_md = None
+    try:
+        conspect._replace_bytes(md_target, md_bytes)
+        conspect._replace_bytes(Path(json_path), json_bytes)
+    except Exception:
+        try:
+            if old_md is None:
+                md_target.unlink(missing_ok=True)
+            else:
+                conspect._replace_bytes(md_target, old_md)
+        except OSError:
+            pass
+        raise
 
 
 def load(json_path):
+    import conspect
     import recordings
     draft = recordings.answer_draft_for(json_path)
     if draft is not None:
@@ -297,7 +319,8 @@ def load(json_path):
             return recordings.load_recording(store, binding["recording_id"])
         finally:
             store.close()
-    return json.loads(Path(json_path).read_text(encoding="utf-8"))
+    with conspect.write_lock(json_path):
+        return json.loads(Path(json_path).read_text(encoding="utf-8"))
 
 
 def _undo_fingerprint(data):

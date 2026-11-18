@@ -275,8 +275,10 @@ class AnswerIntegrity(unittest.TestCase):
         pd.mkdir(parents=True, exist_ok=True)
         P._write(pd / "manifest.json", {"version": "v1", "items": [dict(x) for x in before["review"]]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {
-            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "test", "ts": "2026-01-01"},
-            "r2": {"id": "r2", "kind": "free", "text": "второе", "source": "test", "ts": "2026-01-01"}}})
+            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "test", "actor_kind": "human",
+                   "ts": "2026-01-01"},
+            "r2": {"id": "r2", "kind": "free", "text": "второе", "source": "test", "actor_kind": "human",
+                   "ts": "2026-01-01"}}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             result = core.apply_answers("demo")
             self.assertEqual(sorted(result["free_text"]["successful_ids"]), ["r1", "r2"])
@@ -321,7 +323,8 @@ class AnswerIntegrity(unittest.TestCase):
              "options": [{"label": "Борис", "decision": {"speaker": "Борис"}},
                          {"label": "другое", "decision": {"text": "другое"}}]}]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
-            "id": "r1", "kind": "option", "option": 0, "source": "test", "ts": "2026-01-01"}}})
+            "id": "r1", "kind": "option", "option": 0, "source": "test", "actor_kind": "human",
+            "ts": "2026-01-01"}}})
 
         def apply():
             with patch.object(core, "job_json", return_value=(c.json, c.md)):
@@ -350,7 +353,8 @@ class AnswerIntegrity(unittest.TestCase):
         pd.mkdir(parents=True, exist_ok=True)
         P._write(pd / "manifest.json", {"version": "v1", "items": [dict(x) for x in before["review"]]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
-            "id": "r1", "kind": "free", "text": "первое", "source": "test", "ts": "2026-01-01"}}})
+            "id": "r1", "kind": "free", "text": "первое", "source": "test", "actor_kind": "human",
+            "ts": "2026-01-01"}}})
 
         def apply():
             with patch.object(core, "job_json", return_value=(c.json, c.md)):
@@ -454,7 +458,8 @@ class AnswerIntegrity(unittest.TestCase):
                    for r, new in zip(before["review"], ["первое", "второе"])]
         P._write(pd / "manifest.json", {"version": "v1", "items": entries})
         P._write(pd / "answers.json", {"version": "v1", "answers": {
-            rid: {"id": rid, "kind": "option", "option": 0, "source": "test", "ts": "2026-01-01"}
+            rid: {"id": rid, "kind": "option", "option": 0, "source": "test", "actor_kind": "human",
+                  "ts": "2026-01-01"}
             for rid in ("r1", "r2")}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             self.assertEqual(core.apply_answers("demo")["applied_from_answers"], 2)
@@ -517,7 +522,7 @@ class AnswerIntegrity(unittest.TestCase):
         P._write(pd / "manifest.json", {"version": "v1", "items": [{"id": "r1", "t1": 0.0, "t2": 0.0,
                  "options": [{"label": "сменить", "decision": {"speaker": "Борис"}}]}]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {"id": "r1", "kind": "option",
-                 "option": 0, "source": "test", "ts": "2026-01-01"}}})
+                 "option": 0, "source": "test", "actor_kind": "human", "ts": "2026-01-01"}}})
         def apply():
             with patch.object(core, "job_json", return_value=(c.json, c.md)):
                 return core.apply_answers("demo")
@@ -609,7 +614,7 @@ class AnswerIntegrity(unittest.TestCase):
         c, P, original = self._overlap_free_case()
         pd = P.pack_dir(c.json)
         store = {"version": "v1", "answers": {"r2": {"id": "r2", "version": "v1", "kind": "free",
-                 "text": "новое", "source": "local", "ts": "2026-01-01"}}}
+                 "text": "новое", "source": "local", "actor_kind": "human", "ts": "2026-01-01"}}}
         P._write(pd / "answers.json", store)
         preview = P.apply_free(c.json, c.md, store["answers"], dry_run=True)
         self.assertEqual(preview["successful_ids"], ["r2"])
@@ -653,7 +658,7 @@ class AnswerIntegrity(unittest.TestCase):
                  "items": [dict(r, options=[], word_ids=[wid]) for r in before["review"]]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {
             rid: {"id": rid, "version": "v1", "kind": "free", "text": text,
-                  "source": "local", "ts": "2026-01-01"}
+                  "source": "local", "actor_kind": "human", "ts": "2026-01-01"}
             for rid, text in (("r1", "первое"), ("r2", "второе"))}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             result = core.apply_answers("demo")
@@ -677,9 +682,12 @@ class AnswerIntegrity(unittest.TestCase):
                  for n, r in enumerate(before["review"])]
         P._write(pd / "manifest.json", {"version": "v1", "recording_id": before["recording_id"], "items": items})
         P._write(pd / "answers.json", {"version": "v1", "answers": {
-            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "local", "ts": "2026-01-01"},
-            "r2": {"id": "r2", "kind": "option", "option": 0, "source": "local", "ts": "2026-01-01"},
-            "r3": {"id": "r3", "kind": "free", "text": "третье", "source": "local", "ts": "2026-01-01"}}})
+            "r1": {"id": "r1", "kind": "free", "text": "первое", "source": "local", "actor_kind": "human",
+                   "ts": "2026-01-01"},
+            "r2": {"id": "r2", "kind": "option", "option": 0, "source": "local", "actor_kind": "human",
+                   "ts": "2026-01-01"},
+            "r3": {"id": "r3", "kind": "free", "text": "третье", "source": "local", "actor_kind": "human",
+                   "ts": "2026-01-01"}}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             result = core.apply_answers("demo")
         self.assertEqual(result["preflight_conflicts"][0]["cards"], ["r1", "r2"])
@@ -720,14 +728,15 @@ class AnswerIntegrity(unittest.TestCase):
         P._write(pd / "manifest.json", {"version": "v1", "recording_id": data["recording_id"],
                  "items": [dict(r, word_ids=[wid], options=opts) for r in data["review"]]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {
-            "id": "r1", "kind": "option", "option": 0, "source": "local", "ts": "2026-01-01"}}})
+            "id": "r1", "kind": "option", "option": 0, "source": "local", "actor_kind": "human",
+            "ts": "2026-01-01"}}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             self.assertEqual(core.apply_answers("demo")["review"]["successful_ids"], ["r1"])
             previous = T.load(c.json)
             store = P._read(pd / "answers.json", {})
             store["answers"]["r1"].update(option=1, ts="2026-01-02")
             store["answers"]["r2"] = {"id": "r2", "kind": "free", "text": "третье",
-                                      "source": "local", "ts": "2026-01-02"}
+                                      "source": "local", "actor_kind": "human", "ts": "2026-01-02"}
             P._write(pd / "answers.json", store)
             result = core.apply_answers("demo")
         self.assertTrue(result["preflight_conflicts"])
@@ -802,7 +811,8 @@ class AnswerIntegrity(unittest.TestCase):
         pd.mkdir(parents=True, exist_ok=True)
         P._write(pd / "manifest.json", {"version": "v1", "items": [dict(before["review"][0], options=[])]})
         P._write(pd / "answers.json", {"version": "v1", "answers": {"r1": {"id": "r1", "kind": "free",
-                 "text": "Анна: и он у нас", "source": "test", "ts": "2026-01-01"}}})
+                 "text": "Анна: и он у нас", "source": "test", "actor_kind": "human",
+                 "ts": "2026-01-01"}}})
         with patch.object(core, "job_json", return_value=(c.json, c.md)):
             result = core.apply_answers("demo")
             self.assertEqual(result["free_text"]["successful_ids"], ["r1"])
@@ -845,7 +855,7 @@ class AnswerIntegrity(unittest.TestCase):
     def test_explicit_empty_applied_map_is_not_legacy(self):
         import review_pack as P
         store = {"applied_at": "2026-11-12", "applied_answers": {},
-                 "answers": {"r1": {"kind": "revert", "ts": "2026-11-11"}}}
+                 "answers": {"r1": {"kind": "revert", "actor_kind": "human", "ts": "2026-11-11"}}}
         self.assertEqual(P._applied_map(store), {})
 
 

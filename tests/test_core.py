@@ -408,6 +408,22 @@ class Settings(unittest.TestCase):
         paths.CONFIG_FILE.write_text("{oops", encoding="utf-8")
         self.assertEqual(settings.load_config(), settings.DEFAULTS)
 
+    def test_config_types_are_validated_and_unknown_keys_are_ignored(self):
+        paths.CONFIG_FILE.write_text(json.dumps({
+            "asr_batch": "16", "emotions": "false", "confirm_timeout_sec": True,
+            "bench_min_similarity": float("inf"), "voices_debug": True, "future_setting": "x",
+        }), encoding="utf-8")
+        cfg = settings.load_config()
+        self.assertEqual(cfg["asr_batch"], settings.DEFAULTS["asr_batch"])
+        self.assertEqual(cfg["emotions"], settings.DEFAULTS["emotions"])
+        self.assertEqual(cfg["confirm_timeout_sec"], settings.DEFAULTS["confirm_timeout_sec"])
+        self.assertEqual(cfg["bench_min_similarity"], settings.DEFAULTS["bench_min_similarity"])
+        self.assertTrue(cfg["voices_debug"])
+        self.assertNotIn("future_setting", cfg)
+        self.assertIn("future_setting", settings.load_overrides())
+        with self.assertRaisesRegex(ValueError, "неверный тип настройки"):
+            settings.update(asr_batch="16")
+
     def test_pick_group_rules(self):
         self.assertIsNone(paths.pick_group())                                     # групп нет — без словаря
         paths.voices_path("alpha").parent.mkdir(parents=True)
@@ -423,6 +439,11 @@ class Settings(unittest.TestCase):
     def test_group_names_are_safe_folder_names(self):
         self.assertEqual(paths.safe_group("../x y"), "___x_y")
         self.assertEqual(paths.safe_group(""), "default")
+        for name in ("CON", "nul", "COM1", "LPT9"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                paths.safe_group(name)
+        with self.assertRaises(ValueError):
+            paths.safe_group("x" * 65)
 
 
 if __name__ == "__main__":

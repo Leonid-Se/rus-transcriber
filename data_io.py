@@ -115,6 +115,8 @@ def export_data(dest_dir=None, group=None, with_jobs=False):
         ginfo.append(info)
     if with_jobs:
         for p in sorted(paths.JOBS.glob("*.json")):
+            if p.name.endswith(".voices_debug.json"):
+                continue
             try:
                 files[f"jobs/{p.name}"] = _dump(normalize(json.loads(p.read_text(encoding="utf-8"))))
             except Exception:
@@ -314,8 +316,8 @@ def import_data(zip_path, mode="merge", apply=False):
 # ---------- удаление группы, очистка, проверка ----------
 def delete_group(group, confirm="", permanent=False):
     g = paths.safe_group(group)
-    if confirm != group:
-        raise RuntimeError(f"Подтверждение не совпало: для удаления передайте confirm=«{group}»")
+    if confirm != g:
+        raise RuntimeError(f"Подтверждение не совпало: для удаления передайте confirm=«{g}»")
     gd = paths.group_dir(g)
     if not gd.is_dir():
         raise RuntimeError(f"Группа «{group}» не найдена (есть: {', '.join(paths.list_groups())})")
@@ -331,6 +333,23 @@ def delete_group(group, confirm="", permanent=False):
 def cleanup_jobs(days=30, apply=False):
     cutoff = time.time() - max(0, float(days)) * 86400
     n = size = 0
+    import core
+
+    def active_job(path):
+        name = path.name
+        if name.endswith(".voices_debug.json"):
+            job_id = name[:-len(".voices_debug.json")]
+        else:
+            job_id = path.stem
+        try:
+            status = json.loads((paths.JOBS / f"{job_id}.json").read_text(encoding="utf-8"))
+            if status.get("state") not in ("queued", "running"):
+                return False
+            pid = int((paths.JOBS / f"{job_id}.pid").read_text(encoding="utf-8").strip())
+            return core.alive(pid)
+        except (OSError, ValueError, TypeError):
+            return False
+
     for p in paths.JOBS.iterdir():
         if not p.is_file() or p.suffix not in (".json", ".log", ".pid"):
             continue
@@ -338,10 +357,8 @@ def cleanup_jobs(days=30, apply=False):
             st = p.stat()
             if st.st_mtime >= cutoff:
                 continue
-            if p.suffix == ".json":
-                state = json.loads(p.read_text(encoding="utf-8")).get("state")
-                if state in ("queued", "running") and time.time() - st.st_mtime < 86400:
-                    continue
+            if active_job(p):
+                continue
             n += 1
             size += st.st_size
             if apply:

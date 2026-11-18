@@ -1,6 +1,7 @@
 """Настройки: значения по умолчанию заданы в коде, DATA_DIR\\config.json хранит только отличия пользователя
 (результат теста скорости, свои пределы) и накладывается поверх них."""
 import json
+import math
 import sys
 import time
 from contextlib import contextmanager
@@ -28,7 +29,29 @@ DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnn
             # порог совпадения текста с эталоном при выборе устройства в тесте скорости.
             # 0.97 — обычный компромисс; для работы, где важнее точность, поднимите до 0.99.
             "bench_min_similarity": 0.97,
-            "confirm_mode": "auto", "confirm_timeout_sec": 180}
+             "confirm_mode": "auto", "confirm_timeout_sec": 180}
+
+# Настройки дополнительных возможностей, у которых нет обязательного значения по умолчанию.
+# Неизвестные ключи остаются в файле для совместимости, но в эффективную конфигурацию не попадают.
+EXTRA_CONFIG_TYPES = {
+    "asr_quant": str, "asr_quant_cpu": str, "asr_language": str, "asr_third_backend": str,
+    "word_win_near_change": float,
+    "review_missed": bool, "voices": bool, "voices_debug": bool, "review_local": bool,
+}
+CONFIG_TYPES = {**{key: type(value) for key, value in DEFAULTS.items()}, **EXTRA_CONFIG_TYPES}
+
+
+def _valid_config_value(key, value):
+    expected = CONFIG_TYPES.get(key)
+    if expected is None:
+        return True
+    if expected is bool:
+        return type(value) is bool
+    if expected is int:
+        return type(value) is int
+    if expected is float:
+        return type(value) in (int, float) and math.isfinite(value)
+    return isinstance(value, expected)
 
 
 def load_overrides():
@@ -46,7 +69,14 @@ def load_overrides():
 
 def load_config():
     cfg = dict(DEFAULTS)
-    cfg.update(load_overrides())
+    for key, value in load_overrides().items():
+        if key not in CONFIG_TYPES:
+            continue
+        if not _valid_config_value(key, value):
+            print(f"config.json: неверный тип параметра {key}; используется значение по умолчанию",
+                  file=sys.stderr)
+            continue
+        cfg[key] = value
     return cfg
 
 
@@ -56,14 +86,46 @@ def save_overrides(overrides, explicit=()):
     explicit — ключи, которые нужно сохранить, даже если они совпадают с умолчанием: так выбор
     этой машины (например, «процессор») остаётся явным и не меняется при обновлении программы.
     """
+    with _config_lock():
+        return _save_overrides_locked(overrides, explicit)
+
+
+def _config_lock():
+    import jobslots
+    @contextmanager
+    def lock():
+        path = paths.JOBS / "config.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+b") as f:
+            while not jobslots._try_lock(f):
+                time.sleep(0.05)
+            yield
+    return lock()
+
+
+def _save_overrides_locked(overrides, explicit=()):
+    import os
+    import tempfile
+    usable = {}
+    for key, value in overrides.items():
+        if not _valid_config_value(key, value):
+            print(f"config.json: неверный тип параметра {key}; значение не сохранено", file=sys.stderr)
+            continue
+        usable[key] = value
     keep = set(explicit)
-    diff = {k: v for k, v in overrides.items()
+    diff = {k: v for k, v in usable.items()
             if k != "schema_version" and (k in keep or DEFAULTS.get(k, object()) != v)}
     out = {"schema_version": paths.DATA_SCHEMA, **diff}
     paths.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = paths.CONFIG_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(paths.CONFIG_FILE)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=paths.DATA_DIR,
+                                     prefix="config.", suffix=".tmp", delete=False) as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+        tmp = f.name
+    try:
+        os.replace(tmp, paths.CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return diff
 
 
@@ -72,9 +134,13 @@ def update(explicit=(), **kv):
 
     explicit — что записать явно, даже если значение совпадает с умолчанием (выбор теста скорости).
     """
-    cur = load_overrides()
-    cur.update(kv)
-    return save_overrides(cur, explicit=explicit)
+    invalid = [key for key, value in kv.items() if not _valid_config_value(key, value)]
+    if invalid:
+        raise ValueError("неверный тип настройки: " + ", ".join(sorted(invalid)))
+    with _config_lock():
+        cur = load_overrides()
+        cur.update(kv)
+        return _save_overrides_locked(cur, explicit=explicit)
 
 
 def user_display_name(store):
@@ -174,6 +240,9 @@ def group_voice_lock(group):
     directory = paths.JOBS / "voice-locks"
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / (group + ".lock"), "a+") as f:
+        deadline = time.monotonic() + 60
         while not jobslots._try_lock(f):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("профиль занят другим процессом; повторите позже")
             time.sleep(0.1)
         yield

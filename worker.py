@@ -219,16 +219,26 @@ class Status:
     def _write(self):
         if not self.path:
             return
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-        for k in range(20):      # Windows: замена не проходит, пока сервер читает файл, — повторяем
+        import jobslots
+        import tempfile
+        with jobslots.file_lock(self.path.with_suffix(".status.lock")):
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                             prefix=self.path.name + ".", suffix=".tmp", delete=False) as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+                tmp = Path(f.name)
             try:
-                os.replace(tmp, self.path)
-                return
-            except PermissionError:
-                time.sleep(0.05 * (k + 1))
-        if self.data.get("state") in ("done", "error"):
-            raise RuntimeError(f"не удалось записать статус {self.path}")
+                for k in range(20):      # Windows: замена не проходит, пока читатель держит файл — повторяем
+                    try:
+                        os.replace(tmp, self.path)
+                        if self.data.get("state") in ("done", "error", "cancelled"):
+                            self.path.with_suffix(".pid").unlink(missing_ok=True)
+                        return
+                    except PermissionError:
+                        time.sleep(0.05 * (k + 1))
+                if self.data.get("state") in ("done", "error"):
+                    raise RuntimeError(f"не удалось записать статус {self.path}")
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def set(self, **kw):
         with self._lock:
@@ -1439,23 +1449,22 @@ def _execute_workflow_model(status):
     request_id = getattr(status, "data", {}).get("workflow_request_id")
     if not request_id:
         return {}
-    import llm_provider
-    import recordings
-    import workflow
-    store = recordings.open_store()
     try:
-        request = workflow.get(store, request_id)
-        if not request["policy"]["require_conspect"]:
-            return {}
-        if not request["policy"]["allow_cloud_model"]:
-            return {"model_state": "waiting_model", "model_error": "облачный исполнитель запрещён политикой"}
+        import recordings
+        import workflow
+        store = recordings.open_store()
         try:
+            request = workflow.get(store, request_id)
+            if not request["policy"]["require_conspect"]:
+                return {}
+            if not request["policy"]["allow_cloud_model"]:
+                return {"model_state": "waiting_model", "model_error": "облачный исполнитель запрещён политикой"}
             result = workflow.execute_model(store, request_id)
             return {"model_state": result["state"], "model": result["model"]}
-        except llm_provider.ProviderError as ex:
-            return {"model_state": "failed", "model_error": str(ex)}
-    finally:
-        store.close()
+        finally:
+            store.close()
+    except Exception as ex:
+        return {"model_state": "failed", "model_error": f"{type(ex).__name__}: {ex}"[:1000]}
 
 
 if __name__ == "__main__":

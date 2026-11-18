@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -57,15 +58,34 @@ def alive(pid):
 
 
 def pid_of(job_id):
+    if not _valid_job_id(job_id):
+        return None
     try:
-        return int((JOBS / f"{job_id}.pid").read_text(encoding="utf-8").strip())
+        return int(_job_path(job_id, ".pid").read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
 
 
+def _valid_job_id(job_id):
+    return isinstance(job_id, str) and bool(
+        re.fullmatch(r"(?:\d{8}-\d{6}-[a-z][0-9a-f]{5}|workflow-[0-9a-f]{32})", job_id))
+
+
+def _job_path(job_id, suffix):
+    if not _valid_job_id(job_id):
+        raise CoreError("Недопустимый идентификатор задачи")
+    root = JOBS.resolve()
+    path = (JOBS / f"{job_id}{suffix}").resolve()
+    if not path.is_relative_to(root):
+        raise CoreError("Путь задачи находится вне каталога jobs")
+    return path
+
+
 def job_status(job_id):
     """Статус задачи (dict) или None, если такой задачи нет. Если процесс пропал без итога — state=error."""
-    p = JOBS / f"{job_id}.json"
+    if not _valid_job_id(job_id):
+        return None
+    p = _job_path(job_id, ".json")
     if not p.exists():
         return None
     for _ in range(3):        # файл могут как раз заменять (os.replace в worker) — пробуем ещё раз
@@ -100,7 +120,7 @@ def _need(job_id):
 def launch(script, args, src, kind, *, initial_state=None, job_id=None):
     """Запускает фоновый процесс-задачу (worker.py и др.), возвращает job_id."""
     job_id = job_id or time.strftime("%Y%m%d-%H%M%S-") + kind[0] + uuid.uuid4().hex[:5]
-    status = JOBS / f"{job_id}.json"
+    status = _job_path(job_id, ".json")
     with status.open("x", encoding="utf-8") as stream:
         json.dump({**(initial_state or {}), "state": "queued", "kind": kind, "file": str(src)},
                   stream, ensure_ascii=False)
@@ -110,7 +130,29 @@ def launch(script, args, src, kind, *, initial_state=None, job_id=None):
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                             cwd=str(HERE), creationflags=flags, env=env)
-    (JOBS / f"{job_id}.pid").write_text(str(proc.pid), encoding="utf-8")
+    import jobslots
+    pid_path = _job_path(job_id, ".pid")
+    try:
+        with jobslots.file_lock(_job_path(job_id, ".status.lock")):
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=JOBS,
+                                             prefix=job_id + ".", suffix=".pid.tmp", delete=False) as f:
+                f.write(str(proc.pid))
+                tmp = Path(f.name)
+            try:
+                os.replace(tmp, pid_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            current = job_status(job_id) or {}
+            if current.get("state") in FINISHED:
+                pid_path.unlink(missing_ok=True)
+    except OSError as ex:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        pid_path.unlink(missing_ok=True)
+        raise CoreError(f"Не удалось сохранить PID задачи; worker мог остаться запущенным: {ex}") from ex
     return job_id
 
 
@@ -134,8 +176,23 @@ def cancel_job(job_id):
         if not pid or not alive(pid):
             break
         time.sleep(0.3)
-    st = {**s, "state": "cancelled", "stage": "отменено", "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
-    (JOBS / f"{job_id}.json").write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+    if pid and alive(pid):
+        raise CoreError("Процесс не остановлен; статус задачи не изменён")
+    import jobslots
+    status_path = _job_path(job_id, ".json")
+    with jobslots.file_lock(_job_path(job_id, ".status.lock")):
+        current = job_status(job_id) or s
+        if current.get("state") in FINISHED:
+            return {"job_id": job_id, "state": current["state"], "note": "задача завершилась во время отмены"}
+        st = {**current, "state": "cancelled", "stage": "отменено",
+              "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=JOBS, delete=False) as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+            tmp = Path(f.name)
+        try:
+            os.replace(tmp, status_path)
+        finally:
+            tmp.unlink(missing_ok=True)
     return {"job_id": job_id, "state": "cancelled", "was": s.get("stage"), "process_killed": killed}
 
 
@@ -815,7 +872,8 @@ def status(job_id, wait_sec=0, sleep=time.sleep):
 
 def list_jobs(limit=10):
     rows = []
-    for p in sorted(JOBS.glob("*.json"), reverse=True)[:limit]:
+    job_files = [p for p in JOBS.glob("*.json") if not p.name.endswith(".voices_debug.json")]
+    for p in sorted(job_files, reverse=True)[:limit]:
         s = job_status(p.stem) or {}
         rows.append({"job_id": p.stem, "kind": s.get("kind"), "state": s.get("state"),
                      "stage": s.get("stage"), "progress": s.get("progress"), "file": s.get("file")})
@@ -941,13 +999,27 @@ def prepare_answer_confirmation(recording_id, answer_ids):
             lines.extend(detail)
         if sum(len(line) + 1 for line in lines) > 900:
             raise CoreError("ответы не помещаются в окно подтверждения; выберите меньше")
-        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = _answer_confirmation_hash(state, answer_ids)
         return {"recording_id": recording_id, "answer_ids": list(answer_ids),
                 "state_hash": hashlib.sha256(encoded).hexdigest(), "lines": lines}
     except (OSError, ValueError, KeyError) as ex:
         raise CoreError(f"не удалось подготовить подтверждение ответов: {ex}") from ex
     finally:
         store.close()
+
+
+def _answer_confirmation_hash(state, answer_ids):
+    ids = set(answer_ids)
+    manifest = state.get("manifest") or {}
+    relevant_items = [item for item in manifest.get("items") or [] if item.get("id") in ids]
+    conflicts = [row for row in state.get("conflicts") or []
+                 if row.get("id") in ids or ids.intersection(row.get("cards") or [])]
+    value = {"version": state.get("version"), "answers": {
+                 aid: state.get("answers", {}).get(aid) for aid in sorted(ids)},
+             "items": relevant_items,
+             "applied_answers": {aid: (state.get("applied_answers") or {}).get(aid) for aid in sorted(ids)},
+             "conflicts": conflicts}
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def confirm_review_answers(snapshot):
@@ -965,7 +1037,7 @@ def confirm_review_answers(snapshot):
         store.close()
     with recordings.operation_for_document(path, "human"):
         state = recordings.read_review_pack_state(path)
-        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = _answer_confirmation_hash(state, snapshot["answer_ids"])
         if hashlib.sha256(encoded).hexdigest() != snapshot["state_hash"]:
             raise CoreError("ответы изменились после запроса подтверждения")
         context = recordings.context_for_document(path)
@@ -1411,6 +1483,18 @@ def apply_answers_files(jp, md):
     import conspect
     import recordings
     store, binding = recordings.open_for_document(jp)
+    import review_pack
+    state = review_pack.answers_state(jp, {"answers": {}})
+    applied = review_pack._applied_map(state)
+    if any(answer.get("kind") not in ("skip", "repeat") and
+           applied.get(aid) != review_pack._sig(answer) and
+           answer.get("actor_kind") != "human" and
+           (answer.get("confirmation_context") or {}).get("actor_kind") != "human"
+           for aid, answer in state.get("answers", {}).items()):
+        if store is not None:
+            store.close()
+        raise CoreError("Ответ неизвестного происхождения нельзя применять как человеческий; "
+                        "необходимо явное подтверждение")
     if store is not None:
         try:
             with conspect.write_lock(jp):
@@ -1419,15 +1503,6 @@ def apply_answers_files(jp, md):
                 state = recordings.read_review_pack_state(jp)
                 expected = state["_expected_versions"]
                 context = recordings.operation_context(store, "human")
-                import review_pack
-                applied = review_pack._applied_map(state)
-                if any(answer.get("kind") not in ("skip", "repeat") and
-                       applied.get(aid) != review_pack._sig(answer) and
-                       answer.get("actor_kind") != "human" and
-                       (answer.get("confirmation_context") or {}).get("actor_kind") != "human"
-                       for aid, answer in state.get("answers", {}).items()):
-                    raise CoreError("Ответ неизвестного происхождения нельзя применять как человеческий; "
-                                    "необходимо явное подтверждение")
                 with recordings.answer_draft(jp, initial, state, context) as draft:
                     report = _apply_answers_files_locked(jp, md)
                     candidate = recordings.merge_answer_draft(draft["data"], draft["state"])
@@ -1487,6 +1562,7 @@ def _apply_answers_files_locked(jp, md):
         if result.get("reverted"):
             undone.append(d["id"])
             rep["reverted"].append(d["id"])
+            P.mark_applied(jp, {d["id"]}, outcomes={d["id"]: "reverted"})
         else:
             rep.setdefault("undo_conflicts", []).append(result)
             undo_failed.add(d["id"])
@@ -1526,6 +1602,9 @@ def _apply_answers_files_locked(jp, md):
             aid = decision.get("id")
             if aid in result.get("successful_ids", []) and aid not in rep.get("human", []):
                 remember_snapshot(aid, before, after)
+                if aid in snapshots:
+                    P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]},
+                                   outcomes={aid: "applied"})
     free_items = []
     if blocked_free:
         free_items.append({"conflicts": preflight,
@@ -1542,6 +1621,9 @@ def _apply_answers_files_locked(jp, md):
             free_items.append(part)
             if aid in part.get("successful_ids", []):
                 remember_snapshot(aid, before, transcript.load(jp))
+                if aid in snapshots:
+                    P.mark_applied(jp, {aid}, snapshots={aid: snapshots[aid]},
+                                   outcomes={aid: "applied"})
     if free_items:
         rep["free_text"] = _merge_free_reports(free_items)
     successful = set(report.get("successful_ids", []))
@@ -1570,8 +1652,10 @@ def _apply_answers_files_locked(jp, md):
             outcomes[aid] = "not_found"
         else:
             outcomes[aid] = "not_applied"
-    if successful or outcomes:
-        P.mark_applied(jp, successful, snapshots=snapshots, outcomes=outcomes)
+    failed_outcomes = {aid: outcome for aid, outcome in outcomes.items()
+                       if outcome not in ("applied", "reverted")}
+    if failed_outcomes:
+        P.mark_applied(jp, set(), outcomes=failed_outcomes)
     if undone:
         rep["voice_profile_warning"] = {
             "answer_ids": undone,
@@ -2266,7 +2350,7 @@ def do_cleanup(days=30, apply=False):
 
 # ---------- описание действия для человека (без выполнения) ----------
 def describe_export(group="", dest_dir="", with_jobs=False):
-    groups = [group] if group else paths.list_groups()
+    groups = [paths.safe_group(group)] if group else paths.list_groups()
     return ["Выгрузка архива с ГОЛОСОВЫМИ ОТПЕЧАТКАМИ (биометрия) и словарями.",
             f"Группы: {', '.join(groups) or '—'}",
             f"Статусы задач: {'да' if with_jobs else 'нет'}",

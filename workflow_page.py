@@ -36,6 +36,26 @@ mimetypes.add_type("audio/mpeg", ".mp3")
 MAX_BODY_BYTES = 64 * 1024
 
 
+def pick_audio_path():
+    """Нативное окно выбора файла Windows: диалог в отдельном процессе, экран продолжает отвечать.
+
+    Веб-страница не может получить полный путь из <input type="file">, поэтому диалог
+    открывает сам локальный сервер. Путь выбирает человек; сервер путь не угадывает.
+    """
+    import subprocess
+    code = ("import tkinter as tk; from tkinter import filedialog; r = tk.Tk(); r.withdraw(); "
+            "r.attributes('-topmost', True); "
+            "print(filedialog.askopenfilename(title='Выберите запись', "
+            "filetypes=[('Аудиозаписи', '*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus *.wma'), ('Все файлы', '*.*')])); "
+            "r.destroy()")
+    try:
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True, encoding="utf-8", timeout=300, creationflags=0x08000000).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
 def segment_text(segment):
     words = segment.get("words") or []
     if isinstance(segment.get("text"), str) and segment["text"]:
@@ -121,6 +141,8 @@ def make_server(port):
                     html = (HERE / "workflow.html").read_text(encoding="utf-8")
                     return self._send(200, SKELETON.replace("{BODY}", html).encode("utf-8"),
                                       "text/html; charset=utf-8")
+                if u == "api/pick":
+                    return self._send(200, {"path": pick_audio_path()})
                 if u == "api/requests":
                     return self._send(200, {"requests": core.workflow_list(30)})
                 if u == "api/status":

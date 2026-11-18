@@ -18,6 +18,7 @@ pre{white-space:pre-wrap;background:#f6f6f6;padding:8px;border-radius:6px;overfl
 <section>
   <h2>Новый запрос</h2>
   <label>Файл записи (полный путь):<input type="text" id="audio" placeholder="C:\записи\встреча.mp3"></label>
+  <div class="bar"><button id="pick">Выбрать файл…</button></div>
   <div class="bar">
     <label><input type="checkbox" id="conspect"> нужен конспект</label>
     <label><input type="checkbox" id="cloud" checked> разрешить облачную модель для конспекта</label>
@@ -343,6 +344,12 @@ function openRequest(id) {
   $("detail").scrollIntoView();
 }
 
+$("pick").onclick = async () => {
+  try {
+    const d = await call("api/pick");
+    if (d.path) { $("audio").value = d.path; say(""); }
+  } catch (ex) { say(ex.message, true); }
+};
 $("start").onclick = async () => {
   try {
     const d = await post("api/start", {audio: $("audio").value, require_conspect: $("conspect").checked,

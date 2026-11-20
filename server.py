@@ -80,7 +80,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.20.2"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.20.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -511,6 +511,20 @@ def reopen_review(job_id: str, ids: str) -> str:
     решить их заново через apply_review. Карточки пересобирать не нужно."""
     try:
         return json.dumps(core.reopen_review(job_id, ids), ensure_ascii=False, indent=1)
+    except core.CoreError as ex:
+        return str(ex)
+
+
+@mcp.tool()
+def legacy_speaker_review(job_id: str, build_pack: bool = False) -> str:
+    """Старые подтверждения говорящего (до пословных отметок): места, где по истории правок видно решение
+    человека: смена говорящего, место, принятое как есть, или правка текста (её говорящий подтверждается
+    отдельно); места короче 0,8 с в отпечаток не попадут и не предлагаются.
+    build_pack=false — только список мест и секунды по участникам; build_pack=true — карточки «подтвердите
+    говорящего» по этим местам (затем start_review_page → ответы человека → apply_answers). Сам ничего не
+    подтверждает. После применения ответов — preview_voice_profiles и update_voice_profiles."""
+    try:
+        return json.dumps(core.legacy_speaker_review(job_id, build_pack), ensure_ascii=False, indent=1)
     except core.CoreError as ex:
         return str(ex)
 

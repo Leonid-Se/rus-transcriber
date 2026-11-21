@@ -36,6 +36,7 @@ import paths  # noqa: E402,F401
 import tmpfiles  # noqa: E402
 import download_hint  # noqa: E402
 import runinfo  # noqa: E402
+import words as W  # noqa: E402  (лёгкий модуль конвейера: только numpy, без побочных эффектов)
 SR = 16000
 
 RNNT, CTC, WHISPER, TORCH = "rnnt", "ctc", "whisper", "torch"
@@ -253,24 +254,142 @@ def mark_actual(results):
     return results
 
 
+# Кусок «в разы беднее» опоры (21.11.2026: CTC на Arc оставил по одному слову из ~30 в каждом
+# куске — пустых не было, и потерю отсекал только порог совпадения). Опора куска — вариант группы
+# с наибольшим числом слов в нём. Потеря — когда у варианта слов не больше трети опоры: исправные
+# варианты одной модели расходятся на единицы процентов (e2e-модели пишут числа цифрами:
+# «двадцать пять» → «25» сокращает два слова до одного, но не весь кусок втрое), а сбой даёт
+# расхождение в десятки раз.
+LOST_WORDS_FACTOR = 3
+# Минимум слов у опоры: на коротком куске (обрывок фразы, пауза с одним-двумя словами) разница
+# «3 против 1» — шум, а не потеря речи; кусок обычной речи длиной 15–20 с даёт 30–50 слов.
+LOST_WORDS_MIN_REF = 10
+# Правило слов — только для моделей GigaAM: Whisper при зацикливании повторяет фразы, и раздутый
+# повторами кусок сделал бы «потерявшим речь» исправный вариант. Для Whisper — правило пустых кусков.
+WORD_RULE_FAMILIES = (RNNT, CTC, ML)
+# Пустой кусок — потеря, если у другого варианта той же группы в этом куске не меньше стольких
+# слов. Сравнение покусочное: прежний подсчёт по количеству не видел, что A пуст в куске 1, а B —
+# в куске 2 (по одному пустому у обоих, разница 0). Порог ниже LOST_WORDS_MIN_REF: пустота —
+# полная потеря, а не «в разы меньше», и короткий кусок с несколькими словами речи тоже должен
+# считаться. Но одно-два слова у соседа на паузе — обычно галлюцинация (GigaAM даёт на шуме
+# одиночные «а», «м»), и пустой вариант там прав. Явный случай — у соседа нормальный текст
+# (кусок речи 15–20 с даёт 30–50 слов) — порог не задевает: он остаётся потерей, как прежде.
+LOST_EMPTY_MIN_REF = 5
+# Тот же порог для Whisper выше. Его известные ложные фразы на паузе («Продолжение следует»,
+# «Субтитры сделал…», «Спасибо за просмотр») chunk_word_count убирает фильтром конвейера и они дают
+# 0 слов. Но фраза не из списка, зациклившись, после того же фильтра остаётся max_repeat = 3 раза:
+# «Спасибо за внимание.» ×3 — 9 слов. Порог 10 не делает из-за этого исправный пустой вариант
+# «потерявшим речь», а явный случай не задевает: кусок Whisper в тесте — 24–28 с (run_one режет
+# его до 28 с), обычная речь в нём — 40–70 слов.
+LOST_EMPTY_MIN_REF_WHISPER = 10
+
+
+def chunk_word_count(text, family=None):
+    """Сколько слов куска попало бы в стенограмму или в голосование конвейера; 0 — кусок пуст.
+
+    Правило рабочего конвейера (words.py): слово — то, что содержит букву или цифру
+    (words.result_words по WORD_RE приклеивает «—», «…», «.» к соседнему слову, а не делает словом;
+    сравнение кусков и голосование идут по words.norm_word). Поэтому кусок из одной пунктуации
+    пуст. Текст Whisper конвейер сначала чистит words.clean_whisper (worker.run_words): ложные
+    фразы на тишине удаляются, зацикленные повторы сокращаются; здесь — то же самое."""
+    text = "" if text is None else str(text)
+    if family == WHISPER:
+        text = W.clean_whisper(text)[0]
+    return sum(1 for tok in text.split() if W.norm_word(tok))
+
+
+def chunk_words_of(result):
+    """Число слов по кускам из результата или None, если вариант его не сообщил (старый результат)."""
+    words = result.get("chunk_words")
+    if not isinstance(words, list) or len(words) != result.get("chunks") \
+            or not all(isinstance(n, int) and n >= 0 for n in words):
+        return None
+    return words
+
+
+def empty_count(result):
+    """Пустые куски варианта: по chunk_words, если они есть (одно определение с покусочным
+    правилом), иначе по empty_chunks — у старых результатов это куски с пустым текстом."""
+    words = chunk_words_of(result)
+    return result["empty_chunks"] if words is None else words.count(0)
+
+
 def mark_lost_chunks(results):
-    """Потерянные куски: у варианта пустых кусков больше, чем у другого варианта той же модели.
+    """Потерянные куски: речь, которую другой вариант той же модели на той же нарезке распознал.
 
     Пустой кусок сам по себе не сбой: пауза или музыка пусты у всех. Сбой — когда на той же
     нарезке другой вариант семейства текст получил, а этот нет (так GigaAM на видеокарте терял
-    часть речи при высокой скорости). Сравниваются варианты одного семейства с одинаковым
-    числом кусков; PyTorch-эталон — та же модель, что RNN-T."""
+    часть речи при высокой скорости), или получил в разы меньше слов (LOST_WORDS_FACTOR).
+    Сравниваются варианты одного семейства с одинаковым числом кусков; PyTorch-эталон — та же
+    модель, что RNN-T.
+
+    lost_chunks = lost_empty_chunks + lost_few_words_chunks; один кусок не попадает в обе части:
+    пустой — это 0 слов, «в разы меньше» — хотя бы одно слово.
+
+    Пустой кусок — кусок, из которого в работу конвейера не попало бы ни одного слова
+    (chunk_word_count: в том числе кусок из одной пунктуации и кусок Whisper из одних ложных
+    фраз). Пустые куски (все семейства, и Whisper: пустой кусок — не раздувание повторами)
+    считаются покусочно по chunk_words: кусок с 0 слов, где у другого варианта группы их не меньше
+    LOST_EMPTY_MIN_REF (у Whisper — LOST_EMPTY_MIN_REF_WHISPER). Вариант без годного chunk_words
+    (старый результат, длина не совпала) или без другого такого варианта в группе считается
+    по-прежнему, по количеству: пустых больше, чем у варианта группы, у которого их меньше всего.
+    Смешанная группа: у варианта с chunk_words к покусочному числу добавляется проверка
+    количеством против вариантов без chunk_words — берётся большее, чтобы старый сосед с текстом
+    не перестал выявлять потерю.
+
+    Куски «слов в разы меньше» — только GigaAM и только у вариантов, сообщивших chunk_words
+    (у старых результатов это правило не применяется); lost_few_words_kept / lost_few_words_ref —
+    сколько слов осталось в этих кусках и сколько было у опоры."""
     groups = {}
     for r in results:
         if "asr_sec" not in r or r.get("empty_chunks") is None:
             continue
         family = RNNT if r.get("family") == TORCH else r.get("family")
         groups.setdefault((family, r.get("chunks")), []).append(r)
-    for group in groups.values():
-        least = min(r["empty_chunks"] for r in group)
+    for (family, chunks), group in groups.items():
+        empties = {id(r): empty_count(r) for r in group}
+        least = min(empties.values())
+        words_of = {id(r): chunk_words_of(r) for r in group}
+        counted = [(r, words_of[id(r)]) for r in group if words_of[id(r)] is not None]
+        uncounted = [r for r in group if words_of[id(r)] is None]
+        least_uncounted = min((empties[id(r)] for r in uncounted), default=None)
+        ref = [max(col) for col in zip(*(w for _, w in counted))] if len(counted) > 1 else None
+        min_ref = LOST_EMPTY_MIN_REF_WHISPER if family == WHISPER else LOST_EMPTY_MIN_REF
         for r in group:
-            r["lost_chunks"] = r["empty_chunks"] - least
+            words = words_of[id(r)]
+            if words is None or ref is None:
+                lost = empties[id(r)] - least                  # прежнее правило: по количеству
+            else:
+                # у самого варианта в пустом куске 0 слов, поэтому опора куска — другой вариант
+                lost = sum(1 for n, top in zip(words, ref) if n == 0 and top >= min_ref)
+                if least_uncounted is not None:
+                    lost = max(lost, empties[id(r)] - least_uncounted)
+            r["lost_empty_chunks"] = lost
+            r["lost_chunks"] = lost
+        if ref is None or family not in WORD_RULE_FAMILIES:
+            continue
+        for r, words in counted:
+            few = [(n, top) for n, top in zip(words, ref)
+                   if n > 0 and top >= LOST_WORDS_MIN_REF and n * LOST_WORDS_FACTOR <= top]
+            r["lost_few_words_chunks"] = len(few)
+            r["lost_few_words_kept"] = sum(n for n, _ in few)
+            r["lost_few_words_ref"] = sum(top for _, top in few)
+            r["lost_chunks"] += len(few)
     return results
+
+
+def lost_parts(result):
+    """Части пояснения о потере речи: «пустой текст» и «слов в разы меньше» — для отчёта."""
+    total = result.get("lost_chunks") or 0
+    few = result.get("lost_few_words_chunks") or 0
+    empty = result.get("lost_empty_chunks")
+    empty = total - few if empty is None else empty       # старый результат: только пустые куски
+    parts = []
+    if empty > 0:
+        parts.append(("empty", empty))
+    if few > 0:
+        parts.append(("few", few))
+    return parts
 
 
 def unfit_reason(result):
@@ -292,9 +411,30 @@ def unfit_note(result):
     if reason == "device_mismatch":
         return f"посчитан на {result.get('device_actual')} вместо {result.get('device')} — не выбирается"
     if reason == "lost_chunks":
+        how, parts = [], lost_parts(result)
+        for kind, n in parts:
+            if kind == "empty":
+                how.append("текст пуст там, где у другого варианта он есть" + (f": {n}" if len(parts) > 1 else ""))
+            else:
+                how.append(f"слов в разы меньше, чем у другого варианта той же модели: {n}, осталось "
+                           f"{result.get('lost_few_words_kept')} из {result.get('lost_few_words_ref')}")
         return (f"потеряно кусков: {result.get('lost_chunks')} из {result.get('chunks')} "
-                "(текст пуст там, где у другого варианта он есть) — не выбирается")
+                f"({'; '.join(how)}) — не выбирается")
     return ""
+
+
+def lost_line(result):
+    """Строка блока «Условия прогона» о потере речи вариантом."""
+    chunks = result.get("chunks")
+    how = []
+    for kind, n in lost_parts(result):
+        if kind == "empty":
+            how.append(f"вернул пустой текст для {n} из {chunks} кусков")
+        else:
+            how.append(f"в {n} из {chunks} кусков дал в разы меньше слов (осталось "
+                       f"{result.get('lost_few_words_kept')} из {result.get('lost_few_words_ref')})")
+    return (f"- **Потеря речи:** «{result.get('label')}» {' и '.join(how)} там, где другой вариант "
+            "той же модели речь распознал, — вариант не выбирается.")
 
 
 def conditions_lines(record):
@@ -335,9 +475,7 @@ def conditions_lines(record):
                          f"{r.get('device_actual')} — его скорость не относится к {r.get('device')}, "
                          "вариант не выбирается.")
         elif (r.get("lost_chunks") or 0) > 0:
-            lines.append(f"- **Потеря речи:** «{r.get('label')}» вернул пустой текст для {r.get('lost_chunks')} "
-                         f"из {r.get('chunks')} кусков, которые другой вариант той же модели распознал, — "
-                         "вариант не выбирается.")
+            lines.append(lost_line(r))
     if record.get("run_file"):
         lines.append(f"- Файл прогона: `{record['run_file']}` (в нём нет имени и пути записи).")
     return lines
@@ -463,13 +601,16 @@ def run_one(variant, npy, model, chunk_max):
     else:
         texts = asr.transcribe_many(pieces)
     work = time.time() - t1
+    chunk_words = [chunk_word_count(t, family) for t in texts]   # вне замеряемого интервала
     # что получилось фактически: имя бэкенда после прогона (пакет мог откатиться на поштучное),
     # провайдеры сессии, откаты make_asr — по ним видно, что «GPU» на самом деле посчитан на процессоре
     fact = {"backend_name": getattr(asr, "name", None),
             "providers_actual": actual_providers(getattr(asr, "model", None)) or None,
             "compile_sec": getattr(asr, "compile_sec", None),
             "fallbacks": [str(x)[:200] for x in fallbacks] or None,
-            "empty_chunks": sum(1 for t in texts if not str(t).strip()),
+            # слова куска — по правилу конвейера (chunk_word_count); пустой кусок — 0 слов
+            "chunk_words": chunk_words,
+            "empty_chunks": chunk_words.count(0),
             "peak_memory_mb": runinfo.peak_memory_mb(),
             **runinfo.cache_delta(cache0, cache1)}
     print("@@RESULT@@" + json.dumps({"load_sec": round(load, 1), "first_chunk_sec": round(t_first, 1),

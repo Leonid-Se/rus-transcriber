@@ -516,11 +516,280 @@ class UnfitVariantTests(unittest.TestCase):
         self.assertEqual(bench.choice_summary(only, "whisper", 0.0),
                          {"accurate": None, "fast_ok": None, "fastest": None})
 
+    def lost(self, *results):
+        bench.mark_lost_chunks(list(results))
+        return [(r.get("lost_chunks"), r.get("lost_few_words_chunks")) for r in results]
+
+    def test_few_words_left_is_lost_speech(self):
+        # реальный случай 21.11.2026: CTC на Arc оставил по слову в каждом из 5 кусков, пустых нет
+        cpu = self.res("ctc-cpu", family="ctc", rtfx=20.0, chunk_words=[30, 31, 29, 32, 32])
+        gpu = self.res("ctc-gpu", family="ctc", device="GPU", rtfx=80.0, similarity=0.05,
+                       chunk_words=[1, 1, 1, 1, 1])
+        b8 = self.res("ctc-gpu-b8", family="ctc", device="GPU", rtfx=90.0, similarity=0.05,
+                      chunk_words=[1, 1, 1, 1, 1])
+        self.assertEqual(self.lost(cpu, gpu, b8), [(0, 0), (5, 5), (5, 5)])
+        self.assertEqual((gpu["lost_empty_chunks"], gpu["lost_few_words_kept"], gpu["lost_few_words_ref"]),
+                         (0, 5, 154))
+        self.assertEqual(bench.unfit_reason(gpu), "lost_chunks")
+        note = bench.unfit_note(gpu)
+        self.assertIn("потеряно кусков: 5 из 5", note)
+        self.assertIn("слов в разы меньше", note)
+        self.assertIn("осталось 5 из 154", note)
+        self.assertNotIn("текст пуст", note)
+        self.assertIs(bench.best_of([cpu, gpu, b8], "ctc", 0.0), cpu)     # даже без порога
+        self.assertIs(bench.family_refs([gpu, b8, cpu])["ctc"], cpu)
+        line = bench.lost_line({**gpu, "label": "CTC, видеокарта"})
+        self.assertIn("в 5 из 5 кусков дал в разы меньше слов (осталось 5 из 154)", line)
+        self.assertNotIn("пустой текст", line)
+
+    def test_honest_variants_are_not_lost(self):
+        # числа цифрами, мелкие расхождения; PyTorch — та же модель, что RNN-T
+        self.assertEqual(self.lost(
+            self.res("torch-cpu", family="torch", chunk_words=[31, 29, 26, 31, 12]),
+            self.res("onnx-cpu", chunk_words=[30, 28, 25, 31, 11]),
+            self.res("ov-gpu", device="GPU", chunk_words=[24, 27, 18, 30, 9])),
+            [(0, 0), (0, 0), (0, 0)])
+
+    def test_torch_is_a_reference_for_rnnt(self):
+        self.assertEqual(self.lost(
+            self.res("torch-cpu", family="torch", chunk_words=[30, 30, 30, 30, 30]),
+            self.res("ov-gpu", device="GPU", chunk_words=[30, 10, 30, 2, 30])),
+            [(0, 0), (2, 2)])
+
+    def test_pause_and_short_chunks_are_not_lost(self):
+        # пауза/музыка: мало или ноль слов у всех; короткий кусок ниже минимума опоры — шум
+        self.assertEqual(self.lost(
+            self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 2, 9, 30, 30]),
+            self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[0, 1, 1, 29, 30])),
+            [(0, 0), (0, 0)])
+
+    def test_empty_and_few_words_are_told_apart(self):
+        cpu = self.res("onnx-cpu", chunk_words=[30, 30, 30, 30, 30])
+        gpu = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[0, 3, 30, 30, 30])
+        self.assertEqual(self.lost(cpu, gpu), [(0, 0), (2, 1)])
+        note = bench.unfit_note(gpu)
+        self.assertIn("потеряно кусков: 2 из 5", note)
+        self.assertIn("текст пуст там, где у другого варианта он есть: 1", note)
+        self.assertIn("слов в разы меньше, чем у другого варианта той же модели: 1, осталось 3 из 30", note)
+        line = bench.lost_line({**gpu, "label": "RNN-T, видеокарта"})
+        self.assertIn("вернул пустой текст для 1 из 5 кусков и в 1 из 5 кусков дал в разы меньше слов", line)
+
+    def test_old_results_keep_the_empty_chunk_rule(self):
+        # результат без chunk_words (старый или вариант не сообщил) — только правило пустых кусков
+        old = self.res("ov-gpu", device="GPU")
+        bad = self.res("ov-gpu-b8", device="GPU", chunk_words=[1, 1])          # длина не та — не верим
+        new = self.res("onnx-cpu", chunk_words=[30, 30, 30, 30, 30])
+        self.assertEqual(self.lost(old, bad, new), [(0, None), (0, None), (0, None)])
+        old_lost = self.res("ov-gpu", device="GPU", empty_chunks=2)
+        self.assertEqual(self.lost(old_lost, self.res("onnx-cpu")), [(2, None), (0, None)])
+        self.assertIn("(текст пуст там, где у другого варианта он есть) — не выбирается", bench.unfit_note(old_lost))
+        self.assertIn("вернул пустой текст для 2 из 5 кусков",
+                      bench.lost_line({**old_lost, "label": "RNN-T, видеокарта"}))
+        # прежний результат без разбивки по видам потери
+        self.assertIn("вернул пустой текст для 2 из 5",
+                      bench.lost_line({"label": "x", "chunks": 5, "lost_chunks": 2}))
+
+    def test_different_cuts_and_whisper_are_not_compared_by_words(self):
+        self.assertEqual(self.lost(
+            self.res("ctc-cpu", family="ctc", chunk_words=[30, 30, 30, 30, 30]),
+            self.res("ctc-x", family="ctc", chunks=4, chunk_words=[1, 1, 1, 1]),     # другая нарезка
+            self.res("whisper-ct2", family="whisper", chunks=3, chunk_words=[90, 90, 90]),  # повторы
+            self.res("whisper-dml", family="whisper", chunks=3, chunk_words=[30, 30, 30])),
+            [(0, None), (0, None), (0, None), (0, None)])
+
+    def lost_empty(self, *results):
+        bench.mark_lost_chunks(list(results))
+        return [r.get("lost_empty_chunks") for r in results]
+
+    def test_empty_in_different_chunks_is_lost_for_both(self):
+        # по количеству разница 0 (по одному пустому у обоих); покусочно потеря у каждого
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[30, 0, 30, 30, 30])
+        self.assertEqual(self.lost(a, b), [(1, 0), (1, 0)])
+        self.assertEqual(bench.unfit_reason(a), "lost_chunks")
+        self.assertIn("текст пуст там, где у другого варианта он есть", bench.unfit_note(b))
+
+    def test_pause_empty_for_all_is_not_lost(self):
+        self.assertEqual(self.lost_empty(
+            self.res("torch-cpu", family="torch", empty_chunks=2, chunk_words=[0, 30, 0, 30, 30]),
+            self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 30, 0, 30, 30]),
+            self.res("ov-gpu", device="GPU", empty_chunks=2, chunk_words=[0, 29, 0, 31, 30])),
+            [0, 0, 0])
+
+    def test_few_words_of_a_neighbour_on_a_pause_is_not_lost(self):
+        # у соседа на паузе слова-галлюцинации ниже порога — пустой вариант прав
+        below = bench.LOST_EMPTY_MIN_REF - 1
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 0, 30, 30, 30]),
+            self.res("ov-gpu", device="GPU", chunk_words=[1, below, 30, 30, 30])),
+            [0, 0])
+        # от порога — уже речь, пустой кусок потерян
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30]),
+            self.res("ov-gpu", device="GPU", chunk_words=[bench.LOST_EMPTY_MIN_REF, 30, 30, 30, 30])),
+            [1, 0])
+
+    def test_whisper_uses_the_per_chunk_empty_rule(self):
+        # пустой кусок у Whisper — потеря; правило «слов в разы меньше» к Whisper не применяется
+        ct2 = self.res("whisper-ct2", family="whisper", chunks=3, empty_chunks=1, chunk_words=[0, 30, 90])
+        dml = self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=1, chunk_words=[30, 0, 10])
+        self.assertEqual(self.lost(ct2, dml), [(1, None), (1, None)])
+        self.assertEqual((ct2["lost_empty_chunks"], dml["lost_empty_chunks"]), (1, 1))
+
+    def test_old_results_without_chunk_words_count_empties(self):
+        # нет chunk_words ни у кого: прежний подсчёт по количеству, даже если пустые в разных кусках
+        self.assertEqual(self.lost_empty(
+            self.res("onnx-cpu", empty_chunks=1),
+            self.res("ov-gpu", device="GPU", empty_chunks=1),
+            self.res("ov-gpu-b8", device="GPU", empty_chunks=3)),
+            [0, 0, 2])
+
+    def test_mixed_group(self):
+        # у двух вариантов chunk_words есть, у старого нет
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[30, 0, 30, 30, 30])
+        old = self.res("ov-gpu-b8", device="GPU", empty_chunks=2)
+        self.assertEqual(self.lost_empty(a, b, old), [1, 1, 1])     # old — по количеству: 2 − 1
+        # оба новых пусты в одном куске (между собой — пауза), а старый пустых не имеет:
+        # проверка количеством против старого соседа сохраняет потерю
+        a = self.res("onnx-cpu", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        b = self.res("ov-gpu", device="GPU", empty_chunks=1, chunk_words=[0, 30, 30, 30, 30])
+        old = self.res("ov-gpu-b8", device="GPU", empty_chunks=0)
+        self.assertEqual(self.lost_empty(a, b, old), [1, 1, 0])
+        # новый вариант один в группе со старыми — у него тоже подсчёт по количеству
+        a = self.res("onnx-cpu", empty_chunks=2, chunk_words=[0, 0, 30, 30, 30])
+        old = self.res("ov-gpu", device="GPU", empty_chunks=1)
+        self.assertEqual(self.lost(a, old), [(1, None), (0, None)])
+
+    def test_empty_and_few_words_are_not_counted_twice(self):
+        cpu = self.res("ctc-cpu", family="ctc", chunk_words=[30, 30, 30, 30, 30])
+        gpu = self.res("ctc-gpu", family="ctc", device="GPU", empty_chunks=2, chunk_words=[0, 0, 2, 2, 30])
+        self.assertEqual(self.lost(cpu, gpu), [(0, 0), (4, 2)])
+        self.assertEqual(gpu["lost_chunks"], gpu["lost_empty_chunks"] + gpu["lost_few_words_chunks"])
+        self.assertEqual(gpu["lost_empty_chunks"], 2)
+
+    def test_empty_count_follows_chunk_words(self):
+        # одно определение пустого куска: при годных chunk_words пустые считаются по ним, даже если
+        # empty_chunks записан по тексту (кусок «.» — текст не пуст, но слов 0)
+        punct = self.res("ov-gpu", device="GPU", empty_chunks=0, chunk_words=[0, 30, 30, 30, 30])
+        cpu = self.res("onnx-cpu", chunk_words=[30, 30, 30, 30, 30])
+        self.assertEqual(bench.empty_count(punct), 1)
+        self.assertEqual(self.lost(punct, cpu), [(1, 0), (0, 0)])
+        # старый результат без chunk_words — по empty_chunks, как раньше
+        self.assertEqual(bench.empty_count(self.res("ov-gpu", empty_chunks=2)), 2)
+
+    def test_whisper_false_phrases_on_a_pause_do_not_make_empty_variant_lost(self):
+        # у соседа на паузе «титры» и зацикленная фраза: после фильтра конвейера они ниже порога Whisper
+        junk = ["Продолжение следует...", "Субтитры сделал DimaTorzok. Спасибо за просмотр!",
+                "Спасибо за внимание. " * 12]
+        speech = " ".join(f"слово{i}" for i in range(60))
+        counts = [bench.chunk_word_count(t, "whisper") for t in junk]
+        self.assertEqual(counts[:2], [0, 0])
+        self.assertLess(counts[2], bench.LOST_EMPTY_MIN_REF_WHISPER)
+        self.assertGreaterEqual(counts[2], bench.LOST_EMPTY_MIN_REF)    # прежний порог 5 здесь ошибся бы
+        noisy = self.res("whisper-ct2", family="whisper", chunks=4,
+                         chunk_words=counts + [bench.chunk_word_count(speech, "whisper")])
+        quiet = self.res("whisper-dml", family="whisper", chunks=4, empty_chunks=3, chunk_words=[0, 0, 0, 60])
+        self.assertEqual(self.lost(noisy, quiet), [(0, None), (0, None)])
+
+    def test_whisper_loss_next_to_normal_speech_is_caught(self):
+        # явный случай: у соседа обычная речь (30–50 слов в куске) — пустой кусок Whisper потерян
+        speech = [bench.chunk_word_count(" ".join(f"слово{i}" for i in range(n)) + ".", "whisper")
+                  for n in (30, 50, 40)]
+        self.assertEqual(speech, [30, 50, 40])
+        full = self.res("whisper-ct2", family="whisper", chunks=3, chunk_words=speech)
+        lost = self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=2, chunk_words=[0, 0, 40])
+        self.assertEqual(self.lost(full, lost), [(0, None), (2, None)])
+        self.assertEqual(bench.unfit_reason(lost), "lost_chunks")
+        edge = self.res("whisper-dml", family="whisper", chunks=3, chunk_words=[0, 0, 40])
+        at_threshold = self.res("whisper-ct2", family="whisper", chunks=3,
+                                chunk_words=[bench.LOST_EMPTY_MIN_REF_WHISPER,
+                                             bench.LOST_EMPTY_MIN_REF_WHISPER - 1, 40])
+        self.assertEqual(self.lost(at_threshold, edge), [(0, None), (1, None)])
+
+    def test_old_whisper_results_keep_the_count_rule(self):
+        # старые результаты Whisper без chunk_words — по количеству пустых, как раньше
+        self.assertEqual(self.lost_empty(
+            self.res("whisper-ct2", family="whisper", chunks=3, empty_chunks=0),
+            self.res("whisper-dml", family="whisper", chunks=3, empty_chunks=2)),
+            [0, 2])
+
     def test_unfit_variant_is_not_a_reference_when_a_fit_one_exists(self):
         lost = self.res("ctc-cpu", family="ctc", lost_chunks=1)
         fit = self.res("ctc-gpu", family="ctc", device="GPU")
         self.assertIs(bench.family_refs([lost, fit])["ctc"], fit)
         self.assertIs(bench.family_refs([lost])["ctc"], lost)        # другого нет — остаётся прежнее правило
+
+
+class ChunkWordCountTests(unittest.TestCase):
+    """Слова куска в тесте скорости считаются так же, как их получает рабочий конвейер (words.py)."""
+
+    def test_punctuation_only_chunk_is_empty(self):
+        for text in ("", "   ", ".", ". , —", "… ?!", "– -", None):
+            self.assertEqual(bench.chunk_word_count(text), 0, text)
+            self.assertEqual(bench.chunk_word_count(text, "whisper"), 0, text)
+        self.assertEqual(bench.chunk_word_count("Ну — да, 25 раз… какой-то"), 5)
+
+    def test_matches_pipeline_words_on_examples(self):
+        # GigaAM: слово конвейера — токен с буквой или цифрой (words.result_words, WORD_RE);
+        # токен без них приклеивается к соседнему слову и словом не считается
+        import types
+        import words as W
+        for text in ("Привет, мир — как дела?", "раз . два …", "— начало", "ok 5 «цитата» ."):
+            toks = [(" " + t) for t in text.split()]
+            res = types.SimpleNamespace(tokens=toks, timestamps=[0.1 * i for i in range(len(toks))],
+                                        logprobs=[0.0] * len(toks))
+            pipeline = sum(1 for w in W.result_words(res, 0.0) if W.norm_word(w["w"]))
+            self.assertEqual(bench.chunk_word_count(text), pipeline, text)
+        # Whisper: конвейер берёт clean_whisper(текст).split() (worker.run_words)
+        text = "Да, конечно. Продолжение следует... Спасибо. Спасибо. Спасибо. Спасибо. Спасибо."
+        cleaned = W.clean_whisper(text)[0].split()
+        self.assertEqual(bench.chunk_word_count(text, "whisper"), sum(1 for t in cleaned if W.norm_word(t)))
+        self.assertEqual(bench.chunk_word_count(text, "whisper"), 5)
+        self.assertEqual(bench.chunk_word_count(text), 9)          # у GigaAM фильтра Whisper нет
+
+    def test_run_one_reports_one_definition_of_empty(self):
+        import contextlib
+        import io
+        import numpy as np
+        from unittest import mock
+        import backends
+        tmp = Path(tempfile.mkdtemp(prefix="rt-bench-one-", dir=_TMP))
+        npy = tmp / "audio.npy"
+        np.save(npy, np.zeros(16000 * 45, dtype=np.float32))      # 20 + 20 + 5 с
+
+        class FakeOnnx:
+            name = "cpu"
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def transcribe(self, piece):
+                return "раз"
+
+            def transcribe_many(self, pieces):
+                return ["", ". , —", "раз два три"][:len(pieces)]
+
+        class FakeWhisper:
+            name = "whisper-ct2"
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def transcribe_texts(self, pieces):
+                return ["Продолжение следует...", " ".join(f"слово{i}" for i in range(40))][:len(pieces)]
+
+        out = io.StringIO()
+        with mock.patch.object(backends, "OnnxASR", FakeOnnx), \
+                mock.patch.object(backends, "WhisperCT2", FakeWhisper), contextlib.redirect_stdout(out):
+            bench.run_one({"id": "onnx-cpu", "family": "rnnt", "asr_backend": "onnx-cpu"}, str(npy),
+                          "v3_e2e_rnnt", 20.0)
+            bench.run_one({"id": "whisper-ct2", "family": "whisper", "asr_backend": "whisper-ct2"}, str(npy),
+                          "v3_e2e_rnnt", 20.0)
+        got = [json.loads(line[len("@@RESULT@@"):]) for line in out.getvalue().splitlines()
+               if line.startswith("@@RESULT@@")]
+        self.assertEqual([(r["chunks"], r["chunk_words"], r["empty_chunks"]) for r in got],
+                         [(3, [0, 0, 3], 2), (2, [0, 40], 1)])
 
 
 class ConditionsReportTests(unittest.TestCase):
@@ -698,6 +967,29 @@ class RunFileFromMainTests(unittest.TestCase):
         self.assertIn("**Подмена устройства:**", report)
         self.assertIn("**Потеря речи:**", report)
         self.assertIn("Основной проход: **RNN-T, процессор**", report)
+
+    def test_few_words_left_is_named_as_lost_speech(self):
+        # пакетный вариант быстрее, пустых кусков нет, но в каждом куске осталось по слову:
+        # раньше его отсекал только порог совпадения, и причина в отчёте была «ниже порога»
+        full = " ".join(["слово"] * 36)
+        self.overrides = {"onnx-cpu": {"text": full, "chunk_words": [12, 11, 13]},
+                          "onnx-cpu-b8": {"asr_sec": 0.8, "text": "слово слово слово", "chunk_words": [1, 1, 1]}}
+        st, report = self.run_main("20260101-000400-b00005", only="onnx-cpu,onnx-cpu-b8")
+        rec = json.loads(Path(st["run_file"]).read_text(encoding="utf-8"))
+        by_id = {r["id"]: r for r in rec["results"]}
+        self.assertEqual((st["best"], rec["choice"]["main"], rec["saved"]["asr_backend"]),
+                         ("onnx-cpu", "onnx-cpu", "onnx-cpu"))
+        b8 = by_id["onnx-cpu-b8"]
+        self.assertEqual((b8["unfit"], b8["lost_chunks"], b8["lost_empty_chunks"], b8["lost_few_words_chunks"],
+                          b8["lost_few_words_kept"], b8["lost_few_words_ref"], b8["chunk_words"]),
+                         ("lost_chunks", 3, 0, 3, 3, 36, [1, 1, 1]))
+        self.assertEqual((by_id["onnx-cpu"]["unfit"], by_id["onnx-cpu"]["lost_chunks"]), (None, 0))
+        row = next(l for l in report.splitlines() if l.startswith("| ") and "слов в разы меньше" in l)
+        self.assertIn("потеряно кусков: 3 из 3", row)
+        self.assertIn("осталось 3 из 36", row)
+        self.assertNotIn("ниже порога", row)
+        self.assertIn("**Потеря речи:**", report)
+        self.assertIn("в 3 из 3 кусков дал в разы меньше слов (осталось 3 из 36)", report)
 
     def test_failed_run_is_recorded_too(self):
         self.load_audio.side_effect = RuntimeError(f"не прочитан {self.audio}")

@@ -64,8 +64,33 @@ class PlacesTests(unittest.TestCase):
         self.assertEqual(places["r2"]["speaker"], "Борис")
         self.assertEqual(places["r3"]["evidence"], "правка текста человеком (говорящий не менялся)")
         # r7 короче HUMAN_MIN (0,8 с): в отпечаток не попадёт и не предлагается
-        self.assertEqual(found["skipped"], {"too_short": 1, "already_confirmed": 1, "not_contiguous": 1, "no_words": 0})
+        self.assertEqual(found["skipped"], {"too_short": 1, "already_confirmed": 1, "not_contiguous": 1, "no_words": 0,
+                                            "merged": 0})
         self.assertEqual(found["seconds_by_speaker"], {"Анна": round(0.5 + 0.2 + 0.3 + 0.4 + 0.5, 2), "Борис": round(0.6 + 0.7, 2)})
+
+    def test_nested_places_become_one_card(self):
+        # r8 (слова 0–1) вложено в r1 (0–2) того же сегмента: одна карточка, а не две конфликтующие
+        data = legacy_data("a.wav")
+        data["review"].append({"id": "r8", "t": 0.0, "t1": 0.0, "t2": 0.8, "speaker": "Анна",
+                               "text": "принято как", "status": "resolved"})
+        found = voices.legacy_speaker_places(data)
+        places = {p["id"]: p for p in found["places"]}
+        self.assertEqual(set(places), {"r1", "r2", "r3"})
+        self.assertEqual(places["r1"]["covers"], ["r8"])
+        self.assertEqual((places["r1"]["w1"], places["r1"]["w2"]), (0, 3))
+        self.assertEqual(found["skipped"]["merged"], 1)
+
+    def test_partial_overlap_keeps_longer_place_without_widening(self):
+        data = legacy_data("a.wav")
+        data["segments"][0]["words"][3]["by"] = "human"           # «тут» тоже принят человеком
+        data["review"].append({"id": "r8", "t": 0.6, "t1": 0.6, "t2": 1.6, "speaker": "Анна",
+                               "text": "как есть тут", "status": "resolved"})
+        data["review"][0]["t2"] = 0.8                              # r1: «принято как»
+        found = voices.legacy_speaker_places(data)
+        places = {p["id"]: p for p in found["places"]}
+        self.assertNotIn("r1", places)
+        self.assertEqual(places["r8"]["covers"], ["r1"])
+        self.assertEqual((places["r8"]["w1"], places["r8"]["w2"]), (1, 4))
 
     def test_spans_report_counts_legacy_human_without_changing_selection(self):
         data = legacy_data("a.wav")
@@ -145,6 +170,60 @@ class CommandTests(unittest.TestCase):
             self.assertTrue(all(x["provenance"]["speaker"]["by"] == "human" for x in place_words))
         self.assertEqual(core.legacy_speaker_review("demo")["places"], [])
 
+    def apply_typed(self, rid, text):
+        man = review_pack.manifest(self.jp)
+        review_pack.add_answers(self.jp, [{"id": rid, "version": man["version"], "text": text}],
+                                "local", trusted_actor="human")
+        with patch.object(core, "job_json", return_value=(str(self.jp), str(self.md))):
+            core.apply_answers("demo")
+        return transcript.load(self.jp)
+
+    def test_nested_places_answer_applies_without_conflict(self):
+        data = json.loads(self.jp.read_text(encoding="utf-8"))
+        data["review"].append({"id": "r8", "t": 0.0, "t1": 0.0, "t2": 0.8, "speaker": "Анна",
+                               "text": "принято как", "status": "resolved"})
+        self.jp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        core.legacy_speaker_review("demo", build_pack=True)
+        man = review_pack.manifest(self.jp)
+        self.assertEqual(sorted(i["id"] for i in man["items"]), ["r1", "r2", "r3"])
+        answers = [{"id": item["id"], "version": man["version"], "option": 0} for item in man["items"]]
+        review_pack.add_answers(self.jp, answers, "local", trusted_actor="human")
+        with patch.object(core, "job_json", return_value=(str(self.jp), str(self.md))):
+            core.apply_answers("demo")
+        result = transcript.load(self.jp)
+        first = result["segments"][0]["words"][:3]
+        self.assertTrue(all(x["provenance"]["speaker"]["by"] == "human" for x in first))
+        self.assertEqual(core.legacy_speaker_review("demo")["places"], [])
+
+    def test_free_explanation_on_speaker_card_goes_to_human_not_into_text(self):
+        result = core.legacy_speaker_review("demo", build_pack=True)
+        self.assertTrue(result["pack"])
+        items = {i["id"]: i for i in review_pack.manifest(self.jp)["items"]}
+        self.assertEqual(items["r1"]["answer_mode"], "speaker")
+        # сохранение может склеить соседние реплики одного говорящего — сравниваем слова по порядку
+        before = [(s["speaker"], x["w"]) for s in transcript.load(self.jp)["segments"] for x in s["words"]]
+        data = self.apply_typed("r1", "Анна говорит только слово «принято»")
+        after = [(s["speaker"], x["w"]) for s in data["segments"] for x in s["words"]]
+        self.assertEqual(after, before)
+        r1 = next(r for r in data["review"] if r["id"] == "r1")
+        self.assertEqual(r1["status"], "human")
+        self.assertIn("подтверждения говорящего", r1.get("note") or "")
+
+    def test_name_answer_on_speaker_card_changes_only_speaker(self):
+        core.legacy_speaker_review("demo", build_pack=True)
+        data = self.apply_typed("r1", "это Борис")
+        words = [(s["speaker"], x["w"]) for s in data["segments"] for x in s["words"]]
+        self.assertEqual([w for _, w in words][:4], ["принято", "как", "есть", "тут"])
+        self.assertEqual([spk for spk, _ in words][:4], ["Борис", "Борис", "Борис", "Анна"])
+
+    def test_explicit_label_answer_on_speaker_card_is_not_sent_to_human(self):
+        core.legacy_speaker_review("demo", build_pack=True)
+        data = self.apply_typed("r1", "Анна: принято как есть")
+        words = [(s["speaker"], x["w"]) for s in data["segments"] for x in s["words"]][:4]
+        self.assertEqual(words, [("Анна", "принято"), ("Анна", "как"), ("Анна", "есть"), ("Анна", "тут")])
+        r1 = next(r for r in data["review"] if r["id"] == "r1")
+        self.assertNotIn("подтверждения говорящего", r1.get("note") or "")
+
     def test_sqlite_record_is_refused(self):
         class Store:
             def close(self):
@@ -189,6 +268,23 @@ class PreviewTests(unittest.TestCase):
             lines = core.voice_action_lines({"group": "demo-group", "json": str(source), "report": result})
             self.assertTrue(any(line.startswith("ВНИМАНИЕ") and "Анна" in line for line in lines))
             self.assertTrue(any("4.2 → 0.0" in line for line in lines))
+
+    def test_confirmation_text_fits_with_legacy_reason(self):
+        # окно подтверждения обновления профиля ограничено 1100 знаками (core.prepare_voice_action);
+        # отчёт как у настоящей записи после переноса старых подтверждений не должен его превышать
+        counts = {"accepted_auto": 77, "accepted_human": 15, "foreign_overlap": 2, "gap_or_order": 32,
+                  "legacy_human_without_speaker": 16, "overlap": 33, "too_short": 106, "unconfirmed_or_flagged": 173}
+        report = {"existing_contributions": ["Мария", "Борис", "Ольга"],
+                  "candidates": {"Мария": {"seconds": 107.63}, "Борис": {"seconds": 179.44}, "Ольга": {"seconds": 100.53}},
+                  "human_seconds_change": {"Мария": {"before": 0.0, "after": 32.03}, "Ольга": {"before": 0.0, "after": 2.91}},
+                  "human_seconds_lost": [], "group_selection": {"method": "transcript_or_vocab"},
+                  "selection_explanation": [{"code": c, "description": voices.SELECTION_REASONS[c], "count": n}
+                                            for c, n in counts.items()]}
+        snapshot = {"group": "ip-demo-course-1", "json": "zapis1_2026-11-08_23-12-04.s2.transcript.json",
+                    "vocab_path": "rus-transcriber.vocab.json", "vocab_hash": "0" * 64, "report": report}
+        lines = core.voice_action_lines(snapshot)
+        self.assertLessEqual(len("\n".join(lines)), 1100)
+        self.assertTrue(all(len(line) <= 200 for line in lines))
 
 
 if __name__ == "__main__":

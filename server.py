@@ -38,9 +38,10 @@ _job_json = core.job_json
 
 INSTRUCTIONS = """\
 rus-transcriber: расшифровка речи на этом компьютере. При заказанном конспекте П4 автоматически отправляет
-только текст слов, их ID/признаки сомнений, цель и ревизии в OpenAI GPT-6 Luna через OpenCode. Аудио,
-биометрия, пути и журналы не передаются. Ответ остаётся модельным предложением и проходит локальную проверку;
-он не является подтверждением человека. Рабочий процесс:
+только текст слов, их ID/признаки сомнений, деление на реплики и условные метки говорящих («Участник 1»…),
+цель и ревизии в OpenAI GPT-6 Luna через OpenCode. Имена говорящих, аудио, биометрия, пути и журналы
+не передаются; метки расшифровываются именами только в файле конспекта на этом компьютере. Ответ остаётся
+модельным предложением и проходит локальную проверку; он не является подтверждением человека. Рабочий процесс:
 
 П3/P4: start_workflow → workflow_status. Облако только по явному согласию человека: allow_cloud_model
 по умолчанию false; передавайте true, лишь если человек прямо согласился на отправку текста стенограммы
@@ -80,7 +81,7 @@ rus-transcriber: расшифровка речи на этом компьюте�
    голосовые отпечатки (биометрию): не читайте его и не передавайте в разговор.
 """
 
-VERSION = "2026.11.20.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
+VERSION = "2026.11.21.3"   # версия программы; видна клиентам в ответе initialize (serverInfo.version)
 
 try:
     mcp = FastMCP("rus-transcriber", instructions=INSTRUCTIONS, version=VERSION)
@@ -165,7 +166,9 @@ def workflow_status(request_id: str) -> str:
 
 @mcp.tool()
 def workflow_model_task(request_id: str, offset: int = 0, limit: int = 1000) -> str:
-    """Получить страницу задания. Прочитайте все страницы до next_offset=null."""
+    """Получить страницу задания. Прочитайте все страницы до next_offset=null. В задании версии 2 у слова
+    есть номер реплики turn, а в turns — условные метки говорящих («Участник N») для реплик этой страницы:
+    называйте говорящих только этими метками, имён в задании нет."""
     try:
         return json.dumps(core.workflow_model_task(request_id, offset, limit), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
@@ -240,7 +243,8 @@ def workflow_execute_model(request_id: str, retry_failed: bool = False) -> str:
 
 @mcp.tool()
 def workflow_model_part(request_id: str, part_index: int) -> str:
-    """Получить один блок длинной стенограммы, не более 500 слов."""
+    """Получить один блок длинной стенограммы, не более 500 слов. Блок кончается на границе реплики;
+    реплика длиннее 500 слов делится по концу предложения."""
     try:
         return json.dumps(core.workflow_model_part(request_id, part_index), ensure_ascii=False)
     except (storage.StorageError, ValueError, KeyError, OSError) as ex:
@@ -484,6 +488,26 @@ def review_items(job_id: str, offset: int = 0, limit: int = 40, reasons: str = "
     try:
         return json.dumps(core.review_items(job_id, offset, limit, reasons, min_sec, brief, status),
                           ensure_ascii=False, indent=None if brief else 1)
+    except core.CoreError as ex:
+        return str(ex)
+
+
+@mcp.tool()
+def conversation_hotspots(job_id: str, limit: int = 20, min_score: float = 0.0) -> str:
+    """Горячие места разговора — отрезки, где разговор был оживлён или напряжён. Только по просьбе человека:
+    сами по себе в стенограмму, конспект и ответы не добавляются.
+
+    В ответе hotspots: t1, t2 (секунды), time, score (0…1) и kinds — что измерено: «частые смены говорящих»,
+    «наложения», «громче обычного», «тон выше обычного» (громкость и высота — относительно обычных для
+    того же говорящего в этой записи). Это эвристика для навигации (где развернуть стенограмму или
+    послушать запись), а не оценка эмоций или поведения людей и не доказательство: не пересказывайте её
+    как «человек злился/волновался», пороги стартовые, на настоящей речи не проверялись.
+    limit — сколько мест показать (самые выраженные, по времени; 0 — все), min_score — нижняя граница оценки.
+    available=false — данных нет, причина в reason: запись обработана до появления слоя признаков, настройка
+    interaction была выключена или расчёт слоя не удался; старые записи не пересчитываются.
+    job_id — задача или "recording:<id>" записи в SQLite."""
+    try:
+        return json.dumps(core.conversation_hotspots(job_id, limit, min_score), ensure_ascii=False, indent=1)
     except core.CoreError as ex:
         return str(ex)
 
@@ -751,7 +775,12 @@ def find_recording_results(source_path: str) -> str:
 def read_recording_result(recording_id: str) -> str:
     """Прочитать SQLite-результат по recording_id без сохранённого job."""
     try:
-        return json.dumps(core.read_recording_result(recording_id), ensure_ascii=False)
+        result = core.read_recording_result(recording_id)
+        quality = result.get("quality")
+        if isinstance(quality, dict) and "interaction" in quality:
+            # слой признаков разговора (массивы чисел) показывается только по запросу
+            quality["interaction"] = {"omitted": "см. conversation_hotspots"}
+        return json.dumps(result, ensure_ascii=False)
     except (OSError, ValueError, KeyError, storage.StorageError) as ex:
         return json.dumps({"error": str(ex)}, ensure_ascii=False)
 

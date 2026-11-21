@@ -14,6 +14,9 @@ import paths
 DEFAULTS = {"asr_backend": "auto", "asr_device": "CPU", "asr_model": "v3_e2e_rnnt",
             "asr_batch": 1, "asr_allow_npu": False,
             "pad_to_seconds": 0, "emotions": True,
+            # слой признаков разговора для «горячих мест» (hotspots.py): считается при обработке,
+            # показывается только по запросу
+            "interaction": True,
             # вторая модель GigaAM и третья модель Whisper: голосование «два из трёх».
             # У каждой группы своё устройство: RNN-T, CTC и Whisper могут считаться на разном железе.
             "asr_second_model": "v3_e2e_ctc", "asr_second_backend": "auto",
@@ -133,14 +136,17 @@ def update(explicit=(), **kv):
     """Меняет отдельные настройки, остальные отличия сохраняются.
 
     explicit — что записать явно, даже если значение совпадает с умолчанием (выбор теста скорости).
+    Ключи, уже записанные в config.json, остаются в нём, даже если совпадают с умолчанием:
+    иначе выбор этой машины молча сменился бы вместе с умолчаниями новой версии программы.
     """
     invalid = [key for key, value in kv.items() if not _valid_config_value(key, value)]
     if invalid:
         raise ValueError("неверный тип настройки: " + ", ".join(sorted(invalid)))
     with _config_lock():
         cur = load_overrides()
+        keep = set(cur) | set(explicit)
         cur.update(kv)
-        return _save_overrides_locked(cur, explicit=explicit)
+        return _save_overrides_locked(cur, explicit=keep)
 
 
 def user_display_name(store):

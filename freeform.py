@@ -33,7 +33,15 @@ DUP_SEC = 2.0                    # повтор: то же слово модел
 MIN_ANCHORS = 0.3
 AGREE = {"да", "верно", "так", "правильно", "все верно", "всё верно", "да верно", "ага", "угу", "так и есть",
          "как есть", "да так"}
-WORD = re.compile(r"[\wЁё][\wЁё'-]*", re.U)
+# Закрытый список отрицаний: ответ (или его часть до двоеточия) после norm — ровно [приставка] [усилитель] отрицание.
+# Такой ответ ничего не меняет и не подтверждает. Других отрицаний нет: остальное разбирается как раньше.
+NEGATIVE_PREFIXES = ("нет", "это", "я", "нет-нет")
+NEGATIVE_INTENSIFIERS = ("совершенно", "совсем", "абсолютно")
+NEGATIVE_CORES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна", "не согласны",
+                  "не согласен с этим", "не согласна с этим", "не согласны с этим")
+NEGATIVES = frozenset(" ".join(x for x in (p, i, c) if x) for p in ("",) + NEGATIVE_PREFIXES
+                      for i in ("",) + NEGATIVE_INTENSIFIERS for c in NEGATIVE_CORES)
+WORD =re.compile(r"[\wЁё][\wЁё'-]*", re.U)
 
 _MORPH = None
 
@@ -158,10 +166,18 @@ def _negated_label(toks, pos, names):
     return bool(name and _negated_name(toks, pos) and toks[pos + count - 1].rstrip().endswith(":"))
 
 
+def negative_answer(text):
+    """Ответ из закрытого списка NEGATIVES; «неверно: слово» — тоже (проверяется часть до двоеточия)."""
+    head = (text or "").split(":", 1)[0]
+    return " ".join(norm(x) for x in head.split() if norm(x)) in NEGATIVES
+
+
 def classify(text, names):
     t = " ".join(norm(x) for x in (text or "").split() if norm(x))
     if not t:
         return {"kind": "skip"}
+    if negative_answer(text):
+        return {"kind": "negative"}
     if t in AGREE:
         return {"kind": "agree"}
     ws = t.split()
@@ -363,6 +379,9 @@ def card_edits(item, answer, words, names, corpus=frozenset(), vocab_words=froze
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "agree":
         return {"kind": "agree", "edits": [], "covered": None, "report": rep}
+    if c["kind"] == "negative":
+        rep["human"] = "ответ — отказ, стенограмма не менялась; впишите услышанное слово или выберите вариант"
+        return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}
     if c["kind"] == "unmatched":
         rep["human"] = "указано только отрицание имени; выберите говорящего"
         return {"kind": "unmatched", "edits": [], "covered": None, "report": rep}

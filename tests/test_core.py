@@ -352,6 +352,32 @@ class Answers(unittest.TestCase):
         self.assertEqual(freeform.classify("Борис, не Анна", self.names),
                          {"kind": "name", "speaker": "Борис"})
 
+    # Закрытый список отрицаний: «неверно», «не согласен» и т. п. с короткой приставкой и/или усилителем.
+    CLOSED_NEGATIVES = ("неверно", "не верно", "неправильно", "не правильно", "не согласен", "не согласна",
+                        "не согласны", "это неверно", "нет, неверно", "я не согласен", "нет-нет, неверно",
+                        "совершенно неверно", "совсем не верно", "абсолютно неправильно", "не согласен с этим",
+                        "я совершенно не согласен", "это совершенно неверно", "Неверно!", "НЕ ВЕРНО", "неверно: слово",
+                        "не согласен: слово")
+    # вне списка — как раньше: оценка не распознаётся, ответ разбирается обычным путём
+    NOT_NEGATIVES = ("нет", "наверно", "не совсем верно", "вряд ли верно", "это не так", "не очень верно",
+                     "думаю, что неверно", "да, но неверно", "неверное слово", "он сказал неверно", "Анна: неверно",
+                     "Спикер 1: не согласен", "время: всё верно", "верно", "неверно-неверно", "не")
+
+    def test_negative_answer_closed_list(self):
+        item = {"id": "r1", "t1": 0, "t2": 0}
+        words = [{"w": "слово", "s": 0, "e": 0.2, "_spk": "Анна"}]
+        for text in self.CLOSED_NEGATIVES:
+            with self.subTest(text=text):
+                self.assertTrue(freeform.negative_answer(text))
+                self.assertEqual(freeform.classify(text, self.names), {"kind": "negative"})
+                result = freeform.card_edits(item, {"text": text}, words, self.names)
+                self.assertFalse(result["edits"])
+                self.assertIn("слово", result["report"]["human"])
+        for text in self.NOT_NEGATIVES:
+            with self.subTest(text=text):
+                self.assertFalse(freeform.negative_answer(text))
+                self.assertNotEqual(freeform.classify(text, self.names)["kind"], "negative")
+
     def test_multiword_names_and_labels(self):
         names = ["Спикер 1", "Спикер 10", "Анна", "Анна Петровна", "Борис", "Вера"]
         for text, speaker in (("Спикер 1", "Спикер 1"), ("Спикер 10", "Спикер 10"),

@@ -788,19 +788,35 @@ CONFLICT_SCOPES = ("document", "conspect")
 CONFLICT_PREVIEW_CHARS = 20000        # знаков копии в предпросмотре
 CONFLICT_SHOWN_LINES, CONFLICT_SHOWN_CHARS = 200, 500   # строк различий и знаков в строке на показ
 CONFLICT_DIFF_CELLS = 90000    # сколько пар строк сравнивать точно на одном участке; для большего ищутся опоры
-CONFLICT_DIFF_WORK = 2000000   # общий предел работы сравнения на весь файл; исчерпан — остаток считается «с запасом»
+CONFLICT_DIFF_WORK = 2000000   # бюджет уточнения сверх первичного поиска опор, пропорционального входу
 
 def explain_error(ex):
     """Русское пояснение сбоя хранилища или базы для экрана; неизвестный сбой — с исходной причиной."""
     import storage
     text = str(ex)
     low = text.lower()
+    if isinstance(ex, storage.Busy) or (isinstance(ex, sqlite3.OperationalError)
+                                       and ("locked" in low or "busy" in low)):
+        return "База записей сейчас занята другой операцией. Подождите немного и повторите."
+    if isinstance(ex, storage.Conflict):
+        known = {
+            "stale revisions": "Запись изменилась после показа. Обновите её и повторите действие.",
+            "unresolved document conflict": "Сначала решите конфликт внешней правки документа.",
+            "unresolved conspect conflict": "Сначала решите конфликт внешней правки свёртки.",
+            "conflict already resolved": "Этот конфликт уже решён. Обновите список.",
+            "restored copy is inactive": "Восстановленная копия базы не активирована.",
+            "restore copy requires explicit rebind": "Восстановленная копия требует явного подключения папок.",
+            "external file too large to preserve; manual resolution required":
+                "Файл слишком велик для сохранения копии: нужен отдельный ручной разбор.",
+        }
+        return known.get(text, text if re.search("[А-Яа-яЁё]", text)
+                         else f"Действие не выполнено: состояние записи не позволяет его выполнить (причина: {text}).")
     if isinstance(ex, storage.StorageError) and re.search("[А-Яа-яЁё]", text):
         return text    # собственный отказ программы уже по-русски: прежний текст, не «ошибка базы»
     if "cannot open database" in low or "unable to open database" in low:
         return ("Не удалось открыть базу записей: проверьте, что папка данных на месте и база не занята другой "
                 f"программой (причина: {text}).")
-    if isinstance(ex, sqlite3.OperationalError) and ("locked" in low or "busy" in low) or "database is busy" in low:
+    if "database is busy" in low:
         return "База записей сейчас занята другой операцией. Подождите немного и повторите."
     if "hash mismatch" in low:
         return ("Контрольная сумма сохранённых данных не совпала: строка в базе повреждена "
@@ -884,8 +900,8 @@ def _observed_bytes(store, row):
     if found is None:
         return None
     found = bytes(found)
-    if documents._digest(found) != row["observed_hash"]:
-        raise CoreError("Сохранённая копия повреждена: её контрольная сумма не совпала.")
+    if len(found) != row["observed_size"] or documents._digest(found) != row["observed_hash"]:
+        raise CoreError("Сохранённая копия повреждена: её размер или контрольная сумма не совпали.")
     return found
 
 
@@ -958,7 +974,8 @@ def _conflict_item(store, row, rows, cache):
             "title": _real_case(row["location"], cache).name, "name": row["name"], "kind": row["kind"],
             "relative_path": row["relative_path"], "file": str(_shown_file(row, cache)),
             "observed_size": row["observed_size"], "preserved": row["preserved"], "status": "open",
-            "can_replace": False, "can_retry": False, "problem": None}
+            "can_replace": False, "can_retry": False, "problem": None,
+            "copy_problem": None, "next_effect": None, "next_step": None}
     try:
         same_object = [other for other in rows if other["object"] == row["object"]]
         status = "resolved" if row["resolved"] else "open"
@@ -973,6 +990,12 @@ def _conflict_item(store, row, rows, cache):
         item.update(status=status,
                     can_replace=status == "open" and row["preserved"] and not row["kind"].startswith("archive_"),
                     can_retry=status == "not_written" and not any(not other["resolved"] for other in same_object))
+        if status in ("open", "not_written"):    # у истории копии не читаются: их проверит скачивание
+            item["copy_problem"] = _copy_problem(store, row)
+            if item["copy_problem"]:
+                item["can_replace"] = False
+        if status == "not_written":
+            item["next_effect"], item["next_step"] = _next_step(store, row, same_object, item["copy_problem"])
     except (CoreError, storage.StorageError, sqlite3.Error, ValueError, KeyError, TypeError, OSError) as ex:
         item.update(status="damaged", can_replace=False, can_retry=False,
                     problem=str(ex) if isinstance(ex, CoreError) else
@@ -1036,9 +1059,96 @@ def _also_replaced(store, row, program):
     found = []
     for kind, other in decided.items():
         state, digest = _file_at(store, other, other["relative_path"])
-        if state == "ok" and digest == other["observed_hash"] and digest != documents._digest(program[kind]):
+        if (state == "ok" and digest == other["observed_hash"] and digest != documents._digest(program[kind])
+                and not _copy_problem(store, other)):
             found.append(other["relative_path"])
     return sorted(found)
+
+
+def _waits_for(row, rows):
+    """Другие открытые конфликты того же объекта: пока они есть, подтверждение файл не меняет."""
+    return sorted({Path(other["relative_path"]).name for other in rows
+                   if other["object"] == row["object"] and other["conflict_id"] != row["conflict_id"]
+                   and not other["resolved"]})
+
+
+def _copy_problem(store, row):
+    """Почему сохранённая копия непригодна; None — цела или её не сохраняли."""
+    if not row["preserved"]:
+        return None
+    try:
+        _observed_bytes(store, row)
+    except CoreError as ex:
+        return str(ex)
+    return None
+
+
+def _damaged_stops(store, row, rows, program):
+    """Файлы с повреждённой копией принятого решения, на которых запись встанет, не дойдя до файла row."""
+    import documents
+    decided = {}
+    for other in rows:
+        if (other["object"] != row["object"] or not other["resolved"] or other["revision"] > row["revision"]
+                or other["kind"] not in program):
+            continue
+        same_file = (other["revision"], other["relative_path"]) == (row["revision"], row["relative_path"])
+        if same_file and not row["resolved"]:
+            continue    # новое решение заменит прежнее решение по этому же файлу
+        decided[(other["revision"], other["relative_path"])] = other
+    table, column, revision = (("document_outbox", "recording_id", "document_revision") if row["scope"] == "document"
+                               else ("conspect_outbox", "conspect_id", "revision"))
+    found, order = set(), None
+    for other in decided.values():
+        if row["scope"] == "document" and other["revision"] == row["revision"]:
+            if order is None:    # файлы документа пишутся по очереди: позднейший предыдущему не мешает
+                order = list(documents.current_paths_from_document(
+                    store.get_document(row["recording_id"], row["revision"]), row["recording_id"]))
+            if order.index(other["kind"]) > order.index(row["kind"]):
+                continue
+        state, digest = _file_at(store, other, other["relative_path"])
+        if state != "ok" or digest != other["observed_hash"] or digest == documents._digest(program[other["kind"]]):
+            continue
+        if store.db.execute(f"SELECT 1 FROM {table} WHERE {column}=? AND {revision}=? AND state!='synced'",
+                            (row["object"][1], other["revision"])).fetchone() and _copy_problem(store, other):
+            found.add(Path(other["relative_path"]).name)
+    return sorted(found)
+
+
+def _effect(row, state, waits, stops):
+    """Что случится с файлом при записи по решению:
+    replace — заменён; close — уже равен версии программы; recopy — изменён, будет новый конфликт;
+    wait — ждёт другого конфликта; stopped — сейчас записать нельзя."""
+    if state == "program":
+        return "close"
+    if waits:
+        return "wait"
+    if state in ("missing", "unavailable"):
+        return "stopped"
+    if state == "changed" and (row["scope"] == "conspect" or not stops):
+        return "recopy"    # у свёртки внешние правки ищутся раньше проверки копий
+    return "stopped" if stops else "replace"
+
+
+def replacement_effect(recording_id, conflict_id, kind):
+    """Для окна MCP: что произойдёт после «Да»; если заменять нельзя — отказ до окна. Ничего не записывает."""
+    import recordings
+    store = recordings.open_store()
+    try:
+        store.current_identity()
+        row = _conflict_row(store, recording_id, conflict_id, kind)
+        problem = _copy_problem(store, row)
+        if problem:
+            raise CoreError(problem + " Заменить такой файл нельзя: нужен отдельный ручной разбор.")
+        if _file_at(store, row, row["relative_path"])[0] == "missing":
+            raise CoreError(_missing_text(row, "затем повторите."))
+        facts = _conflict_facts(store, row)
+        if not facts["can_replace"]:
+            raise CoreError(facts["reason"])
+        blocked = bool(_unresolvable_wait(store, row, _conflict_rows(store, kind)))
+        return {"effect": facts["effect"], "waits": facts["waits_for"], "stops": facts["stops_for"],
+                "changed": facts["file_state"] == "changed", "blocked": blocked}
+    finally:
+        store.close()
 
 
 def _conflict_facts(store, row):
@@ -1057,12 +1167,17 @@ def _conflict_facts(store, row):
              else "same" if digest == row["observed_hash"] else "changed")
     reason = _refusal(row, state) or problem
     also = [] if reason else _also_replaced(store, row, program)
+    rows = [] if reason else _conflict_rows(store, row["scope"])
+    waits = [] if reason else _waits_for(row, rows)
+    stops = [] if reason else _damaged_stops(store, row, rows, program)
     return {"program": None if program is None else program[row["kind"]], "file_state": state,
-            "also_replaces": also, "can_replace": reason is None, "reason": reason,
+            "also_replaces": also, "waits_for": waits, "stops_for": stops,
+            "effect": None if reason else _effect(row, state, waits, stops), "can_replace": reason is None, "reason": reason,
             "snapshot": None if reason else {
                 "scope": row["scope"], "recording_id": row["recording_id"], "conflict_id": row["conflict_id"],
                 "observed_hash": row["observed_hash"], "program_revision": revision,
-                "program_hash": program_hash, "also_replaces": also}}
+                "program_hash": program_hash, "also_replaces": also, "waits_for": waits,
+                "stops_for": stops}}
 
 
 def _lines(text):
@@ -1113,15 +1228,17 @@ def _anchors(a, b):
     return chain[::-1]
 
 
-def _diff_lines(a, b):
+def _diff_lines(a, b, *, details=None):
     """Строки a, которых нет на своём месте в b (gone), и строки b, которых нет в a (came).
 
     Сравнение по порядку: перестановка и перенос строк — потеря. Значение — номер строки напротив
-    при замене одной строки другой или None. Работа ограничена одним общим пределом на весь файл
-    (CONFLICT_DIFF_WORK: и таблицы точного сравнения, и поиск опор): что в него не уложилось,
-    считается целиком потерей и появлением, то есть число потерь только завышается."""
+    при замене одной строки другой или None. Общий бюджет — первичный поиск опор по входу плюс
+    CONFLICT_DIFF_WORK для уточнения. Что в него не уложилось, считается целиком потерей и
+    появлением (оценка сверху); details сообщает, что результат огрублён."""
     gone, came = {}, {}
-    budget = CONFLICT_DIFF_WORK
+    budget = CONFLICT_DIFF_WORK + 5 * (len(a) + len(b))
+    if details is not None:
+        details["approximate"] = False
     work = [(0, len(a), 0, len(b))]
     while work:
         a1, a2, b1, b2 = work.pop()
@@ -1149,6 +1266,8 @@ def _diff_lines(a, b):
                 anchors = _anchors(a[a1:a2], b[b1:b2])
             budget -= cost
         if not anchors:
+            if details is not None and a1 < a2 and b1 < b2:
+                details["approximate"] = True
             gone.update((i, None) for i in range(a1, a2))
             came.update((j, None) for j in range(b1, b2))
             continue
@@ -1253,14 +1372,21 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
         gone = came = {}
         mine = theirs = []
         text = None
+        comparison = {"approximate": False}
         if observed is not None:
             text, encoding, _ = _decode_copy(observed)
             program_text = None if program is None else program.decode("utf-8", errors="surrogateescape")
             if program_text is not None:
                 mine, theirs = _lines(text), _lines(program_text)
-                gone, came = _diff_lines(mine, theirs)
+                gone, came = _diff_lines(mine, theirs, details=comparison)
                 newlines_only = text != program_text and mine == theirs
             notes = _file_notes(text, program_text, encoding)
+            if comparison["approximate"]:
+                notes.append("Сравнение огрублено: число строк — оценка сверху, а не точное число изменений. "
+                             "В списки могли попасть совпадающие строки. Сохранённая копия доступна целиком.")
+        waits = _unresolvable_wait(store, row, _conflict_rows(store, row["scope"])) if can_replace else None
+        if waits:
+            notes.append(waits)
         removed, removed_notes, whole_removed = _present(mine, gone, theirs)
         added, added_notes, whole_added = _present(theirs, came, mine)
         shown_text = None if text is None else _show_text(text)
@@ -1274,7 +1400,11 @@ def preview_conflict(recording_id, conflict_id, kind="document"):
                 "removed_notes": removed_notes, "added_notes": added_notes,
                 "shown_all": whole_removed and whole_added, "newlines_only": newlines_only,
                 "encoding": encoding, "file_notes": notes, "copy_problem": copy_problem,
+                "comparison_approximate": comparison["approximate"],
                 "also_replaces": facts["also_replaces"] if can_replace else [],
+                "waits_for": facts["waits_for"] if can_replace else [], "waits_blocked": bool(waits),
+                "stops_for": facts["stops_for"] if can_replace else [],
+                "effect": facts["effect"] if can_replace else None,
                 "can_replace": can_replace, "reason": reason, "snapshot": snapshot}
     finally:
         store.close()
@@ -1300,21 +1430,36 @@ def _is_journal_stop(ex):
     return isinstance(ex, ValueError) and "ручное восстановление" in str(ex)
 
 
-def _journal_blockers(row):
+def _journal_blockers(store, row):
     """Файлы, из-за которых журнал свёртки не даёт продолжить запись: (имя, хэши журнала, имя журнала).
 
     Журнал один на запись, поэтому мешать может и файл другой свёртки из той же папки."""
     import conspect
-    folder = Path(row["root_path"]) / Path(row["relative_path"]).parent
+    import documents
+    import recordings
     found = []
     try:
-        for journal in sorted(folder.glob("*.conspect.pending")):
-            record = json.loads(journal.read_text(encoding="utf-8"))
-            for item in record["files"]:
-                hashes = (item["old_hash"], item["new_hash"])
-                if conspect._digest(conspect._read_bytes(folder / item["name"])) not in hashes:
-                    found.append((item["name"], hashes, journal.name))
-    except (OSError, ValueError, KeyError, TypeError):
+        binding = recordings.document_binding(store, row["recording_id"])
+        root = documents._authorized_root(store, binding["root_id"], binding["root"])
+        json_relative = Path(binding["paths"]["json"])
+        journal, exists = documents._read_only_target(root, str(json_relative) + ".conspect.pending")
+        if not exists:
+            return found
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        if record.get("version") != 1 or not isinstance(record.get("files"), list):
+            return found
+        for item in record["files"]:
+            name = item["name"]
+            if (not isinstance(name, str) or Path(name).name != name
+                    or not name.endswith((".conspect.json", ".conspect.md"))):
+                return []
+            relative = (json_relative.parent / name).as_posix()
+            path, exists = documents._read_only_target(root, relative)
+            digest = conspect._digest(path.read_bytes()) if exists else None
+            hashes = (item["old_hash"], item["new_hash"])
+            if digest not in hashes:
+                found.append((relative, hashes, journal.name, binding["root_id"]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     return found
 
@@ -1324,15 +1469,24 @@ def _journal_reason(store, row):
     head = ("Запись файлов свёртки остановлена журналом: после прошлого сбоя файлы свёртки изменились, и программа "
             "не продолжает сама, чтобы не затереть вашу правку. Сначала сохраните свою новую правку отдельно "
             "(скопируйте файл в другое место). ")
-    blockers = _journal_blockers(row)
+    blockers = _journal_blockers(store, row)
     if not blockers:
         return head + ("Какой файл мешает, определить не удалось, и выхода на этом экране нет: нужно "
                        "ручное восстановление рядом с файлами записи.")
     rows = _conflict_rows(store, row["scope"])
     parts = []
-    for name, hashes, journal in blockers:
-        copies = [other for other in rows if Path(other["relative_path"]).name.casefold() == name.casefold()
-                  and other["preserved"] and other["observed_hash"] in hashes]
+    for relative, hashes, journal, root_id in blockers:
+        name = Path(relative).name
+        copies = []
+        for other in reversed(rows):
+            if (other["recording_id"] == row["recording_id"] and other["root_id"] == root_id
+                    and os.path.normcase(str(Path(other["relative_path"]))) == os.path.normcase(str(Path(relative)))
+                    and other["preserved"] and other["observed_hash"] in hashes):
+                try:
+                    if _observed_bytes(store, other) is not None:
+                        copies.append(other)
+                except CoreError:
+                    pass
         if copies:
             parts.append(f"Мешает файл «{name}» (журнал «{journal}»): верните на его место его сохранённую копию "
                          f"(скачайте её как «{_copy_name(copies[0])}» и переименуйте в «{name}») и нажмите «Повторить».")
@@ -1345,9 +1499,12 @@ def _journal_reason(store, row):
 
 def _failure_reason(store, row, ex):
     """Настоящая причина, по которой файл не записан, когда она известна по ошибке записи."""
+    import documents
     import storage
     if _is_journal_stop(ex):
         return _journal_reason(store, row)
+    if isinstance(ex, documents.DamagedCopy):
+        return str(ex) + " После изменения файла нажмите «Повторить»."
     if isinstance(ex, storage.Busy) or (isinstance(ex, sqlite3.OperationalError)
                                         and ("locked" in str(ex).lower() or "busy" in str(ex).lower())):
         return ("База записей была занята другой операцией. Решение принято; подождите немного "
@@ -1363,8 +1520,65 @@ def _file_words(row, digest):
     """Что сказать о файле по его сверенному содержимому, а не по догадке о том, дошла ли запись."""
     if digest == row["observed_hash"]:
         return " Файл по-прежнему такой, как ваша правка: версия программы в него не записана."
-    return (" Файл сейчас не совпадает ни с вашей правкой, ни с последней версией программы: часть записи могла "
-            "пройти. Сверьте его содержимое.")
+    return (" Файл сейчас не совпадает ни с вашей сохранённой правкой, ни с последней версией программы. "
+            "Причину изменения по этой проверке установить нельзя. Сверьте его содержимое.")
+
+
+def _unresolvable_wait(store, row, rows):
+    """Открытый конфликт того же объекта, который на экране не решить, но запись этого файла его ждёт."""
+    stuck = sorted({Path(other["relative_path"]).name for other in rows
+                    if other["object"] == row["object"] and other["conflict_id"] != row["conflict_id"]
+                    and not other["resolved"] and (not other["preserved"] or other["kind"].startswith("archive_")
+                                                   or _copy_problem(store, other))})
+    if not stuck:
+        return None
+    names = ", ".join(f"«{name}»" for name in stuck)
+    return (f"Запись этого файла ждёт решения по другому файлу той же записи: {names}. Но решить его на этом экране "
+            "нельзя (файл больше 8 МиБ, это архив или его копия повреждена), нужен отдельный ручной разбор. До него "
+            "этот файл останется как есть, даже если решение о замене принято.")
+
+
+def _next_step(store, row, rows, problem):
+    """Карточка принятого, но не записанного решения: (что будет с файлом, слова человеку)."""
+    import documents
+    program = _program_version(store, row)[1]
+    found, digest = _file_at(store, row, row["relative_path"])
+    state = found if found != "ok" else "same" if digest == row["observed_hash"] else "changed"
+    waits = _waits_for(row, rows)
+    stops = _damaged_stops(store, row, rows, program)
+    effect = _effect(row, state, waits, stops)
+    waiting = ""
+    if waits:
+        waiting = _unresolvable_wait(store, row, rows) or (
+            "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения).")
+    if problem:
+        if state == "missing":
+            text = ("Файла на прежнем месте нет, а его сохранённая копия повреждена, скачать её нельзя: "
+                    "нужен ручной разбор вне экрана.")
+        elif state == "same":
+            text = ("Сохранённая копия повреждена, поэтому файл заменён не будет"
+                    + (", даже когда ожидание другого файла кончится. " if waits else ". ") + documents.DAMAGED_EXIT)
+        elif state == "changed":
+            text = ("Сохранённая копия повреждена, но файл уже изменён. Заменён он не будет: когда запись дойдёт "
+                    "до него, программа покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+        else:
+            text = "Сохранённая копия повреждена, а файл сейчас не читается: освободите его и обновите список."
+        return effect, f"{waiting} {text}".strip()
+    if waits:
+        return effect, (waiting + " Если тот файл будет решён, программа допишет этот, если вы его с тех пор "
+                        "не меняли; если меняли, появится новый конфликт.")
+    if state == "missing":
+        return effect, _missing_text(row, "и нажмите «Повторить».")
+    if state == "unavailable":
+        return effect, "Файл сейчас нельзя прочитать, записать его программа не может. Освободите его и повторите."
+    if effect == "recopy":
+        return effect, ("Файл изменён после принятого решения, поэтому заменён не будет: при повторе программа "
+                        "покажет новый конфликт, а если файл не больше 8 МиБ, сохранит его новую копию.")
+    if effect == "stopped":
+        return effect, ("Этот файл не будет записан, пока не разобрана повреждённая копия: "
+                        + ", ".join(f"«{name}»" for name in stops) + ". Выход указан в карточке того файла.")
+    return effect, ("Принятое решение программа может довести и сама, при любой следующей записи файлов этой записи, "
+                    "не спрашивая снова, если файл не меняли и другие файлы записи не помешают.")
 
 
 def _file_outcome(store, row, failure):
@@ -1378,10 +1592,15 @@ def _file_outcome(store, row, failure):
              and other["relative_path"] == row["relative_path"]]
     if fresh:
         return {"outcome": "changed", "new_conflict_id": fresh[-1]["conflict_id"], "reason": None}
-    if any(not other["resolved"] for other in rows):
-        reason = ("Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
-                  "Когда вы решите тот файл, программа допишет этот, если вы его с тех пор не меняли; "
-                  "если меняли, появится новый конфликт.")
+    waiting = any(not other["resolved"] for other in rows)
+    problem = _copy_problem(store, row) if waiting or state == "missing" else None
+    if problem:
+        reason = _next_step(store, row, rows, problem)[1]
+    elif waiting:
+        reason = _unresolvable_wait(store, row, rows) or (
+            "Запись этого файла ждёт решения по другому файлу той же записи (он среди ждущих решения). "
+            "Если тот файл будет решён, программа допишет этот, если вы его с тех пор не меняли; "
+            "если меняли, появится новый конфликт.")
     elif state == "missing":
         reason = _missing_text(row, "и нажмите «Повторить».")
     elif state == "unavailable":
@@ -1396,26 +1615,15 @@ def _file_outcome(store, row, failure):
     return {"outcome": "not_written", "new_conflict_id": None, "reason": reason}
 
 
-def _verify_copies(store, row):
-    """До любой записи файлов: цела ли сохранённая копия правки в каждом файле объекта, который запись
-    могла бы затереть (файл сейчас равен этой правке). Иначе отказ: заменённый файл уже не вернуть."""
-    for other in _conflict_rows(store, row["scope"]):
-        if other["object"] != row["object"] or other["kind"].startswith("archive_"):
-            continue
-        state, digest = _file_at(store, other, other["relative_path"])
-        if state == "ok" and digest == other["observed_hash"] and _observed_bytes(store, other) is None:
-            raise CoreError(f"Копия вашей правки файла «{Path(other['relative_path']).name}» не сохранена (он был "
-                            "больше 8 МиБ), а запись заменила бы его: на этом экране выхода нет, файл остаётся "
-                            "на диске как есть.")
-
-
 def _write_and_report(store, row):
     """Довести запись файлов объекта и сообщить итог по самому файлу, а не по очереди."""
     import recordings
-    write = recordings.materialize_recording if row["scope"] == "document" else recordings.materialize_conspects
     failure = None
     try:
-        write(store, row["recording_id"])
+        if row["scope"] == "document":
+            recordings.materialize_recording(store, row["recording_id"])
+        else:
+            recordings.materialize_conspects(store, row["recording_id"], conspect_id=row["conspect_id"])
     except Exception as ex:    # решение уже записано, и ответ всегда по факту: что лежит в файле
         failure = ex
     try:
@@ -1437,14 +1645,13 @@ def _replace_file(store, row, snapshot=None):
     if snapshot is not None and facts["snapshot"] != snapshot:
         raise CoreError("Показанное сравнение устарело: конфликт или версия программы изменились. "
                         "Откройте сравнение заново.")
-    _verify_copies(store, row)
     try:
         result = getattr(store, f"resolve_{row['scope']}_conflict")(
             row["conflict_id"], str(uuid.uuid4()), recordings.operation_context(store, "human"))
     except (storage.Busy, sqlite3.Error) as ex:
         raise CoreError("Решение не записано, файл не тронут. " + explain_error(ex)) from ex
     except (OSError, ValueError, storage.StorageError) as ex:
-        raise CoreError("Решение не записано, файл не тронут: конфликт уже решён или база занята.") from ex
+        raise CoreError("Решение не записано, файл не тронут. " + explain_error(ex)) from ex
     return {**result, **_write_and_report(store, row)}
 
 
@@ -1478,7 +1685,6 @@ def retry_conflict_file(recording_id, conflict_id, kind):
         if item["status"] == "resolved":
             raise CoreError("Повторять нечего: файл уже записан, или вы вернули на место свою копию, "
                             "или по этому файлу есть более новый конфликт.")
-        _verify_copies(store, row)
         return _write_and_report(store, row)
     finally:
         store.close()
@@ -1841,7 +2047,7 @@ def _resolve_for_agent(scope, recording_id, conflict_id):
         else:
             result = store.resolve_conspect_conflict(
                 conflict_id, str(uuid.uuid4()), recordings.operation_context(store, "human"))
-            completed = recordings.materialize_conspects(store, recording_id)
+            completed = recordings.materialize_conspects(store, recording_id, conspect_id=result["conspect_id"])
             result["materialized"] = (result["conspect_id"], result["revision"]) in completed
         return result
     except (OSError, ValueError, storage.StorageError) as ex:

@@ -34,6 +34,18 @@ class _FileConflict(storage.Conflict):
         super().__init__("document conflict")
 
 
+DAMAGED_EXIT = (
+    "Повтор без изменений не поможет. Скопируйте файл в другое место, затем измените его, не увеличивая: "
+    "удалите один любой знак (в пустой файл добавьте один) и сохраните. Если файл останется не больше "
+    "8 МиБ, при повторе записи программа сохранит новую копию и покажет новый конфликт, в котором файл "
+    "можно заменить; если станет больше, копия не сохранится и заменить его на экране будет нельзя. "
+    "Если файл совпадёт с версией программы, заменять его уже не нужно.")
+
+
+class DamagedCopy(storage.StorageError):
+    """Копия, разрешающая перезапись, непригодна: останавливается только её объект, не соседи."""
+
+
 def _not_reparse(path):
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
@@ -177,6 +189,22 @@ def _record_conflict(store, root_id, rid, revision, exc):
                          "WHERE recording_id=? AND document_revision=?", (rid, revision))
 
 
+def _check_override_copy(override, current, desired, relative):
+    """Под блокировкой писателя проверить копию, разрешающую именно эту перезапись.
+
+    Старые решения не участвуют; новый внешний файл обработается как новый конфликт.
+    Уже записанная версия программы не требует пригодной копии для повторного подтверждения.
+    """
+    if override is None or current == desired or current != override["observed_hash"]:
+        return
+    content = override["observed_bytes"]
+    if (not isinstance(content, (bytes, bytearray, memoryview)) or len(content) != override["observed_size"]
+            or _digest(content) != override["observed_hash"]):
+        raise DamagedCopy(
+            f"Сохранённая копия правки файла «{relative}» повреждена или отсутствует, поэтому файл не заменён. "
+            + DAMAGED_EXIT)
+
+
 def _authorized_root(store, root_id, root_path):
     """Проверить, что корень зарегистрирован, активен и совпадает с переданным путём."""
     storage._uuid(root_id)
@@ -188,8 +216,12 @@ def _authorized_root(store, root_id, root_path):
     return root
 
 
-def materialize_pending(store, root_id, root_path, *, fault=None):
-    """Обработать очередь зарегистрированного, явно разрешённого корня по порядку."""
+def materialize_pending(store, root_id, root_path, *, fault=None, recording_id=None):
+    """Обработать очередь зарегистрированного, явно разрешённого корня по порядку.
+
+    Повреждённая копия останавливает только свою запись. recording_id — чья это операция:
+    отказ вызывающему бросается лишь за неё, без него — за любую запись корня.
+    """
     root = _authorized_root(store, root_id, root_path)
     fault = fault or (lambda boundary, recording_id, revision: None)
     completed = []
@@ -199,6 +231,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
             "WHERE root_id=? AND state!='synced' ORDER BY recording_id, document_revision",
             (root_id,)).fetchall()
         blocked = set()
+        damaged = {}
         for row in rows:
             rid, rev = row["recording_id"], row["document_revision"]
             if rid in blocked or row["state"] == "conflict":
@@ -230,9 +263,9 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     desired = _digest(doc[kind])
                     expected = expected_hashes[kind]
                     override = store.db.execute(
-                        "SELECT observed_hash FROM document_conflicts WHERE recording_id=? "
-                        "AND document_revision=? AND kind=? AND resolution_operation_id IS NOT NULL "
-                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind)).fetchone()
+                        "SELECT observed_hash, observed_size, observed_bytes FROM document_conflicts WHERE recording_id=? "
+                        "AND document_revision=? AND kind=? AND relative_path=? AND resolution_operation_id IS NOT NULL "
+                        "ORDER BY rowid DESC LIMIT 1", (rid, rev, kind, filename)).fetchone()
                     if override is not None and current not in (desired, override["observed_hash"]):
                         if current is None:
                             raise storage.Conflict("external document disappeared after confirmation")
@@ -240,6 +273,7 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     if override is None and current not in (None, desired, expected):
                         raise _FileConflict(kind, path)
                     if current != desired:
+                        _check_override_copy(override, current, desired, filename)
                         _write_atomic(path, doc[kind])
                     fault("replace_" + kind, rid, rev)
                 fault("before_ack", rid, rev)
@@ -261,6 +295,12 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
             except _FileConflict as exc:
                 _record_conflict(store, root_id, rid, rev, exc)
                 blocked.add(rid)
+            except DamagedCopy as exc:
+                with store._transaction():
+                    store.db.execute("UPDATE document_outbox SET state='error', error_code='damaged_copy' "
+                                     "WHERE recording_id=? AND document_revision=? AND state!='synced'", (rid, rev))
+                blocked.add(rid)
+                damaged[rid] = exc
             except storage.Conflict:
                 with store._transaction():
                     store.db.execute("UPDATE document_outbox SET state='error', error_code='unclassified_conflict' "
@@ -297,6 +337,9 @@ def materialize_pending(store, root_id, root_path, *, fault=None):
                     store.db.execute("UPDATE document_outbox SET state='error', error_code='io_or_interrupted' "
                                      "WHERE recording_id=? AND document_revision=? AND state='synced'", (rid, rev))
                 raise
+    for rid, exc in damaged.items():
+        if recording_id in (None, rid):
+            raise exc
     return completed
 
 

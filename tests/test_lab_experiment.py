@@ -606,10 +606,53 @@ class TrialOnAudioFile(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
+class CaptureWithVoteTrace(unittest.TestCase):
+    """Сведение с протоколом (trace) идёт через words.vote_n мимо vote3: Capture записывает то же, что без него,
+    и mark_alt на исключённых отрезках не затирает способ сведения."""
+
+    def capture(self, trace, whisper_fails=True):
+        import backends
+        import words
+        from tests.test_combine_audit_fixes import diag_with_failed_whisper
+        from tests.test_combine_n_models import ok_diag, ten, text
+        diag = diag_with_failed_whisper("primary", "second") if whisper_fails else ok_diag("primary", "second",
+                                                                                           "whisper")
+        cap = lab_run.Capture(words, backends)
+        with cap:
+            words.combine_hypotheses({"primary": ten(), "second": ten({4: "пятак"}), "whisper": text(ten({1: "двое"}))},
+                                     diag, **({"trace": {}} if trace else {}))
+        return cap.vote
+
+    def test_same_capture_with_and_without_trace(self):
+        for fails in (True, False):
+            with self.subTest(whisper_fails=fails):
+                plain, traced = self.capture(False, fails), self.capture(True, fails)
+                self.assertEqual(plain["function"], "vote3")
+                self.assertEqual(traced, plain)
+        self.assertEqual(self.capture(True)["mark_alt_spans"], 1)
+
+
+@unittest.skipUnless(HAVE_LAB, "папки lab/ нет (установленная копия программы)")
 class CaptureWithRealPipeline(unittest.TestCase):
     """Перехват гипотез вокруг настоящего worker.run_words (модели подменены, как в test_whisper_ct2)."""
 
     def test_hypotheses_of_all_passes_are_captured(self):
+        data, hyps, calls, timing = self.run_pair()
+        self.check_capture(data, hyps, calls, timing)
+
+    def test_save_hypotheses_setting_does_not_change_lab_record(self):
+        """save_hypotheses в config.json песочницы: лаборатория выключает её у себя, запись лаборатории та же."""
+        import hypstore
+        with mock.patch.object(hypstore, "write", side_effect=AssertionError("лаборатория не пишет hypotheses\\")):
+            plain = self.run_pair()
+            with_setting = self.run_pair({"save_hypotheses": True})
+        self.check_capture(*with_setting)
+        self.assertEqual(json.dumps(plain[1], ensure_ascii=False, sort_keys=True),
+                         json.dumps(with_setting[1], ensure_ascii=False, sort_keys=True))
+        self.assertNotIn("_hyp", with_setting[0])
+        self.assertEqual(plain[2], with_setting[2])
+
+    def run_pair(self, cfg_extra=None):
         import numpy as np
         import backends
         import words
@@ -651,7 +694,7 @@ class CaptureWithRealPipeline(unittest.TestCase):
         cfg = {"asr_model": "primary", "asr_second_model": "second", "asr_third_model": "onnx-community/whisper-large-v3-turbo",
                "asr_third_device": "CPU", "asr_third_backend": "whisper-ct2", "asr_third_mode": "all",
                "asr_third_long_chunks": False, "asr_third_quant_cpu": "int8", "asr_third_batch": 4,
-               "emotions": False, "review_missed": False, "interaction": False}
+               "emotions": False, "review_missed": False, "interaction": False, **(cfg_extra or {})}
         conf = {"id": "a-current", "roles": {}}
         with mock.patch.object(backends, "make_asr", fake_make_asr), \
              mock.patch.object(backends, "WhisperCT2", CT2), \
@@ -662,8 +705,11 @@ class CaptureWithRealPipeline(unittest.TestCase):
              mock.patch.object(words, "doubt_flags", return_value=0), \
              mock.patch.object(words, "review_items", return_value=[]):
             orig_transcribe = words.transcribe
-            data, hyps, calls, timing = engine.run_config(shared, cfg, conf)
+            result = engine.run_config(shared, cfg, conf)
             self.assertIs(words.transcribe, orig_transcribe, "подмены сняты после вызова")
+        return result
+
+    def check_capture(self, data, hyps, calls, timing):
         self.assertEqual([w["w"] for w in hyps["primary"]["words"]], ["раз", "раз"])
         self.assertEqual([w["w"] for w in hyps["second"]["words"]], ["два", "два"])
         self.assertEqual(hyps["primary"]["model"], "primary")

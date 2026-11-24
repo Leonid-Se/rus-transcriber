@@ -51,6 +51,8 @@ OUTCOME_REASONS = {
     "revert_pending": ("отмена подготовлена: нажмите «Применить сохранённые ответы»; до этого прежний ответ "
                        "на месте. Передумали — «Не отменять»"),
     "applied": "ответ применён к стенограмме",
+    "applied_open": ("ответ применён, но место осталось открытым: прослушайте интервал и подтвердите "
+                     "услышанное кнопкой «Я прослушал…»"),
     "reverted": "ответ отменён, место снова открыто",
     "pending_new": ("новый ответ сохранён, но не применён: применённый ответ этим не заменяется. "
                     "Чтобы заменить: «Подготовить отмену» → «Применить сохранённые ответы» → выберите ответ "
@@ -194,6 +196,13 @@ def answer_is_current(answer, item):
     return bool(answer) and answer.get("rev", 1) == card_rev(item)
 
 
+# Состояние сбойного прохода (asr_problem.state) в вопросе карточки — по-русски; служебное имя не выводится.
+ASR_STATE_RU = {"error": "сбой распознавания",
+                "empty_unknown": "модель не выдала слов, неизвестно, была ли здесь речь",
+                "filtered": "распознанный текст целиком удалён очисткой"}
+ASR_STATE_UNKNOWN_RU = "результат неполон или неизвестен"
+
+
 def _card(T, data, it, q):
     """Карточка пакета для места it по вопросу q — без клипа; одна для build и upsert_cards.
     -> (карточка, (t1, t2)) или (None, причина пропуска)."""
@@ -226,9 +235,12 @@ def _card(T, data, it, q):
         models = ((data.get("quality") or {}).get("asr_run") or {}).get("models") or {}
         names = [(models.get(key) or {}).get("id") or key for key in problem.get("words_from") or []]
         model = (models.get(problem.get("model")) or {}).get("id") or problem.get("model") or "ASR"
-        question = (str(model) + ": " + str(problem.get("state")) +
-                    ("; слова других проходов: " + ", ".join(names) if names else "") +
-                    ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали.")
+        if problem.get("state") == "disagreement":
+            question = "Модели распознали по-разному (" + ", ".join(dict.fromkeys([str(model), *names])) + ")"
+        else:
+            question = (str(model) + ": " + ASR_STATE_RU.get(problem.get("state"), ASR_STATE_UNKNOWN_RU) +
+                        ("; слова других проходов: " + ", ".join(names) if names else ""))
+        question += ". Прослушайте весь интервал и подтвердите только то, что вы действительно услышали."
     manifest_item = {
         "id": it["id"], "rev": 1, "t": T.hms(it["t"]), "t1": round(t1, 2), "t2": round(t2, 2),
         **target,
@@ -1053,7 +1065,8 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
     closed = {rid: via for rid, via in closed.items() if via not in blocked}
     if edits or closed:
         result_data, rep = T.apply_word_edits(json_path, md_path, edits, by="human", closed=closed,
-                                    answers={k: v.get("text") for k, v in valid_free.items()}, dry_run=dry_run)
+                                    answers={k: v.get("text") for k, v in valid_free.items()}, dry_run=dry_run,
+                                    listened_by="human")
     else:
         result_data = data
         rep = {"cards": {}, "failed": {}, "proposed_delete": [], "not_found": [],
@@ -1062,16 +1075,22 @@ def _apply_free_locked(json_path, md_path, free, dry_run=False):
     confirmed, confirm_refusals = [], {}
     if not dry_run:
         # ответ совпал со словами, уже стоящими в паузе: открытое место закрывается тем же путём, что «как есть»
-        still_open = {r["id"] for r in T.load(json_path).get("review") or []
-                      if r.get("status", "open") in ("open", "human")}
+        now_places = {r["id"]: r for r in T.load(json_path).get("review") or []}
+        still_open = {rid for rid, r in now_places.items() if T.place_unresolved(r)}
         confirmed = [r["id"] for r in reports if r.get("confirm_as_is") and r["id"] not in blocked
                      and r["id"] in still_open]
         if confirmed:
             # «как есть» человека; у места-слова — по его ID слов из пакета, как у варианта (decisions)
             man_items = {it["id"]: it for it in man["items"]}
+            # то же слово, вписанное человеком на месте «модели расходятся», — его прослушивание (PR 7);
+            # «верно» и другие оценки им не считаются: они не говорят, что человек слышал
+            same_word = {r["id"] for r in reports if r.get("kind") == "short_word"}
             asked = [{"id": cid, **({"word_ids": man_items[cid]["word_ids"]}
                                     if "word_ids" in man_items.get(cid, {})
-                                    and not T.is_gap_place(man_items[cid]) else {})} for cid in confirmed]
+                                    and not T.is_gap_place(man_items[cid]) else {}),
+                      **({"listened": "words", "via": "card"} if cid in same_word and (
+                          now_places[cid].get("asr_problem") or {}).get("state") == "disagreement" else {})}
+                     for cid in confirmed]
             _, nested = T.apply_review(json_path, md_path, asked, by="human")
             refused = {c.get("id"): c.get("why") for c in nested.get("conflicts") or []}
             done = set(nested.get("successful_ids") or [])
@@ -1316,6 +1335,8 @@ def _answer_state(answer, applied_sig, event):
     if relation == "revert":
         # Отмена сохранена, но ещё не применялась: правка на месте, пока человек не нажмёт «Применить».
         return "undo_conflict" if (event or {}).get("outcome") == "undo_conflict" else "revert_pending"
+    if relation == "applied" and (event or {}).get("outcome") == "applied_open":
+        return "applied_open"          # применён, место открыто (PR 7): подпись та же, исход последнего применения
     if relation is not None:
         return relation
     if event is not None and event.get("outcome") in OUTCOME_REASONS and event.get("outcome") != "applied":

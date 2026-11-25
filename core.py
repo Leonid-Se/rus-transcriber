@@ -1110,7 +1110,53 @@ def apply_answers(job_id):
 
 
 def apply_answers_files(jp, md):
-    """Применить ответы к указанной паре файлов готовой задачи."""
+    """Применить ответы к указанной паре файлов готовой задачи.
+
+    После применения (и после фиксации в sqlite) карточки ответов с исходом applied_open получают новую
+    редакцию (PR 13б): ответ применён, место осталось открытым — следующий вопрос человеку. Замена идёт
+    снаружи `conspect.write_lock`: применение держит её и внутри берёт блокировку ответов пакета, а
+    `review_pack.upsert_cards` сам берёт операцию документа и ту же блокировку ответов — без вложения."""
+    report = _apply_answers_files_once(jp, md)
+    return _replace_open_cards(jp, report)
+
+
+def _card_errors():
+    """Сбои постановки карточки в открытый пакет после записи стенограммы (PR 13б): не отменяют записанное,
+    а попадают в отчёт (`cards_not_replaced`). storage.Conflict — запись сменилась между фиксацией и заменой."""
+    import storage
+    return OSError, RuntimeError, ValueError, storage.StorageError
+
+
+def _replace_open_cards(jp, report):
+    """Новая редакция карточек с исходом applied_open. Сбой замены не отменяет применённые ответы: он в
+    отчёте (`cards_not_replaced`), и следующее «Применить» снова даёт этому ответу applied_open и замену."""
+    import review_pack
+    import transcript
+    outcomes = report.get("outcomes") or []
+    # слова места противоречия изменились после показа: карточка — новая редакция с текущими словами
+    stale = [row["id"] for row in outcomes if row.get("outcome") == "source_conflict"]
+    if stale:
+        places = {i.get("id"): i for i in transcript.load(jp).get("review") or []}
+        stale = [aid for aid in stale if transcript.contradiction_pending(places.get(aid) or {})]
+        try:
+            cards = review_pack.contradiction_cards(jp, stale)
+            report["replaced_cards"] = [aid for aid, state in cards.items() if state == "updated"]
+        except _card_errors() as ex:
+            report["cards_not_replaced"] = [{"id": aid, "why": str(ex)} for aid in stale]
+    ids = [row["id"] for row in outcomes if row.get("outcome") == "applied_open"]
+    if not ids:
+        return report
+    try:
+        replaced = review_pack.open_after_answer_cards(jp, ids)
+    except _card_errors() as ex:
+        report["cards_not_replaced"] = (report.get("cards_not_replaced") or []) + \
+            [{"id": aid, "why": str(ex)} for aid in ids]
+        return report
+    report["replaced_cards"] = (report.get("replaced_cards") or []) + replaced
+    return report
+
+
+def _apply_answers_files_once(jp, md):
     import conspect
     import recordings
     store, binding = recordings.open_for_document(jp)
@@ -1544,10 +1590,45 @@ def edit_span(job_id, t1, t2, text, speaker="", note="", by=None):
     except ValueError as ex:
         raise CoreError(str(ex))
     s = _done_json(job_id)
+    return edit_span_files(s["json"], s["markdown"], t1, t2, text, speaker or None, note or None, by)
+
+
+def edit_span_files(jp, md, t1, t2, text, speaker=None, note=None, by=None):
+    """Правка отрезка пары файлов. Противоречие решению человека (PR 13б) — не ошибка, а результат
+    {"written": false, "contradiction": "rN", "card": "added|updated|unchanged|pending|not_replaced",
+    "text": «не записано: …»}: слова не меняются, карточка места встаёт в открытый пакет. Сбой постановки
+    карточки — card: not_replaced и `cards_not_replaced`; повтор той же правки её ставит."""
+    import review_pack
+    import transcript
     try:
-        _, rep = transcript.edit_span(s["json"], s["markdown"], t1, t2, text, speaker or None, note or None, by)
+        _, rep = transcript.edit_span(jp, md, t1, t2, text, speaker, note, by)
     except ValueError as ex:
         raise CoreError(str(ex))
+    rid = rep.get("contradiction")
+    if rid:
+        try:
+            rep["card"] = review_pack.contradiction_cards(jp, [rid]).get(rid, "pending")
+        except _card_errors() as ex:
+            rep["card"] = "not_replaced"
+            rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)}]
+    return rep
+
+
+def apply_review_files(jp, md, decisions, by="claude"):
+    """Решения по местам разбора (transcript.apply_review); предложения агента по словам или месту человека
+    становятся карточками противоречия в открытом пакете (PR 13б): `contradictions`, `cards`."""
+    import review_pack
+    import transcript
+    _, rep = transcript.apply_review(jp, md, decisions, by=by)
+    ids = list(dict.fromkeys(rep.get("contradictions") or []))
+    if ids:
+        rep["contradictions"] = ids
+        try:
+            rep["cards"] = review_pack.contradiction_cards(jp, ids)
+        except _card_errors() as ex:
+            # решения уже записаны: сбой постановки карточек — в отчёт; повтор решения или сборка их поставят
+            rep["cards"] = {rid: "not_replaced" for rid in ids}
+            rep["cards_not_replaced"] = [{"id": rid, "why": str(ex)} for rid in ids]
     return rep
 
 

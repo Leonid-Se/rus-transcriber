@@ -175,7 +175,11 @@ class TransferTests(PackFixture):
         self.assertEqual([e["type"] for e in state["interaction_events"]], ["audio_ended"])
         states = review_pack.answer_states_of(state, man)
         self.assertEqual({k: v["state"] for k, v in states.items()},
-                         {"r-ok": "applied", "r-ambig": "applied", "r-time": "saved", "r-edited": "saved"})
+                         {"r-ok": "applied", "r-ambig": "applied", "r-time": "saved", "r-edited": "already_decided"})
+        # Р-4 (решение владельца): ответ закрытого места без отметки — событие переноса «место уже решено»
+        decided = [e for e in state["application_events"] if e.get("action") == review_pack.LEGACY_DECIDED_ACTION]
+        self.assertEqual([(e["id"], e["outcome"]) for e in decided], [("r-edited", "already_decided")])
+        self.assertNotIn("r-edited", state["applied_answers"])
         self.assertIs(states["r-ok"]["undo"], False)              # снимка нет — «Отменить нельзя», честно
         self.assertEqual(review_pack.heard_ids(state, man), ["r-time"])   # переход 10.6 по audio_ended
         review = self.current(rid)["review"]["payload"]
@@ -187,7 +191,8 @@ class TransferTests(PackFixture):
         ps = self.current(rid)["transcript"]["payload"]["quality"]["migration"]["pack_state"]
         self.assertEqual((ps["state"], ps["answers_current"], ps["answers_archived"], ps["applied"]), ("full", 4, 1, 2))
         self.assertEqual(ps["applied_marks"], {"kept": 1, "from_true": 1, "dropped": 0, "from_applied_at": 0})
-        self.assertEqual((ps["waiting"], ps["waiting_closed_place"], ps["undo_snapshots_dropped"]), (2, 1, 1))
+        self.assertEqual((ps["waiting"], ps["waiting_closed_place"], ps["undo_snapshots_dropped"]), (1, 0, 1))
+        self.assertEqual(ps["already_decided_marked"], 1)
 
     def test_rebuild_guard_counts_only_current_answers(self):
         """М-1: архивный ответ не ждёт «Применить»; ждут только ответы текущего пакета — с номером карточки."""
@@ -195,7 +200,8 @@ class TransferTests(PackFixture):
         entry = self.apply()
         with self.assertRaises(review_pack.RebuildRefused) as caught:
             review_pack.check_rebuild(entry["documents"]["json"])
-        self.assertEqual([(w["card"], w["id"]) for w in caught.exception.waiting], [(2, "r-time"), (4, "r-edited")])
+        # ответ закрытого места помечен «место уже решено» (Р-4) и пересборку не блокирует
+        self.assertEqual([(w["card"], w["id"]) for w in caught.exception.waiting], [(2, "r-time")])
         self.assertNotIn("None", str(caught.exception))
 
     def test_without_waiting_answers_rebuild_passes_and_apply_runs(self):
@@ -210,9 +216,77 @@ class TransferTests(PackFixture):
         report = core.apply_answers("recording:" + entry["recording_id"])     # было TypeError (М-1)
         self.assertIsInstance(report, dict)
 
-    def test_waiting_answer_on_unknown_revision_is_not_applied(self):
-        """Ждущий старый ответ не применяется вслепую: автора у него нет (штатная защита «Применить» требует
-        подтверждения), а ревизия, по которой собран пакет, неизвестна. Стенограмма не меняется."""
+    def test_closed_place_answer_marked_already_decided_does_not_block_apply(self):
+        """Р-4: без ответа открытого места «Применить» проходит; ответ закрытого места не применяется (исход
+        «место уже решено» из пометки переноса), стенограмма не меняется."""
+        answers = self.answers()
+        answers.pop("r-time")
+        self.write_pack(answers=answers)
+        self.init_db()
+        entry = self.apply()
+        import core
+        before = self.current(entry["recording_id"])["transcript"]["payload"]
+        report = core.apply_answers("recording:" + entry["recording_id"])
+        self.assertEqual({o["id"]: o["outcome"] for o in report["outcomes"]}["r-edited"], "already_decided")
+        self.assertNotIn("r-edited", recordings.read_review_pack_state(entry["documents"]["json"])["applied_answers"])
+        self.assertEqual(self.current(entry["recording_id"])["transcript"]["payload"], before)
+        states = review_pack.answer_states(entry["documents"]["json"])
+        self.assertEqual(states["r-edited"]["state"], "already_decided")
+        self.assertEqual(review_pack.check_rebuild(entry["documents"]["json"])["waiting"], [])
+
+    def test_marked_free_answer_is_not_applied_and_apply_repeats(self):
+        """Ф212-1: старый свободный ответ («свой текст») без автора на закрытом месте помечен «место уже решено».
+        «Применить» его не трогает: пометка остаётся последним событием, слова не меняются, повторное «Применить»
+        не отказывает «неизвестного происхождения» (было: попытка применения поверх пометки и возврат Ф207-1)."""
+        answers = self.answers()
+        answers.pop("r-time")
+        answers["r-edited"] = {"id": "r-edited", "version": VERSION, "source": "local", "ts": AFTER,
+                               "kind": "free", "text": "месяцы"}
+        self.write_pack(answers=answers)
+        self.init_db()
+        entry = self.apply()
+        rid, jp = entry["recording_id"], entry["documents"]["json"]
+        self.assertNotIn("r-edited", review_pack.free_answers(jp))
+        import core
+        before = self.current(rid)["transcript"]
+        for _ in range(2):
+            report = core.apply_answers("recording:" + rid)
+            self.assertEqual({o["id"]: o["outcome"] for o in report["outcomes"]}["r-edited"], "already_decided")
+        after = self.current(rid)["transcript"]
+        self.assertEqual((after["revision"], after["payload"]), (before["revision"], before["payload"]))
+        state = recordings.read_review_pack_state(jp)
+        self.assertEqual([(e["action"], e["outcome"]) for e in state["application_events"] if e["id"] == "r-edited"],
+                         [(review_pack.LEGACY_DECIDED_ACTION, "already_decided")])
+        self.assertNotIn("r-edited", state["applied_answers"])
+
+    def _not_marked_over_applied(self, answer, expected_state):
+        """Ф212-2: пометку получает только сохранённый ответ (saved). Ответ поверх применённого на закрытом месте
+        (неприменённая отмена — revert_pending, новый ответ — pending_new) не помечается: его состояние от события
+        не зависит, с пометкой он остался бы ждущим, а «Применить» его пропускал бы."""
+        answers = self.answers()
+        for aid in ("r-time", "r-edited"):
+            answers.pop(aid)
+        answers["r-ok"] = {"id": "r-ok", "version": VERSION, "source": "local", "ts": AFTER, **answer}
+        self.write_pack(answers=answers, applied_answers={"r-ok": ["option", 0, None], "r-ambig": ["free", None, "да"]})
+        self.init_db()
+        entry = self.apply()
+        rid, jp = entry["recording_id"], entry["documents"]["json"]
+        stats = self.current(rid)["transcript"]["payload"]["quality"]["migration"]["pack_state"]
+        self.assertEqual(stats["already_decided_marked"], 0)
+        state = recordings.read_review_pack_state(jp)
+        self.assertFalse([e for e in state["application_events"] if e.get("action") == review_pack.LEGACY_DECIDED_ACTION])
+        self.assertEqual(review_pack.answer_states(jp)["r-ok"]["state"], expected_state)
+
+    def test_unapplied_revert_on_closed_place_is_not_marked(self):
+        self._not_marked_over_applied({"kind": "revert"}, "revert_pending")
+
+    def test_new_answer_over_applied_on_closed_place_is_not_marked(self):
+        self._not_marked_over_applied({"kind": "option", "option": 1}, "pending_new")
+
+    def test_waiting_answer_without_author_is_refused(self):
+        """Ждущий старый ответ без автора не применяется вслепую: штатная защита «Применить» требует
+        подтверждения (Ф207-1). Сверку ревизий проверяют тесты карточек настоящего вида (Ф207-5,
+        test_import_legacy_behavior.RealCardsApplyTests). Стенограмма не меняется."""
         self.init_db()
         entry = self.apply()
         import core
@@ -269,6 +343,58 @@ class TransferTests(PackFixture):
         self.assertEqual(review["undo"]["review_pack"]["applied_answers"], {})
         self.assertEqual(stats["pack_state"]["applied_marks"]["dropped"], 1)
 
+    def test_applied_at_rule_compares_fractions_of_second(self):
+        """Ф207-4: правило «не позже applied_at» — по исходным секундам с долями, как review_pack._applied_map:
+        ответ в ту же секунду, но позже применения, ждёт; ответ раньше в ту же секунду — применён."""
+        answers = self.answers()
+        answers["r-ok"]["ts"], answers["r-time"]["ts"] = APPLIED_AT + 0.1, APPLIED_AT + 0.7
+        for aid in ("r-ambig", "r-edited"):
+            answers.pop(aid)
+        self.write_pack(answers=answers, applied_at=APPLIED_AT + 0.2)
+        packs, manifests = IL._read_pack_files([self.pack])
+        packs[0]["raw"].pop("applied_answers")
+        self.assertEqual(IL._utc_text(APPLIED_AT + 0.7), IL._utc_text(APPLIED_AT + 0.2))   # строки равны
+        legacy = json.loads(self.tj.read_text(encoding="utf-8"))
+        _, _, review, stats = IL.build_snapshots(legacy, recording_id=IL.recording_id_for(self.tj, "s"), metadata={},
+                                                 field_sources={}, variant={}, source={}, answers_packs=packs,
+                                                 manifests=manifests)
+        self.assertEqual(set(review["undo"]["review_pack"]["applied_answers"]), {"r-ok"})
+        self.assertEqual((stats["pack_state"]["applied_marks"]["from_applied_at"], stats["pack_state"]["waiting"]),
+                         (1, 1))
+
+    def test_new_import_of_archived_pack_is_not_a_repair_candidate(self):
+        """Ф207-6: запись, которую новый перенос сразу положил в архив, ремонт считает исправленной."""
+        self.write_pack(version="другая")
+        self.init_db()
+        entry = self.apply()
+        self.assertEqual(entry["status"], "imported")
+        self.assertEqual(IL.repair_packs(db_only=True)["records"][0]["status"], "already_repaired")
+        rec = IL.repair_packs(IL.load_plan(self.write_plan()))["records"][0]
+        self.assertEqual(rec["status"], "already_repaired")
+        self.assertIn("новым переносом", rec["why"])
+
+    def test_old_pack_formats_are_named_in_inventory(self):
+        """Опись (а1) не отказывает старым видам пакета: рукописная фикстура — поля, которых нынешний код уже не
+        пишет (секунды, отметки true), и прежний формат answers.json с копией manifest и _expected_versions."""
+        self.write_pack(manifest={"version": VERSION, "items": []}, _expected_versions={"source_revision": 1})
+        packs, manifests = IL._read_pack_files([self.pack])
+        self.assertEqual(IL.unknown_pack_keys(packs, manifests), [])
+
+    def test_unknown_pack_key_refuses_record_before_writing(self):
+        """а1: ключ без назначения в описи — отказ записи unknown_pack_keys (код 1), ключ назван, ничего не
+        пишется; проверка без записи показывает это до apply."""
+        self.write_pack(new_state={"x": 1})
+        plan = self.write_plan()
+        self.init_db()
+        before = self.db_hashes()
+        entry = IL.run(self.plan(), "check")[0]
+        self.assertEqual(entry["status"], "unknown_pack_keys")
+        self.assertEqual(entry["unknown_pack_keys"], ["встреча.v2.review: new_state"])
+        with mock.patch.object(IL, "audio_facts", return_value={"audio_available": True}):
+            self.assertEqual(IL.run(self.plan(), "apply")[0]["status"], "unknown_pack_keys")
+            self.assertEqual(IL.main(["check", "--plan", str(plan)]), 1)
+        self.assertEqual(self.db_hashes(), before)
+
     def test_mismatched_versions_archive_answers(self):
         self.write_pack(version="другая")
         packs, manifests = IL._read_pack_files([self.pack])
@@ -309,7 +435,8 @@ class RepairTests(PackFixture):
         report = IL.repair_packs(IL.load_plan(self.write_plan()))
         self.assertEqual([e["status"] for e in report["records"]], ["would_repair"])
         ps = report["records"][0]["pack_state"]
-        self.assertEqual((ps["state"], ps["answers_current"], ps["waiting"], ps["waiting_closed_place"]), ("full", 4, 2, 1))
+        self.assertEqual((ps["state"], ps["answers_current"], ps["waiting"], ps["waiting_closed_place"]), ("full", 4, 1, 0))
+        self.assertEqual(ps["already_decided_marked"], 1)           # Р-4: сухой прогон показывает число пометок
         self.assertEqual(self.db_hashes(), before_db)
         self.assertEqual(self.legacy_hashes(), before_files)
         self.assertEqual({p: Path(p).read_bytes() for p in docs}, docs)
@@ -406,6 +533,81 @@ class RepairTests(PackFixture):
         report = json.loads((out / "repair-report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["backup_damaged_copies"], damaged)
         self.assertEqual(report["records"][0]["status"], "repaired")
+
+    def test_repeat_repair_of_archived_pack_is_already_repaired(self):
+        """Ф207-6: ремонт пакета, ушедшего в архив целиком (версии не совпали), повтором — «уже исправлено», код 0."""
+        self.write_pack(version="другая")
+        plan = self.write_plan()
+        report = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(report["records"][0]["status"], "repaired")
+        self.assertEqual(report["records"][0]["pack_state"]["state"], "archived_only")
+        db_after = self.db_hashes()
+        again = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(again["records"][0]["status"], "already_repaired")
+        self.assertEqual(self.db_hashes(), db_after)
+        self.assertEqual(self.run_main("--plan", str(plan), "--apply", "--data-dir", str(self.db.parent)), 0)
+
+    def test_documents_failure_after_db_write_is_reported_and_repeat_writes_them(self):
+        """Ф207-2: сбой записи файлов после записи в базу — не «ошибка», а «в базе исправлено, документы не
+        записаны» (код 1); повтор --apply дописывает документы без новой ревизии."""
+        plan = self.write_plan()
+        with mock.patch.object(recordings, "materialize_recording", side_effect=OSError("диск занят")):
+            report = IL.repair_packs(IL.load_plan(plan), apply=True)
+        rec = report["records"][0]
+        self.assertEqual(rec["status"], "repaired_documents_pending", rec)
+        self.assertIn("диск занят", rec["error"])
+        self.assertEqual(self.current(self.rid)["review"]["revision"], 2)
+        self.assertNotIn(VERSION, Path(self.entry["documents"]["json"]).read_text(encoding="utf-8"))
+        self.assertEqual(IL.repair_packs(db_only=True)["records"][0]["status"], "repaired_documents_pending")
+        self.assertEqual(self.run_main("--plan", str(plan)), 1)                     # сухой прогон: нужен повтор
+        again = IL.repair_packs(IL.load_plan(plan), apply=True)
+        self.assertEqual(again["records"][0]["status"], "documents_written", again)
+        self.assertIsNone(again["backup"])
+        self.assertEqual(self.current(self.rid)["review"]["revision"], 2)
+        self.assertIn(VERSION, Path(self.entry["documents"]["json"]).read_text(encoding="utf-8"))
+        store = recordings.open_store(self.db)
+        try:
+            self.assertEqual(IL._document_state(store, self.rid), "synced")
+        finally:
+            store.close()
+        self.assertEqual(IL.repair_packs(IL.load_plan(plan), apply=True)["records"][0]["status"], "already_repaired")
+
+    def test_repair_marks_closed_place_answers_already_decided(self):
+        """Р-4 (решение владельца 26.11.2026): ремонт помечает старый ответ закрытого места «место уже решено»;
+        «Применить» после ремонта отказывает только из-за ответа открытого места без автора (r-time); повтор
+        ремонта ничего не меняет."""
+        plan = self.write_plan()
+        self.assertEqual(IL.repair_packs(IL.load_plan(plan))["records"][0]["pack_state"]["already_decided_marked"], 1)
+        rec = IL.repair_packs(IL.load_plan(plan), apply=True)["records"][0]
+        self.assertEqual((rec["status"], rec["pack_state"]["already_decided_marked"]), ("repaired", 1))
+        jp = self.entry["documents"]["json"]
+        self.assertEqual({k: v["state"] for k, v in review_pack.answer_states(jp).items()}["r-edited"],
+                         "already_decided")
+        with self.assertRaises(review_pack.RebuildRefused) as caught:
+            review_pack.check_rebuild(jp)
+        self.assertEqual([w["id"] for w in caught.exception.waiting], ["r-time"])
+        import core
+        before = self.current(self.rid)["transcript"]["payload"]
+        state = recordings.read_review_pack_state(jp)
+        self.assertTrue(review_pack.legacy_decided(state, "r-edited", state["answers"]["r-edited"]))
+        self.assertFalse(review_pack.legacy_decided(state, "r-time", state["answers"]["r-time"]))
+        with self.assertRaisesRegex(core.CoreError, "неизвестного происхождения"):
+            core.apply_answers("recording:" + self.rid)
+        self.assertEqual(self.current(self.rid)["transcript"]["payload"], before)
+        db_after = self.db_hashes()
+        self.assertEqual(IL.repair_packs(IL.load_plan(plan), apply=True)["records"][0]["status"], "already_repaired")
+        self.assertEqual(self.db_hashes(), db_after)
+
+    def test_unknown_pack_key_refuses_repair(self):
+        """а1 в ремонте: сухой прогон и --apply называют ключ, база не меняется, код 1."""
+        self.write_pack(new_state={"x": 1})
+        plan = self.write_plan()
+        before = self.db_hashes()
+        rec = IL.repair_packs(IL.load_plan(plan))["records"][0]
+        self.assertEqual((rec["status"], rec["unknown_pack_keys"]), ("unknown_pack_keys", ["встреча.v2.review: new_state"]))
+        self.assertEqual(self.run_main("--plan", str(plan), "--apply", "--data-dir", str(self.db.parent)), 1)
+        self.assertEqual(self.db_hashes(), before)
+        self.assertFalse((self.db.parent / "db-backups").exists())
 
     def test_not_migrated_and_nothing_to_repair(self):
         plan = self.plan()

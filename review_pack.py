@@ -1469,6 +1469,10 @@ def decisions(json_path):
         if not answer_is_current(a, it):       # ответ прежней редакции карточки к новому вопросу не применяется
             rep["unanswered"].append(aid)
             continue
+        if legacy_decided(store, aid, a):
+            # Р-4: место решено до переноса — ответ неизвестного автора не применяется от имени человека;
+            # исход already_decided в отчёте «Применить» берётся из сохранённого состояния ответа
+            continue
         relation = over_applied(a, applied.get(aid))
         if relation == "applied" and confirms_check(a, events):
             # К-23: человек на ноутбуке подтвердил ответ, применённый с отметкой «проверьте» (тот же ответ или
@@ -1575,13 +1579,14 @@ def decisions(json_path):
 
 def free_answers(json_path):
     """Свободные ответы пакета, ещё не применённые: {id: ответ}. Отрицание — и после применения (место
-    остаётся с подсказкой, применённая правка не трогается)."""
+    остаётся с подсказкой, применённая правка не трогается). Ответ с пометкой переноса «место уже решено»
+    (Р-4, legacy_decided) не применяется, как и в decisions."""
     import freeform
     store = _read_answers(json_path, {"answers": {}})
     items = {it.get("id"): it for it in (manifest(json_path) or {}).get("items") or []}
     applied = _applied_map(store)
     return {aid: a for aid, a in store.get("answers", {}).items() if a.get("kind") == "free" and
-            answer_is_current(a, items.get(aid)) and
+            answer_is_current(a, items.get(aid)) and not legacy_decided(store, aid, a) and
             (aid not in applied or freeform.negative_answer(a.get("text")))}
 
 
@@ -1919,6 +1924,18 @@ def _answer_event(events, aid, answer):
                 ("answer_sig_sha256" not in row or row["answer_sig_sha256"] == _sig_hash(answer))):
             return row
     return None
+
+
+# Р-4 (решение владельца 26.11.2026): старый ответ, место которого уже закрыто, перенос помечает событием
+# применения с этим action и исходом already_decided — «место уже решено», ответ не применялся.
+LEGACY_DECIDED_ACTION = "legacy_import"
+
+
+def legacy_decided(store, aid, answer):
+    """Последнее событие применения этого ответа — пометка переноса «место уже решено» (Р-4). Такой ответ
+    «Применить» не применяет и не считает ждущим подтверждения: решения в нём больше нет."""
+    row = _answer_event(store.get("application_events"), aid, answer)
+    return bool(row) and row.get("action") == LEGACY_DECIDED_ACTION and row.get("outcome") == "already_decided"
 
 
 def _last_place_event(events, aid):

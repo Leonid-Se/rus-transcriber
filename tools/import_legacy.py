@@ -44,6 +44,68 @@ REPAIR_TOOL = "tools/import_legacy.py repair-packs v1"
 NAMESPACE = uuid.UUID("6b1d3c5e-8f0a-4c11-9d6e-2a7f4b9e0c31")
 MAX_INTERACTION_EVENTS = 2000           # как storage.MAX_INTERACTION_EVENTS и review_pack.MAX_INTERACTION_EVENTS
 CLOSED_STATUSES = ("resolved", "human")
+
+# Опись пакета карточек старого формата (механизм А разбора причин М-1): у каждого ключа answers.json и
+# manifest.json и у каждого файла папки разбора — назначение при переносе. Ключ файла пакета, которого здесь нет,
+# — отказ записи unknown_pack_keys (решение Архитектора 26.11.2026, вариант а1), а не тихий пропуск: тихая потеря
+# состояния пакета и была М-1. Новый ключ формата карточек сначала получает здесь назначение (тест
+# tests/test_import_legacy_behavior.py собирает пакет программой и падает на ключе без назначения). Ключи ответа и
+# карточки переносятся целиком, как записаны (копия ответа и manifest), поэтому здесь не перечисляются.
+LEGACY_PACK_INVENTORY = {
+    "answers.json": {
+        "version": "question_version разбора и version ответов текущего пакета",
+        "answers": "answers разбора (текущий пакет) или undo.legacy_review_packs (архив, Р-2)",
+        "applied_answers": "undo.review_pack.applied_answers",
+        "applied_at": "undo.review_pack.applied_at; правило «не позже applied_at» — в отметки applied_answers",
+        "conflicts": "conflicts разбора",
+        "rejected": "rejected разбора",
+        "application_events": "undo.review_pack.application_events и applications разбора",
+        "application_events_dropped": "undo.review_pack.application_events_dropped",
+        "interaction_events": "interaction_events разбора (не больше MAX_INTERACTION_EVENTS)",
+        "interaction_events_dropped": "interaction_events_evicted разбора",
+        "heard": "undo.review_pack.heard",
+        "outcome_details": "undo.review_pack.outcome_details",
+        "undo_snapshots": "не переносится (Р-1): после переноса снимок не совпадёт; число — в отчёте",
+        "manifest": "не переносится: копия manifest.json, переносится сам manifest.json",
+        "_expected_versions": "не переносится: служебная сверка ревизий сборки в режиме базы",
+    },
+    "manifest.json": {
+        "version": "undo.review_pack.manifest.version",
+        "items": "undo.review_pack.manifest.items (word_ids чужих слов убираются); questions разбора",
+        "recording_id": "undo.review_pack.manifest: новый ID записи, прежний — legacy_recording_id",
+        "source_revision": "undo.review_pack.manifest: ревизия базы (1 или 0), прежняя — legacy_source_revision",
+        "job_json": "undo.review_pack.manifest.legacy_job_json; job_json ставит запись документа",
+        "pack_rev": "undo.review_pack.manifest.pack_rev",
+        "audio": "undo.review_pack.manifest.audio",
+        "audio_sha256": "undo.review_pack.manifest.audio_sha256",
+        "clips_dir": "undo.review_pack.manifest.clips_dir; клипы не копируются (Р-3)",
+        "speakers": "undo.review_pack.manifest.speakers",
+        "created": "undo.review_pack.manifest.created",
+    },
+    "files": {
+        "answers.json": "текущий пакет: состояние ответов",
+        "manifest.json": "текущий пакет: карточки",
+        "answers.*.json": "архив ответов прежних редакций: undo.legacy_review_packs (Р-2)",
+        "manifest.*.json": "архив карточек прежних редакций: undo.legacy_review_packs (Р-2)",
+        "answers.lock": "не переносится: замок записи ответов",
+        "cards.html": "не переносится: страница строится заново по базе",
+        "clips": "не переносится (Р-3): клипы остаются в старой папке, новая порция режется заново",
+        "voice": "не переносится: голосовые ответы остаются в старой папке, путь в ответе прежний",
+        "cloud.json": "не переносится: облачные карточки собираются заново",
+    },
+}
+
+
+def unknown_pack_keys(packs, manifests):
+    """Ключи файлов пакета без назначения в LEGACY_PACK_INVENTORY -> ["файл: ключ", …] (пусто — всё названо)."""
+    out = []
+    for rows, kind in ((packs, "answers.json"), (manifests, "manifest.json")):
+        known = LEGACY_PACK_INVENTORY[kind]
+        for row in rows:
+            body = row.get("raw") if kind == "answers.json" else row
+            skip = ("name", "current") if kind == "manifest.json" else ()
+            out += [f"{row['name']}: {k}" for k in sorted(body or {}) if k not in known and k not in skip]
+    return out
 DOC_SUBDIR = "v4"
 PLAN_VERSION = 1
 METADATA_FIELDS = ("title", "recorded_at", "recorded_timezone", "container", "codec",
@@ -409,13 +471,23 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
         review["rejected"] = copy.deepcopy(raw.get("rejected") or [])
         applied_at = _utc_text(raw.get("applied_at"))
         applied, marks = {}, {"kept": 0, "from_true": 0, "dropped": 0, "from_applied_at": 0}
+
+        def not_later(aid, answer):
+            # правило review_pack._applied_map «ответ не позже applied_at» — по исходным значениям файла (Ф207-4):
+            # секунды сравниваются числами, с долями; строки без долей секунды дали бы «применён» ответу,
+            # сохранённому в ту же секунду после применения
+            ts, at = (mine.get(aid) or {}).get("ts"), raw.get("applied_at")
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (ts, at)):
+                return ts <= at
+            return (answer.get("ts") or "") <= applied_at
+
         if "applied_answers" in raw:
             for aid, sig in (raw.get("applied_answers") or {}).items():
                 answer = answers.get(aid)
                 if answer is not None and isinstance(sig, list):
                     applied[aid] = sig
                     marks["kept"] += 1
-                elif answer is not None and sig is True and applied_at and (answer.get("ts") or "") <= applied_at:
+                elif answer is not None and sig is True and applied_at and not_later(aid, answer):
                     # старая отметка «применён» без подписи: подпись ответа, который был до применения пакета
                     applied[aid] = RP._sig(answer)
                     marks["from_true"] += 1
@@ -425,7 +497,7 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
             # пакет до записи отметок: применёнными считались ответы не позже applied_at (review_pack._applied_map);
             # в базе состояние всегда с applied_answers, поэтому правило переносится явными подписями
             for aid, answer in answers.items():
-                if (answer.get("ts") or "") <= applied_at:
+                if not_later(aid, answer):
                     applied[aid] = RP._sig(answer)
                     marks["from_applied_at"] += 1
         events = copy.deepcopy(raw.get("application_events") or [])
@@ -434,6 +506,23 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
             for key in ("answer_ts", "at"):
                 if isinstance(row, dict) and key in row:
                     row[key] = _utc_text(row[key])
+        status = {item["id"]: item.get("status") or "open" for item in review.get("review") or []}
+        # Р-4 (решение владельца 26.11.2026, «пометить их ремонтом»): сохранённый и не применённый ответ (saved),
+        # место которого уже закрыто, — событие «место уже решено» без попытки применить; ответы открытых мест
+        # ждут человека, как прежде. Отмену (revert_pending) и новый ответ поверх применённого (pending_new)
+        # не помечать (Ф212-2): их состояние от события не зависит, они остались бы ждущими
+        marked = 0
+        probe = {"answers": answers, "applied_answers": applied, "application_events": events, "undo_snapshots": {},
+                 "rejected": review["rejected"]}
+        now = time.strftime(ANSWER_TS_FORMAT, time.gmtime())
+        for aid, row in RP.answer_states_of(probe, manifest, outcome_details=False).items():
+            answer = answers[aid]
+            if (row["state"] == "saved" and status.get(aid) in CLOSED_STATUSES and
+                    answer.get("kind") not in ("skip", "repeat") and applied.get(aid) != RP._sig(answer)):
+                events.append({"id": aid, "version": answer.get("version"), "answer_ts": answer.get("ts"),
+                               "answer_source": answer.get("source"), "answer_sig_sha256": RP._sig_hash(answer),
+                               "action": RP.LEGACY_DECIDED_ACTION, "outcome": "already_decided", "at": now})
+                marked += 1
         pack = {"manifest": manifest, "applied_answers": applied, "applied_at": applied_at, "undo_snapshots": {},
                 "application_events": events,
                 "application_events_dropped": raw.get("application_events_dropped", 0)}
@@ -453,7 +542,7 @@ def pack_state_from_legacy(review, transcript, packs, manifests, recording_id, l
                  "undo_snapshots": {}, "rejected": review["rejected"],
                  "outcome_details": pack.get("outcome_details")}
         waiting = RP.rebuild_check(state, manifest)["waiting"]
-        status = {item["id"]: item.get("status") or "open" for item in review.get("review") or []}
+        stats.update(already_decided_marked=marked)
         stats.update(state="full", version=version, answers_current=n, answers_skipped=skipped,
                      answers_other_version=len(other_version), ts_converted=converted,
                      manifest_items=len(manifest.get("items") or []), questions=len(questions),
@@ -623,6 +712,12 @@ def run(plan, mode, ffprobe=None):
                 entry = {"audio": rec["audio"], "transcript": variant["transcript"], "main": bool(variant.get("main"))}
                 try:
                     legacy, source, packs, conspects, manifests = _read_variant(rec, variant)
+                    unknown = unknown_pack_keys(packs, manifests)
+                    if unknown:
+                        # опись пакета (а1): ключ без назначения — отказ записи до сборки снимков, ничего не пишется
+                        entry.update(status="unknown_pack_keys", unknown_pack_keys=unknown, why=UNKNOWN_KEYS_WHY)
+                        report.append(entry)
+                        continue
                     rid, rule = recording_id_from(legacy, variant["transcript"], source["sha256"])
                     entry.update(recording_id=rid, recording_id_rule=rule, source_sha256=source["sha256"],
                                  legacy_recording_id=legacy.get("recording_id"),
@@ -778,10 +873,16 @@ def verify_set(report, out_dir):
     return v
 
 
+# исходы записи, при которых перенос не выполнен для неё: итог partial, код 1
+IMPORT_PROBLEMS = ("error", "conflict", "unknown_pack_keys")
+UNKNOWN_KEYS_WHY = ("в файлах пакета карточек есть ключи без назначения в описи LEGACY_PACK_INVENTORY — запись не "
+                    "переносится, чтобы не потерять их молча; нужна правка инструмента")
+
+
 def _status(mode, report, verification):
     if mode == "check":
         return "checked"
-    if any(e.get("status") in ("error", "conflict") for e in report):
+    if any(e.get("status") in IMPORT_PROBLEMS for e in report):
         return "partial"
     if verification and all(ok is not False for ok in verification["checks"].values()):
         return "verified_copy"
@@ -816,9 +917,10 @@ def write_artifacts(out_dir, plan, report, mode, verification=None):
         lines += ["## Проверки", ""] + [f"- {k}: {'да' if ok else 'НЕТ'}" for k, ok in verification["checks"].items()] + [""]
     if md_diff:
         lines += ["## MD отличается от рендера JSON (посмотреть человеку)", ""] + [f"- {n}" for n in md_diff] + [""]
-    problems = [e for e in report if e.get("status") in ("error", "conflict")]
+    problems = [e for e in report if e.get("status") in IMPORT_PROBLEMS]
     if problems:
-        lines += ["## Ошибки и конфликты", ""] + [f"- {Path(e['transcript']).name}: {e.get('error') or e.get('note')}"
+        lines += ["## Ошибки и конфликты", ""] + [f"- {Path(e['transcript']).name}: "
+                                                 f"{e.get('error') or e.get('why') or e.get('note')}"
                                                  for e in problems] + [""]
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return status
@@ -827,7 +929,8 @@ def write_artifacts(out_dir, plan, report, mode, verification=None):
 # ---------------------------------------------------------------- ремонт: пакет карточек (М-1)
 
 # Состояния записи в отчёте ремонта. Отказы дают код 1; остальное — штатный исход.
-REPAIR_REFUSALS = frozenset(("not_migrated", "changed_after_import", "pack_files_changed", "error"))
+REPAIR_REFUSALS = frozenset(("not_migrated", "changed_after_import", "pack_files_changed", "error",
+                             "repaired_documents_pending", "documents_conflict", "unknown_pack_keys"))
 
 
 class RepairBackupError(RuntimeError):
@@ -865,8 +968,20 @@ def _db_check(store, rid):
     import_op = _import_operation(rid)
     untouched = (current["transcript"]["revision"] == 1 and current["review"]["revision"] == 1 and
                  current["transcript"]["operation_id"] == import_op and current["review"]["operation_id"] == import_op)
-    if not pack_state_missing(review):
+    repaired = bool((review.get("undo") or {}).get("legacy_pack_repair"))
+    # pack_state с итогом пишет только новый перенос (В-1); прежний перенос этого поля не писал (Ф207-6)
+    new_import = (mig.get("pack_state") or {}).get("state") in ("full", "archived_only")
+    if repaired and _document_state(store, rid) != "synced":
+        # Ф207-2: ревизия ремонта в базе, а файлы документа не дописаны — повтор с --apply их допишет
+        out["status"] = ("documents_conflict" if _document_state(store, rid) == "conflict"
+                         else "repaired_documents_pending")
+        out["why"] = ("в базе исправлено, документы рядом с аудио в конфликте — решите конфликт штатно "
+                      "(resolve_document_conflict или экран)" if out["status"] == "documents_conflict"
+                      else "в базе исправлено, документы рядом с аудио не записаны — повторите с --apply")
+    elif not pack_state_missing(review) or repaired or new_import:
         out["status"] = "already_repaired"
+        if new_import and not repaired:
+            out["why"] = "перенесено новым переносом вместе с состоянием пакета"
     elif not untouched:
         out["status"] = "changed_after_import"
         out["why"] = "запись менялась после переноса — ремонт не выполняется, нужен человек"
@@ -929,6 +1044,17 @@ def _binding(store, rid):
     return recordings.document_binding(store, rid)
 
 
+def _document_state(store, rid):
+    """Состояние очереди последней ревизии документа записи (document_outbox): synced, pending, conflict…"""
+    row = store.db.execute("SELECT state FROM document_outbox WHERE recording_id=? "
+                           "ORDER BY document_revision DESC LIMIT 1", (rid,)).fetchone()
+    return row[0] if row else None
+
+
+class RepairDocumentsPending(RuntimeError):
+    """Ревизия ремонта записана в базу, а файлы документа — нет (Ф207-2): повтор с --apply их допишет."""
+
+
 def _repair_backup(store):
     """Резерв базы перед первой записью ремонта: <папка данных>/db-backups.
 
@@ -959,9 +1085,22 @@ def _repair_write(store, rid, review, digest):
     result = store.commit_change_with_document(
         rid, {"source_revision": 1, "review_revision": 1}, operation_id, context, review=review,
         root_id=binding["root_id"], generated_at=datetime.now(timezone.utc).isoformat())
-    completed = recordings.materialize_recording(store, rid)
-    documents.require_written(store, rid, result["document_revision"], completed)
+    try:
+        _repair_documents(store, rid, result["document_revision"])
+    except Exception as ex:
+        raise RepairDocumentsPending(f"{type(ex).__name__}: {ex}") from ex
     return result
+
+
+def _repair_documents(store, rid, revision=None):
+    """Дописать файлы документа записи из очереди штатно (без новой ревизии): после записи в базу или повтором."""
+    import documents
+    import recordings
+    if revision is None:
+        revision = store.db.execute("SELECT MAX(document_revision) FROM document_outbox WHERE recording_id=?",
+                                    (rid,)).fetchone()[0]
+    completed = recordings.materialize_recording(store, rid)
+    documents.require_written(store, rid, revision, completed)
 
 
 def repair_packs(plan=None, *, apply=False, db_only=False):
@@ -1018,9 +1157,17 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
                 **({"error": "несколько записей с этим источником"} if rids else {})}
     rid = rids[0]
     check, transcript, review_db, mig = _db_check(store, rid)
+    if check["status"] == "repaired_documents_pending" and apply:
+        import documents
+        documents.guard_before_write(store, rid)
+        _repair_documents(store, rid)
+        return {**check, "status": "documents_written", "why": "в базе было исправлено; документы дописаны"}
     if check["status"] != "candidate":
         return check
     packs, manifests = _read_pack_files(variant.get("review_packs", []))
+    unknown = unknown_pack_keys(packs, manifests)
+    if unknown:
+        return {**check, "status": "unknown_pack_keys", "unknown_pack_keys": unknown, "why": UNKNOWN_KEYS_WHY}
     review, info = _repair_review(store, rid, review_db, transcript, mig, packs, manifests)
     out = {**check, **info}
     if review is None:
@@ -1032,7 +1179,12 @@ def _repair_variant(store, rec, variant, by_sha, apply, report):
         report["backup"], damaged = _repair_backup(store)
         if damaged:
             report["backup_damaged_copies"] = damaged
-    result = _repair_write(store, rid, review, _pack_digest(packs, manifests))
+    try:
+        result = _repair_write(store, rid, review, _pack_digest(packs, manifests))
+    except RepairDocumentsPending as ex:
+        out.update(status="repaired_documents_pending", review_revision=2, error=str(ex),
+                   why="в базе исправлено, документы рядом с аудио не записаны — повторите с --apply")
+        return out
     out.update(status="repaired", review_revision=result.get("review_revision", 2))
     return out
 
@@ -1046,6 +1198,7 @@ def _repair_summary(report):
                      f"текущих {ps.get('answers_current', '-')}, в архиве {ps.get('answers_archived', '-')}, "
                      f"применённых {ps.get('applied', '-')}, ждущих {ps.get('waiting', '-')} "
                      f"(из них на закрытых местах {ps.get('waiting_closed_place', '-')}), "
+                     f"помечено «место уже решено» {ps.get('already_decided_marked', '-')}, "
                      f"снимков отмены не перенесено {ps.get('undo_snapshots_dropped', '-')}"
                      + (f"; {e['why']}" if e.get("why") else "") + (f"; ошибка: {e['error']}" if e.get("error") else ""))
     lines.append(f"итог: {report['summary']}" + (f"; резерв: {report['backup']}" if report.get("backup") else ""))
@@ -1178,7 +1331,8 @@ def main(argv=None):
     status = write_artifacts(a.out, plan, report, a.command, verification) if a.out else _status(a.command, report, None)
     print(_summary(report))
     print(f"статус: {status}")
-    return 0 if status in ("checked", "verified_copy") and not any(e["status"] == "error" for e in report) else 1
+    failed = any(e["status"] in ("error", "unknown_pack_keys") for e in report)
+    return 0 if status in ("checked", "verified_copy") and not failed else 1
 
 
 if __name__ == "__main__":
